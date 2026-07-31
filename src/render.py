@@ -74,3 +74,7 @@ def render_marker(comps, cell, tau, phi, tape, polarity=0.0, pol_dir=0.0, amp=1.
     if polarity:
         out = out * np.exp(polarity * np.cos(phi - pol_dir))
     return amp * out / (out[cell].mean() + 1e-12)
+
+def render_cell(cell, markers):
+    hi  = max(np.percentile(im[cell], 99.5) for im in markers)
+    return np.dstack([np.clip(im / hi + 1e-9, 0, 1) for im in markers])
