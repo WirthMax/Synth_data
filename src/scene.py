@@ -48,3 +48,29 @@ def generate_single_cell(Tape, size = 201, radius = 32, nuc_frac = 0.3, rough = 
                    (rho - r_nuc) / np.maximum(r_cell - r_nuc, 1e-6))
     
     return cell, nuc, rho, phi, tau
+
+
+### Tissue
+from scipy.spatial import cKDTree
+from scipy.ndimage import gaussian_filter
+
+def thin(tape, min_dist):
+    """Each candidate carries a frozen random priority order. A candidate is dropped if any higher-priority candidate lies within min_dist
+    """
+    xy, order = tape["xy"], tape["order"]
+    tree = cKDTree(xy)
+    keep = np.ones(len(xy), bool)
+    # return pairs closer than min_dist, and drop the one with lower priority
+    for i, j in tree.query_pairs(min_dist, output_type="ndarray"):
+        keep[i if order[i] > order[j] else j] = False
+    k = np.flatnonzero(keep)
+    d = cKDTree(tape["xy"][k]).query(tape["xy"][k], k=2)[0][:, 1].min()
+    assert d >= min_dist, f"min dist {d} < {min_dist}"
+    return k
+
+def support_mask(tape, scale_px=40.0, cover=0.75):
+    """ generate tissue mask by using gaussian filter on the support field and thresholding it to get a binary mask
+    """
+    z = gaussian_filter(tape["support"], scale_px, truncate=4.0)
+    z = (z - z.mean()) / (z.std() + 1e-12)
+    return z >= np.quantile(z, 1.0 - np.clip(cover, 0.0, 1.0))
