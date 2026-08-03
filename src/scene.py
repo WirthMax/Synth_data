@@ -53,68 +53,106 @@ def reach_px(R, elong, rough, grow=1.0, pad=2):
     return int(np.ceil(R * grow * max(s, 1.0 / s) * np.exp(3.0 * rough))) + pad
 
 
-def cell_fields(rho, phi, r_cell, r_nuc=None, rim=1.5):
-    """Masks and intrinsic coordinates from the two support functions.
+def mix_harmonics(a, b, a2, b2, corr):
+    """Nuclear coefficients correlated with the cell's at level `corr`, without resampling."""
+    c = float(np.clip(corr, 0.0, 1.0))
+    s = np.sqrt(1.0 - c * c)
+    return c * a + s * a2, c * b + s * b2
 
-    d = rho / r_cell is exactly 1 on the free boundary, which is what the tessellation
-    compares across cells. The sandbox just thresholds it at 1.
+
+def nucleus_centre(cy, cx, radius, nuc_frac, rim, elong, angle_deg,
+                   nuc_offset, off_dir, off_mag):
+    """Displace the nucleus inside its cell; returns the IMAGE-frame nuclear centre.
+
+    `free` is a body-frame length, so the displacement is built in the body frame and then
+    mapped back out: undo the stretch, then undo the rotation. Adding it directly in image
+    coordinates would make nuc_offset mean something different at every orientation.
     """
-    d = rho / np.maximum(r_cell, 1e-6)
-    out = {"d": d, "cell": d <= 1.0, "phi": phi, "rho": rho}
-    if r_nuc is not None:
-        # Clip the NUCLEAR SUPPORT, then build both the mask and tau from that same clipped
-        # curve. Deriving the mask from the clipped radius but tau from the unclipped one
-        # desynchronises them: tau = 0 lands somewhere other than the labelled nuclear edge,
-        # so a nuclear marker bleeds across the boundary of its own label.
-        r_n = np.maximum(np.minimum(r_nuc, r_cell - rim), 1e-6)
-        out["r_nuc_eff"] = r_n
-        out["nuc"] = rho <= r_n
-        out["tau"] = np.where(rho < r_n, rho / r_n - 1.0,
-                              (rho - r_n) / np.maximum(r_cell - r_n, 1e-6))
+    free = max(radius * (1.0 - nuc_frac) - rim, 0.0)
+    m = nuc_offset * free * off_mag
+    t, s = np.deg2rad(angle_deg), np.sqrt(elong)
+    ox_b, oy_b = m * np.cos(off_dir), m * np.sin(off_dir)
+    ox, oy = ox_b * s, oy_b / s
+    return (cy + ox * np.sin(t) + oy * np.cos(t),
+            cx + ox * np.cos(t) - oy * np.sin(t))
+
+
+def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5):
+    """Masks and coordinates from two supports about POSSIBLY DIFFERENT centres.
+
+    psi = rho - r(phi) is signed (negative inside), measured relative to each contour --
+    which is what lets the two be compared even though they have different origins.
+    The containment clip is applied to psi_n ONCE and both outputs derive from it, so the
+    labelled nuclear edge and the tau = 0 level set stay the same curve.
+    """
+    d = rho_c / np.maximum(r_c, 1e-6)
+    out = {"d": d, "cell": d <= 1.0, "phi": phi_c, "rho": rho_c}
+    if r_n is None:
+        return out
+    psi_c = rho_c - r_c
+    psi_n = np.maximum(rho_n - r_n, psi_c + rim)
+    out["nuc"] = psi_n <= 0.0
+    out["tau"] = np.where(psi_n < 0.0,
+                          rho_n / np.maximum(r_n, 1e-6) - 1.0,
+                          psi_n / np.maximum(psi_n - psi_c, 1e-6))
     return out
 
 
-def generate_single_cell(Tape, size=201, radius=32, nuc_frac=0.3, rough=0.25,
-                         elong=1.6, angle_deg=30, beta=1.9, rim=1.5):
-    """Sandbox: one cell centred in its own image."""
-    # take the first candidate from the tape
-    r_cell_fn = make_boundary(Tape.a[0], Tape.b[0], radius, rough, beta, Tape.K)
-    r_nuc_fn = make_boundary(Tape.a[0], Tape.b[0], radius * nuc_frac, rough * 0.6, beta, Tape.K, extra=1.5)
+def _cell_and_nucleus(a, b, a2, b2, y, x, cy, cx, radius, nuc_frac, rough, beta, K,
+                      elong, angle_deg, rim, nuc_corr, nuc_offset, off_dir, off_mag):
+    """Shared core: both wrappers do exactly this, only the grid differs."""
+    an, bn = mix_harmonics(a, b, a2, b2, nuc_corr)          # nucleus ONLY
+    r_cell_fn = make_boundary(a, b, radius, rough, beta, K)
+    r_nuc_fn = make_boundary(an, bn, radius * nuc_frac, rough * 0.6, beta, K, extra=1.5)
+
+    rho_c, phi_c = body_frame(y, x, cy, cx, angle_deg, elong)
+    ncy, ncx = nucleus_centre(cy, cx, radius, nuc_frac, rim, elong, angle_deg,
+                              nuc_offset, off_dir, off_mag)
+    rho_n, phi_n = body_frame(y, x, ncy, ncx, angle_deg, elong)
+
+    f = cell_fields(rho_c, phi_c, r_cell_fn(phi_c), rho_n, phi_n, r_nuc_fn(phi_n), rim)
+    f["nuc_centre"] = (ncy, ncx)
+    return f
+
+
+def generate_single_cell(Tape, i=0, size=201, radius=32, nuc_frac=0.45, rough=0.25,
+                         elong=1.6, angle_deg=30, beta=1.9, rim=1.5,
+                         nuc_corr=0.4, nuc_offset=0.6):
+    """Sandbox: candidate i from the tape, centred in its own image."""
     y, x = centred_grid(size)
-    rho, phi = body_frame(y, x, 0.0, 0.0, angle_deg, elong)
-    return cell_fields(rho, phi, r_cell_fn(phi), r_nuc_fn(phi), rim)
+    return _cell_and_nucleus(
+        Tape["a"][i], Tape["b"][i], Tape["a2"][i], Tape["b2"][i], y, x, 0.0, 0.0,
+        radius, nuc_frac, rough, beta, Tape["K"], elong, angle_deg, rim,
+        nuc_corr, nuc_offset,
+        off_dir=2 * np.pi * Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i])
+
 
 ### Tissue
 from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter
 
+
+def stamp_cell(tape, i, cy, cx, tile, radius, nuc_frac, rough, elong, angle_deg, beta,
+               grow=1.0, rim=1.5, nuc_corr=0.4, nuc_offset=0.6):
+    """Tissue: candidate i stamped at (cy, cx) on a local patch."""
+    y, x, origin = patch_grid(cy, cx, reach_px(radius, elong, rough, grow), tile)
+    f = _cell_and_nucleus(
+        tape["a"][i], tape["b"][i], tape["a2"][i], tape["b2"][i], y, x, cy, cx,
+        radius, nuc_frac, rough, beta, tape["K"], elong, angle_deg, rim,
+        nuc_corr, nuc_offset,
+        off_dir=2 * np.pi * tape["u_offdir"][i], off_mag=tape["u_offmag"][i])
+    return f, origin
+
+
 def thin(tape, min_dist):
-    """Each candidate carries a frozen random priority order. A candidate is dropped if any higher-priority candidate lies within min_dist
-    """
     xy, order = tape["xy"], tape["order"]
-    tree = cKDTree(xy)
     keep = np.ones(len(xy), bool)
-    # return pairs closer than min_dist, and drop the one with lower priority
-    for i, j in tree.query_pairs(min_dist, output_type="ndarray"):
+    for i, j in cKDTree(xy).query_pairs(min_dist, output_type="ndarray"):
         keep[i if order[i] > order[j] else j] = False
-    k = np.flatnonzero(keep)
-    d = cKDTree(tape["xy"][k]).query(tape["xy"][k], k=2)[0][:, 1].min()
-    assert d >= min_dist, f"min dist {d} < {min_dist}"
-    return k
+    return np.flatnonzero(keep)
+
 
 def support_mask(tape, scale_px=40.0, cover=0.75):
-    """ generate tissue mask by using gaussian filter on the support field and thresholding it to get a binary mask
-    """
     z = gaussian_filter(tape["support"], scale_px, truncate=4.0)
     z = (z - z.mean()) / (z.std() + 1e-12)
     return z >= np.quantile(z, 1.0 - np.clip(cover, 0.0, 1.0))
-
-
-def stamp_cell(tape_a, tape_b, cy, cx, tile, radius, nuc_frac, rough, elong,
-               angle_deg, beta, K, grow=1.0, rim=1.5):
-    """Tissue: one cell at (cy, cx) on a local patch. Same three calls as in generate_single_cell."""
-    r_cell_fn = make_boundary(tape_a, tape_b, radius, rough, beta, K)
-    r_nuc_fn = make_boundary(tape_a, tape_b, radius * nuc_frac, rough * 0.6, beta, K, extra=1.5)
-    y, x, origin = patch_grid(cy, cx, reach_px(radius, elong, rough, grow), tile)
-    rho, phi = body_frame(y, x, cy, cx, angle_deg, elong)
-    return cell_fields(rho, phi, r_cell_fn(phi), r_nuc_fn(phi), rim), origin
