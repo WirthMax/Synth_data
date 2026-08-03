@@ -13,14 +13,23 @@ class Tape(object):
 
     def draw(self, tile=256, n_cand=1500, Pool = 3, ):
         """Everything random, drawn once, before any parameter is looked at."""
-        self.a = self.rng.standard_normal(self.K)                      # boundary harmonics
-        self.b = self.rng.standard_normal(self.K)
+        self.tile = tile
+        # boundary harmonics
+        self.a = self.rng.standard_normal((n_cand, self.K))
+        self.b = self.rng.standard_normal((n_cand, self.K))
         self.noise = self.rng.standard_normal((Pool, self.size, self.size))  # texture field
         
         # Tissuetile=256, n_cand=1500
-        self.xy=self.rng.random((n_cand, 2)) * tile      # candidate centres
-        self.order=self.rng.random(n_cand)               # priority mark for the hard-core rule
-        self.support=self.rng.random((tile, tile))        # support field for the tissue
+        # candidate centres
+        self.xy=self.rng.random((n_cand, 2)) * tile
+        # priority mark for the hard-core rule
+        self.order=self.rng.random(n_cand)
+        # support field for the tissue
+        self.support=self.rng.random((tile, tile))       
+        # per-cell size jitter
+        self.z_size=self.rng.standard_normal(n_cand)
+        # per-cell orientation
+        self.u_orient=self.rng.random(n_cand)
 
     # Add this method to allow bracket access
     def __getitem__(self, key):
