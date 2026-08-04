@@ -77,14 +77,20 @@ def nucleus_centre(cy, cx, radius, nuc_frac, rim, elong, angle_deg,
             cx + ox * np.cos(t) - oy * np.sin(t))
 
 
-def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5):
+def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, body_grow=1.0):
     """Masks and coordinates from two supports about POSSIBLY DIFFERENT centres.
 
     psi = rho - r(phi) is signed (negative inside), measured relative to each contour --
     which is what lets the two be compared even though they have different origins.
     The containment clip is applied to psi_n ONCE and both outputs derive from it, so the
     labelled nuclear edge and the tau = 0 level set stay the same curve.
+
+    body_grow scales the CELL contour only (r_c -> body_grow * r_c), leaving the nucleus
+    untouched. 1.0 = the free shape (the mask uses this). grow > 1 gives the packed body: d,
+    cell and tau then reference the grown membrane, so a marker rendered on these fields fills
+    the tessellated territory instead of just the free shape.
     """
+    r_c = r_c * body_grow
     d = rho_c / np.maximum(r_c, 1e-6)
     out = {"d": d, "cell": d <= 1.0, "phi": phi_c, "rho": rho_c}
     if r_n is None:
@@ -99,8 +105,13 @@ def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5):
 
 
 def _cell_and_nucleus(a, b, a2, b2, y, x, cy, cx, radius, nuc_frac, rough, beta, K,
-                      elong, angle_deg, rim, nuc_corr, nuc_offset, off_dir, off_mag):
-    """Shared core: both wrappers do exactly this, only the grid differs."""
+                      elong, angle_deg, rim, nuc_corr, nuc_offset, off_dir, off_mag,
+                      body_grow=1.0):
+    """Shared core: both wrappers do exactly this, only the grid differs.
+
+    body_grow scales the cell contour (not the nucleus); see cell_fields. Default 1.0 = the
+    free shape used everywhere for the mask; > 1 gives the packed body for marker rendering.
+    """
     an, bn = mix_harmonics(a, b, a2, b2, nuc_corr)          # nucleus ONLY
     r_cell_fn = make_boundary(a, b, radius, rough, beta, K)
     r_nuc_fn = make_boundary(an, bn, radius * nuc_frac, rough * 0.6, beta, K, extra=1.5)
@@ -110,7 +121,8 @@ def _cell_and_nucleus(a, b, a2, b2, y, x, cy, cx, radius, nuc_frac, rough, beta,
                               nuc_offset, off_dir, off_mag)
     rho_n, phi_n = body_frame(y, x, ncy, ncx, angle_deg, elong)
 
-    f = cell_fields(rho_c, phi_c, r_cell_fn(phi_c), rho_n, phi_n, r_nuc_fn(phi_n), rim)
+    f = cell_fields(rho_c, phi_c, r_cell_fn(phi_c), rho_n, phi_n, r_nuc_fn(phi_n), rim,
+                    body_grow=body_grow)
     f["nuc_centre"] = (ncy, ncx)
     return f
 
@@ -136,14 +148,19 @@ from render import render_marker          # one-way: render.py imports no scene,
 
 
 def stamp_cell(tape, i, cy, cx, tile, radius, nuc_frac, rough, elong, angle_deg, beta,
-               grow=1.0, rim=1.5, nuc_corr=0.4, nuc_offset=0.6):
-    """Tissue: candidate i stamped at (cy, cx) on a local patch."""
+               grow=1.0, rim=1.5, nuc_corr=0.4, nuc_offset=0.6, body_grow=1.0):
+    """Tissue: candidate i stamped at (cy, cx) on a local patch.
+
+    `grow` sizes the patch (reach); `body_grow` scales the rendered cell contour (see
+    cell_fields). They are set together (body_grow=grow) to render markers on the packed body.
+    """
     y, x, origin = patch_grid(cy, cx, reach_px(radius, elong, rough, grow), tile)
     f = _cell_and_nucleus(
         tape["a"][i], tape["b"][i], tape["a2"][i], tape["b2"][i], y, x, cy, cx,
         radius, nuc_frac, rough, beta, tape["K"], elong, angle_deg, rim,
         nuc_corr, nuc_offset,
-        off_dir=2 * np.pi * tape["u_offdir"][i], off_mag=tape["u_offmag"][i])
+        off_dir=2 * np.pi * tape["u_offdir"][i], off_mag=tape["u_offmag"][i],
+        body_grow=body_grow)
     return f, origin
 
 
@@ -303,17 +320,26 @@ def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
         phi_img[sl] = np.where(win, f["phi"], phi_img[sl])
         nuc_labels[sl] = np.where(win, f["nuc"]*n, nuc_labels[sl])
 
-        # markers: render this cell's channels on the SAME patch and composite by the
-        # SAME winner mask, so the image can never disagree with the label.
-        if markers is not None and f["cell"].any():
-            specs = markers()                        # [(comps, amp, polarity, pol_dir), ...]
-            if channels is None:
-                channels = [np.zeros((tile, tile)) for _ in specs]
-            ptape = {"noise": tape["noise_tile"][:, y0:y0+h, x0:x0+w]}   # render_marker reads only ["noise"]
-            for ch, (comps, amp, pol, pdir) in zip(channels, specs):
-                img = render_marker(comps, f["cell"], f["tau"], f["phi"], f["d"],
-                                    ptape, pol, pdir, amp)
-                ch[sl] = np.where(win, img, ch[sl])
+        # markers: render this cell's channels and composite by the SAME winner mask, so the
+        # image can never disagree with the label. Render on the GROWN body (body_grow=grow):
+        # its boundary is grow * r(phi), which coincides with the label extent (f["d"] <= grow),
+        # so a marker fills the packed territory instead of only the free shape. Same patch,
+        # so the offsets/shape match the mask fields above.
+        if markers is not None:
+            fm, _ = stamp_cell(
+                tape=tape, i=i, cy=cy, cx=cx, tile=tile, radius=r_eff[n-1],
+                nuc_frac=nf[n-1], rough=rough, elong=elong,
+                angle_deg=180.0 * tape["u_orient"][i], beta=beta,
+                grow=grow, rim=rim, nuc_corr=nuc_corr, nuc_offset=nuc_offset, body_grow=grow)
+            if fm["cell"].any():
+                specs = markers()                    # [(comps, amp, polarity, pol_dir), ...]
+                if channels is None:
+                    channels = [np.zeros((tile, tile)) for _ in specs]
+                ptape = {"noise": tape["noise_tile"][:, y0:y0+h, x0:x0+w]}   # render_marker reads only ["noise"]
+                for ch, (comps, amp, pol, pdir) in zip(channels, specs):
+                    img = render_marker(comps, fm["cell"], fm["tau"], fm["phi"], fm["d"],
+                                        ptape, pol, pdir, amp)
+                    ch[sl] = np.where(win, img, ch[sl])
 
     # keep only the piece holding the seed; a two-piece "cell" is a wrong annotation
     orphan = 0
