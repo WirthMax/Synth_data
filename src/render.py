@@ -95,5 +95,8 @@ def render_marker(comps, cell, tau, phi, d, tape, polarity=0.0, pol_dir=0.0, amp
     return amp * out / (denom + 1e-12)
 
 def render_cell(cell, markers):
-    hi  = max(np.percentile(im[cell], 99.5) for im in markers)
-    return np.dstack([np.clip(im / hi + 1e-9, 0, 1) for im in markers])
+    """Stack markers into an RGB image, EACH channel scaled to [0, 1] by ITS OWN 99.5th
+    in-cell percentile
+    """
+    return np.dstack([np.clip(im / (np.percentile(im[cell], 99.5) + 1e-9), 0, 1)
+                      for im in markers])
