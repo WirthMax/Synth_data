@@ -131,6 +131,7 @@ def generate_single_cell(Tape, i=0, size=201, radius=32, nuc_frac=0.45, rough=0.
 from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter
 from scipy import ndimage as ndi
+from render import render_marker          # one-way: render.py imports no scene, so no cycle
 
 
 
@@ -162,7 +163,8 @@ def support_mask(tape, scale_px=40.0, cover=0.75):
 
 def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
                  rough=0.15, beta=2.0, support_scale=40.0, cover=0.75, grow=1.35,
-                 nuc_frac=0.35, nuc_frac_sigma=0.15, rim=1.5, nuc_corr=0.5, nuc_offset=0.9,):
+                 nuc_frac=0.35, nuc_frac_sigma=0.15, rim=1.5, nuc_corr=0.5, nuc_offset=0.9,
+                 markers=None):
     """Render a tile of packed cells: instance labels plus intrinsic coordinates.
 
     Nothing here reads pixel data. The output is a deterministic function of (tape, theta),
@@ -238,6 +240,14 @@ def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
         the support function, so the labelled nuclear edge and the tau = 0 level set stay the
         same curve. Must stay resolvable -- below ~1 px it vanishes after the PSF.
 
+    Markers (appearance -- opt-in; the mask is unchanged whether on or off)
+    ----------------------------------------------------------------------
+    markers : callable or None
+        Each cell's channels are rendered on its own patch with
+        `render_marker` and composited by the SAME tessellation winner as the label, so the
+        image can never disagree with the mask. Texture comes from `tape["noise_tile"]` sliced
+        to the patch, so it stays frozen and globally coherent across the tile.
+
     Returns
     -------
     labels : (tile, tile) int32       0 = background, k = cell k. THE GROUND TRUTH.
@@ -246,7 +256,9 @@ def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
                                       membrane. Exceeds 1 in contact zones when grow > 1.
     phi_img : (tile, tile) float      body-frame angle, co-rotating with each cell.
     info : dict                       n_cells, centres, r_eff, support, orphan_px, empty,
-                                      packing (cell pixels / support pixels).
+                                      packing (cell pixels / support pixels), d_img (the winning
+                                      normalised radius per pixel; inf in background), and
+                                      markers (list of (tile, tile) channels, or None).
     """
     tile = tape["tile"]
     # generate a support mask to limit the area where cells can be placed
@@ -262,6 +274,7 @@ def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
     nuc_labels = np.zeros((tile, tile), np.int32)
     tau_img    = np.zeros((tile, tile))
     phi_img    = np.zeros((tile, tile))
+    channels   = None                    # allocated lazily once we know how many markers
     r_eff = radius * np.exp(size_sigma * tape["z_size"][keep])
 
 
@@ -289,7 +302,19 @@ def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
         tau_img[sl] = np.where(win, f["tau"], tau_img[sl])
         phi_img[sl] = np.where(win, f["phi"], phi_img[sl])
         nuc_labels[sl] = np.where(win, f["nuc"]*n, nuc_labels[sl])
-        
+
+        # markers: render this cell's channels on the SAME patch and composite by the
+        # SAME winner mask, so the image can never disagree with the label.
+        if markers is not None and f["cell"].any():
+            specs = markers()                        # [(comps, amp, polarity, pol_dir), ...]
+            if channels is None:
+                channels = [np.zeros((tile, tile)) for _ in specs]
+            ptape = {"noise": tape["noise_tile"][:, y0:y0+h, x0:x0+w]}   # render_marker reads only ["noise"]
+            for ch, (comps, amp, pol, pdir) in zip(channels, specs):
+                img = render_marker(comps, f["cell"], f["tau"], f["phi"], f["d"],
+                                    ptape, pol, pdir, amp)
+                ch[sl] = np.where(win, img, ch[sl])
+
     # keep only the piece holding the seed; a two-piece "cell" is a wrong annotation
     orphan = 0
     for n, slc in enumerate(ndi.find_objects(labels), start=1):
@@ -303,11 +328,15 @@ def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
             labels[slc][drop] = 0
             nuc_labels[slc][drop] = 0
             tau_img[slc][drop] = 0.0
+            if channels is not None:
+                for ch in channels:
+                    ch[slc][drop] = 0.0          # keep the image matching the trimmed mask
             orphan += int(drop.sum())
 
     present = np.flatnonzero(np.bincount(labels.ravel(), minlength=len(keep)+1)[1:])
     info = dict(n_cells=len(keep), centres=tape["xy"][keep], r_eff=r_eff, support=sup,
                 orphan_px=orphan, empty=len(keep)-len(present),
-                packing=float((labels > 0).sum() / max(sup.sum(), 1)))
+                packing=float((labels > 0).sum() / max(sup.sum(), 1)),
+                d_img=best, markers=channels)
     return labels, nuc_labels, tau_img, phi_img, info
 

@@ -18,8 +18,10 @@ class Tape(object):
         # boundary harmonics
         self.a = self.rng.standard_normal((n_cand, self.K))
         self.b = self.rng.standard_normal((n_cand, self.K))
-        # texture field
-        self.noise = self.rng.standard_normal((Pool, self.size, self.size))  
+        # texture field (sandbox resolution, one plane per pool)
+        self.noise = self.rng.standard_normal((Pool, self.size, self.size))
+        # texture field at tile resolution -- sliced per patch when rendering tissue markers
+        self.noise_tile = self.rng.standard_normal((Pool, tile, tile))
         ### Nuclear
         # independent nuclear dynamics
         self.a2 = self.rng.standard_normal((n_cand, self.K))
