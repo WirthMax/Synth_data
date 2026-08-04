@@ -73,9 +73,9 @@ def render_marker(comps, cell, tau, phi, d, tape, polarity=0.0, pol_dir=0.0, amp
     """amp * normalise( sum_k w_k * normalise(loc_k x tex_k) x polarity x env(d) ).
 
     Normalise INSIDE each pool (a pool is a product), ADD across pools (means add), apply
-    polarity, then multiply by the SMOOTH boundary envelope and rescale
-    once so the in-cell mean is exactly amp. `d` is the normalised radius from cell_fields;
-    edge_softness / edge_level tune the falloff (see boundary_falloff).
+    polarity, then multiply by the SMOOTH boundary envelope and rescale once so the marker's
+    mean intensity over the interior AREA is exactly amp. `d` is the normalised radius from
+    cell_fields; edge_softness / edge_level tune the falloff (see boundary_falloff).
     """
     out, wsum = np.zeros(cell.shape, float), 0.0
     for i, c in enumerate(comps):
@@ -87,7 +87,12 @@ def render_marker(comps, cell, tau, phi, d, tape, polarity=0.0, pol_dir=0.0, amp
     if polarity:
         out = out * np.exp(polarity * np.cos(phi - pol_dir))
     out = out * boundary_falloff(d, edge_softness, edge_level)   # smooth support, not a hard cut
-    return amp * out / (out[cell].mean() + 1e-12)
+    # Normalise by the marker's total energy over the interior AREA -- not the interior MEAN.
+    # The two agree for interior markers (skirt energy ~0), but when a marker peaks at or beyond
+    # the boundary (mu >= 1) the interior is dark, its mean collapses to ~0, and dividing by it
+    # would blow the boundary ring up without bound. Total-energy / area stays finite.
+    denom = out.sum() / max(int(cell.sum()), 1)
+    return amp * out / (denom + 1e-12)
 
 def render_cell(cell, markers):
     hi  = max(np.percentile(im[cell], 99.5) for im in markers)
