@@ -130,6 +130,8 @@ def generate_single_cell(Tape, i=0, size=201, radius=32, nuc_frac=0.45, rough=0.
 ### Tissue
 from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter
+from scipy import ndimage as ndi
+
 
 
 def stamp_cell(tape, i, cy, cx, tile, radius, nuc_frac, rough, elong, angle_deg, beta,
@@ -156,3 +158,156 @@ def support_mask(tape, scale_px=40.0, cover=0.75):
     z = gaussian_filter(tape["support"], scale_px, truncate=4.0)
     z = (z - z.mean()) / (z.std() + 1e-12)
     return z >= np.quantile(z, 1.0 - np.clip(cover, 0.0, 1.0))
+
+
+def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
+                 rough=0.15, beta=2.0, support_scale=40.0, cover=0.75, grow=1.35,
+                 nuc_frac=0.35, nuc_frac_sigma=0.15, rim=1.5, nuc_corr=0.5, nuc_offset=0.9,):
+    """Render a tile of packed cells: instance labels plus intrinsic coordinates.
+
+    Nothing here reads pixel data. The output is a deterministic function of (tape, theta),
+    which is what makes the label trustworthy as ground truth.
+
+    Parameters
+    ----------
+    tape : dict
+        Frozen randomness, drawn once and independent of every parameter below. Fields used
+        here: xy (candidate centres), order (hard-core priority), a/b (cell harmonics),
+        a2/b2 (independent nuclear harmonics), z_size, z_nucfrac, u_orient, u_offdir,
+        u_offmag, support, tile, K. Parameters only THRESHOLD or SMOOTHLY MAP these, never
+        resample them -- resampling per theta would make the fitting objective jagged.
+
+    Point process
+    -------------
+    min_dist : float, px
+        Hard-core radius: no two surviving centres are closer than this. GROUNDED -- measure
+        it from real nearest-neighbour distances rather than fitting it, since it defines the
+        mask. Roughly 1.2-1.8 x radius; too large and only a handful of candidates survive.
+    support_scale : float, px
+        Correlation length of the tissue-support field. Must stay >> cell size (>= ~4 x
+        radius) so the support boundary can never be mistaken for a cell edge.
+    cover : float in [0, 1]
+        Fraction of the tile that is tissue. Applied as a quantile of the support field, so
+        it maps monotonically onto realised coverage whatever the field's spread.
+
+    Cell geometry (all mask-defining -> GROUNDED, not fitted)
+    --------------------------------------------------------
+    radius : float, px
+        Median equivalent-circle radius of the FREE shape (area = pi r^2). Note the realised
+        label area differs after packing -- ground this against post-packing median area,
+        not against pi*radius^2.
+    size_sigma : float
+        Lognormal spread of cell size: realised r = radius * exp(size_sigma * z_size).
+        0.15 gives roughly +-15%.
+    elong : float >= 1
+        Median aspect ratio. Area-preserving (the body-frame map has unit determinant), so
+        this does not double as a size knob.
+    rough : float
+        Boundary irregularity, read as the SD of log radius: 0.15 ~ +-15% radial wobble.
+        Above ~0.35 territories start pinching apart -- watch info["orphan_px"].
+    beta : float
+        Spectral tilt of the boundary harmonics at FIXED amplitude. Large -> a few fat
+        lobes; small -> fine crenulation, which pinches at small radius. Below ~1.0 with
+        radius < 5 px the shape is no longer band-limited for the pixel grid.
+
+    Packing
+    -------
+    grow : float >= 1
+        How far a cell may claim pixels, in units of its own free boundary (d = rho/r).
+        1.0 -> free shapes with gaps between them; ~2 -> confluent, cells meeting along
+        contact surfaces. In dense regions a neighbour binds first and grow is inert; in
+        sparse regions grow alone sets the cell size.
+
+    Nucleus
+    -------
+    nuc_frac : float
+        Median nucleus:cell equivalent-radius ratio.
+    nuc_frac_sigma : float
+        Per-cell lognormal spread of that ratio. Set > 0, or nuclear area predicts cell area
+        exactly and a nucleus-only model can invert the whole segmentation.
+    nuc_corr : float in [0, 1]
+        How much the nuclear outline mirrors the cell outline. 1 -> a scaled copy (leaks
+        orientation and elongation); 0 -> independent. Implemented by mixing two frozen
+        draws, so it stays smooth and safe to fit.
+    nuc_offset : float in [0, 1]
+        Nuclear eccentricity, as a fraction of the free cytoplasmic room. 0 puts the nucleus
+        exactly on the tessellation seed, making the seed exactly recoverable from the
+        nucleus.
+    rim : float, px
+        Minimum cytoplasmic clearance between the nuclear and plasma membranes. Enforced on
+        the support function, so the labelled nuclear edge and the tau = 0 level set stay the
+        same curve. Must stay resolvable -- below ~1 px it vanishes after the PSF.
+
+    Returns
+    -------
+    labels : (tile, tile) int32       0 = background, k = cell k. THE GROUND TRUTH.
+    nuc_labels : (tile, tile) int32   nuclei, same ids as `labels`.
+    tau_img : (tile, tile) float      -1 nucleus centre, 0 nuclear envelope, +1 free
+                                      membrane. Exceeds 1 in contact zones when grow > 1.
+    phi_img : (tile, tile) float      body-frame angle, co-rotating with each cell.
+    info : dict                       n_cells, centres, r_eff, support, orphan_px, empty,
+                                      packing (cell pixels / support pixels).
+    """
+    tile = tape["tile"]
+    # generate a support mask to limit the area where cells can be placed
+    sup = support_mask(tape, support_scale, cover)
+    # keep only the candidates that are sufficiently far apart and within the support mask
+    keep = thin(tape, min_dist)
+    cy0, cx0 = tape["xy"][keep].T
+    keep = keep[sup[np.clip(cy0.astype(int), 0, tile-1),
+                    np.clip(cx0.astype(int), 0, tile-1)]]
+
+    best       = np.full((tile, tile), np.inf)
+    labels     = np.zeros((tile, tile), np.int32)
+    nuc_labels = np.zeros((tile, tile), np.int32)
+    tau_img    = np.zeros((tile, tile))
+    phi_img    = np.zeros((tile, tile))
+    r_eff = radius * np.exp(size_sigma * tape["z_size"][keep])
+
+
+    nf = np.clip(nuc_frac * np.exp(nuc_frac_sigma * tape["z_nucfrac"][keep]), 0.15, 0.85)
+
+    for n, i in enumerate(keep, start=1):
+        cy, cx = tape["xy"][i]
+        
+        f, (y0, x0) = stamp_cell(
+            tape = tape, i = i, cy = cy, cx = cx, tile = tile, radius = r_eff[n-1], 
+            nuc_frac = nf[n-1], rough = rough, elong = elong, 
+            angle_deg = 180.0 * tape["u_orient"][i], beta = beta,
+            grow=grow, rim=rim, nuc_corr=nuc_corr, nuc_offset=nuc_offset, 
+        )
+        h, w = f["d"].shape
+        if h == 0 or w == 0:
+            continue
+        sl = (slice(y0, y0+h), slice(x0, x0+w))
+        
+        # tesselation to decide which cell is closest to each pixel 
+        # -> find boundries
+        win = (f["d"] < best[sl]) & (f["d"] <= grow) & sup[sl]
+        best[sl] = np.where(win, f["d"], best[sl])
+        labels[sl] = np.where(win, n, labels[sl])
+        tau_img[sl] = np.where(win, f["tau"], tau_img[sl])
+        phi_img[sl] = np.where(win, f["phi"], phi_img[sl])
+        nuc_labels[sl] = np.where(win, f["nuc"]*n, nuc_labels[sl])
+        
+    # keep only the piece holding the seed; a two-piece "cell" is a wrong annotation
+    orphan = 0
+    for n, slc in enumerate(ndi.find_objects(labels), start=1):
+        if slc is None:
+            continue
+        m = labels[slc] == n
+        cc, k = ndi.label(m)
+        if k > 1:
+            main = 1 + int(np.argmax(np.bincount(cc.ravel())[1:]))
+            drop = m & (cc != main)
+            labels[slc][drop] = 0
+            nuc_labels[slc][drop] = 0
+            tau_img[slc][drop] = 0.0
+            orphan += int(drop.sum())
+
+    present = np.flatnonzero(np.bincount(labels.ravel(), minlength=len(keep)+1)[1:])
+    info = dict(n_cells=len(keep), centres=tape["xy"][keep], r_eff=r_eff, support=sup,
+                orphan_px=orphan, empty=len(keep)-len(present),
+                packing=float((labels > 0).sum() / max(sup.sum(), 1)))
+    return labels, nuc_labels, tau_img, phi_img, info
+
