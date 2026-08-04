@@ -50,19 +50,32 @@ def field(noise, kind="blob", scale_px=4.0, wavelength_px=8.0, coherence=2.0,
     z = np.fft.ifft2(np.fft.fft2(noise) * H).real
     return z / (z.std() + 1e-12)
 
+def boundary_falloff(d, edge_softness=0.06, edge_level=0.5):
+    """Smooth cell-support envelope in the normalised radius d = rho / r(phi).
+    Marker fades ACROSS the outline instead ofbeing clipped at it. 
+    """
+    p = float(np.clip(edge_level, 1e-3, 1.0 - 1e-3))
+    s = max(float(edge_softness), 1e-6)
+    c = 1.0 + s * np.log(p / (1.0 - p))          # env(1) == p
+    return 1.0 / (1.0 + np.exp(np.clip((d - c) / s, -700.0, 700.0)))
+
+
 def pool_image(c, cell, tau, tape_plane):
     """One pool = its own localisation x its own texture, normalised to in-cell mean 1."""
     loc = localization_function(tau, mu=c["mu"], width=c["width"], sharp=c["sharp"])
     tex = np.exp(c["strength"] * field(tape_plane, **{k: c[k] for k in _FIELD_KEYS if k in c}))
-    f = loc * tex * cell
+    f = loc * tex
     return f / (f[cell].mean() + 1e-12)
 
 
-def render_marker(comps, cell, tau, phi, tape, polarity=0.0, pol_dir=0.0, amp=1.0):
-    """amp * normalise( sum_k w_k * normalise(loc_k x tex_k) x polarity ).
+def render_marker(comps, cell, tau, phi, d, tape, polarity=0.0, pol_dir=0.0, amp=1.0,
+                  edge_softness=0.06, edge_level=0.5):
+    """amp * normalise( sum_k w_k * normalise(loc_k x tex_k) x polarity x env(d) ).
 
-    Normalise INSIDE each pool (a pool is a product), ADD across pools (means add),
-    then apply polarity and rescale once so the in-cell mean is exactly amp.
+    Normalise INSIDE each pool (a pool is a product), ADD across pools (means add), apply
+    polarity, then multiply by the SMOOTH boundary envelope and rescale
+    once so the in-cell mean is exactly amp. `d` is the normalised radius from cell_fields;
+    edge_softness / edge_level tune the falloff (see boundary_falloff).
     """
     out, wsum = np.zeros(cell.shape, float), 0.0
     for i, c in enumerate(comps):
@@ -73,6 +86,7 @@ def render_marker(comps, cell, tau, phi, tape, polarity=0.0, pol_dir=0.0, amp=1.
     out = out / wsum if wsum > 0 else cell.astype(float)
     if polarity:
         out = out * np.exp(polarity * np.cos(phi - pol_dir))
+    out = out * boundary_falloff(d, edge_softness, edge_level)   # smooth support, not a hard cut
     return amp * out / (out[cell].mean() + 1e-12)
 
 def render_cell(cell, markers):
