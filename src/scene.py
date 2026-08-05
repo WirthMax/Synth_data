@@ -217,7 +217,7 @@ def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, gr
 
 def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius, 
                       rough, beta, rot, angle_deg, elong, rim, nuc_offset, off_dir, off_mag, grow, 
-                      centre = (0.0, 0.0, 0.0)):
+                      centre = (0.0, 0.0, 0.0), rough_nuc = None, beta_nuc=None):
     """Shared core: both wrappers do exactly this, only the grid differs.
 
     body_grow scales the cell contour (not the nucleus); see cell_fields. Default 1.0 = the
@@ -225,7 +225,11 @@ def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
     """
     cn = mix_harmonics(c_cell, c_nuc, nuc_corr)
     r_cell_fn = make_boundary(c_cell, radius, rough, beta, L, l_min)
-    r_nuc_fn = make_boundary(c_nuc, radius * nuc_frac, rough * 0.6, beta, L, l_min)
+    if rough_nuc is None:
+        rough_nuc = rough * 0.6
+    if rough_nuc is None:
+        beta_nuc = beta
+    r_nuc_fn = make_boundary(c_nuc, radius * nuc_frac, rough_nuc, beta_nuc, L, l_min)
     rho_c, phi_c = body_frame(grid, rot = rot, centre = centre, angle_deg=angle_deg, elong=elong)
     print(rho_c.shape, phi_c.shape)
     ncentre = nucleus_centre(centre = centre, radius = radius, nuc_frac = nuc_frac, 
@@ -246,7 +250,8 @@ def generate_single_cell_3d(Tape,
                             size=(128, 128, 128), spacing = 1.0, L=4, l_min=2,
                             i = 0, 
                             polar_deg=70.0, azim_deg=30.0, roll_deg=0.0,
-                            nuc_corr=0.5, nuc_frac=0.25, radius=32, rough=0.25, beta=0.5, 
+                            nuc_corr=0.5, nuc_frac=0.25, radius=32, rough=0.25, rough_nuc =0.1, 
+                            beta=0.5, beta_nuc=0.9, 
                             angle_deg = 0.0, elong = 1.0, rim = 1.5, nuc_offset = 0.6, 
                             off_dir = 0.0, off_mag = 1.0, grow = 1.0
                             ):
@@ -256,7 +261,8 @@ def generate_single_cell_3d(Tape,
     rot = rotation_matrix(polar_deg=polar_deg, azim_deg=azim_deg, roll_deg=roll_deg)
     return _cell_and_nucleus(
         c_cell = Tape["sh"][i], c_nuc = Tape["sh2"][i], grid = grid, L = L, l_min = l_min,
-        nuc_corr = nuc_corr, nuc_frac = nuc_frac, radius = radius, rough = rough, beta = beta,
+        nuc_corr = nuc_corr, nuc_frac = nuc_frac, radius = radius, rough = rough, rough_nuc =rough_nuc, 
+        beta=beta, beta_nuc=beta_nuc,
         rot = rot, angle_deg = angle_deg, elong = elong, rim = rim, 
         nuc_offset = nuc_offset, off_dir=Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i], grow = grow
         )
