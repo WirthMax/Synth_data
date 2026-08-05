@@ -1,39 +1,147 @@
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 
-def make_boundary(a, b, R, kappa, beta, K, extra=0.0, n_quad=1024):
-    """Return r(phi): the support function of one contour, area normalised to pi*R^2.
-
-    Returns a CALLABLE rather than an array, because the sandbox and the tile need it on
-    different point sets. The expensive part (the area quadrature) happens once, here.
+def _sh_terms(u, L=4, l_min=2):
+    """Yield real orthonormal spherical harmonics one at a time, in (l, m) order.
+    Assumes `u` is a normalized Cartesian vector array: u[..., 0]=x, u[..., 1]=y, u[..., 2]=z.
     """
-    k = np.arange(1, K+1)
-    w = kappa * k ** -(beta + extra)
-    w = w / (np.linalg.norm(w) + 1e-12) * kappa
-    wa, wb = w * a, w * b
+    x, y, z = u[..., 0], u[..., 1], u[..., 2]
+    xx, yy, zz = x * x, y * y, z * z
+    p = np.pi
 
-    def g(p):
-        return np.cos(p[..., None] * k) @ wa + np.sin(p[..., None] * k) @ wb
+    if l_min <= 0 <= L:
+        yield np.broadcast_to(np.float64(0.5 * np.sqrt(1 / p)), x.shape)
+    if l_min <= 1 <= L:
+        c = np.sqrt(3 / (4 * p))
+        yield c * y; yield c * z; yield c * x
+    if l_min <= 2 <= L:
+        yield 0.5 * np.sqrt(15 / p) * x * y
+        yield 0.5 * np.sqrt(15 / p) * y * z
+        yield 0.25 * np.sqrt(5 / p) * (3 * zz - 1.0)
+        yield 0.5 * np.sqrt(15 / p) * x * z
+        yield 0.25 * np.sqrt(15 / p) * (xx - yy)
+    if l_min <= 3 <= L:
+        yield 0.25 * np.sqrt(35 / (2 * p)) * y * (3 * xx - yy)
+        yield 0.5 * np.sqrt(105 / p) * x * y * z
+        yield 0.25 * np.sqrt(21 / (2 * p)) * y * (5 * zz - 1.0)
+        yield 0.25 * np.sqrt(7 / p) * z * (5 * zz - 3.0)
+        yield 0.25 * np.sqrt(21 / (2 * p)) * x * (5 * zz - 1.0)
+        yield 0.25 * np.sqrt(105 / p) * z * (xx - yy)
+        yield 0.25 * np.sqrt(35 / (2 * p)) * x * (xx - 3 * yy)
+    if l_min <= 4 <= L:
+        yield 0.75 * np.sqrt(35 / p) * x * y * (xx - yy)
+        yield 0.75 * np.sqrt(35 / (2 * p)) * y * z * (3 * xx - yy)
+        yield 0.75 * np.sqrt(5 / p) * x * y * (7 * zz - 1.0)
+        yield 0.75 * np.sqrt(5 / (2 * p)) * y * z * (7 * zz - 3.0)
+        yield (3 / 16) * np.sqrt(1 / p) * (35 * zz * zz - 30 * zz + 3.0)
+        yield 0.75 * np.sqrt(5 / (2 * p)) * x * z * (7 * zz - 3.0)
+        yield (3 / 8) * np.sqrt(5 / p) * (xx - yy) * (7 * zz - 1.0)
+        yield 0.75 * np.sqrt(35 / (2 * p)) * x * z * (xx - 3 * yy)
+        yield (3 / 16) * np.sqrt(35 / p) * (xx * (xx - 3 * yy) - yy * (3 * xx - yy))
 
-    phi_q = np.linspace(0.0, 2.0 * np.pi, n_quad)
-    area = 0.5 * np.trapezoid(np.exp(g(phi_q)) ** 2, phi_q)   # area of this shape at R=1
-    scale = R * np.sqrt(np.pi / area)
-    return lambda p: scale * np.exp(g(p))
+def sh_eval(u, c, L=4, l_min=2, dtype=np.float32):
+    """sum_j c_j Y_j(u), accumulated term by term so nothing large is materialised."""
+    out = np.zeros(u.shape[:-1], dtype)
+    sh_terms = list(_sh_terms(u, L, l_min))
+    for cj, term in zip(c, sh_terms):
+        if cj != 0.0:
+            out += (cj * term).astype(dtype, copy=False)
+    return out
+
+def sh_basis(u, L=4, l_min=2):
+    """Stacked basis, (..., n_lm). Only for small point sets -- see `_sh_terms`."""
+    return np.stack(list(_sh_terms(u, L, l_min)), -1)
+
+def sh_degrees(L=4, l_min=2):
+    """The degrees of each basis column, so the spectrum can be applied per column."""
+    return np.concatenate([np.full(2 * l + 1, l) for l in range(l_min, L + 1)])
 
 
-def body_frame(y, x, cy=0.0, cx=0.0, angle_deg=0.0, elong=1.0):
-    """Image coordinates -> (rho, phi) in the cell's rotated, un-stretched frame."""
-    t, s = np.deg2rad(angle_deg), np.sqrt(elong)
-    dy, dx = y - cy, x - cx
-    xr = dx * np.cos(t) + dy * np.sin(t)
-    yr = -dx * np.sin(t) + dy * np.cos(t)
-    return np.hypot(xr / s, yr * s), np.arctan2(yr * s, xr / s)
+def n_sh(L=4, l_min=2):
+    """Compute the total number of spherical harmonics for given range of l."""
+    return int(sh_degrees(L, l_min).size)
 
 
-def centred_grid(size):
-    """Full grid with the origin at the image centre -- the sandbox case."""
-    y, x = np.mgrid[:size, :size] - (size - 1) / 2.0
-    return y, x
+def sphere_quadrature(n_theta=48, n_phi=96):
+    """Gauss-Legendre in cos(theta) x uniform in phi. Returns (u [N,3], w [N]), sum(w) = 4 pi."""
+    ct, wct = np.polynomial.legendre.leggauss(n_theta)
+    st = np.sqrt(np.maximum(1.0 - ct ** 2, 0.0))
+    ph = (np.arange(n_phi) + 0.5) * (2.0 * np.pi / n_phi)
+    u = np.stack([np.outer(st, np.cos(ph)),
+                  np.outer(st, np.sin(ph)),
+                  np.repeat(ct[:, None], n_phi, 1)], -1).reshape(-1, 3)
+    w = np.repeat(wct[:, None], n_phi, 1).ravel() * (2.0 * np.pi / n_phi)
+    return u, w
+
+def make_boundary(coeff, R, kappa, beta, L = 4, l_min = 2):
+    """Return r(phi): the support function of one contour, volume normalised to (4/3)pi R^3.
+Coeff holds all the randomness — one frozen row per cell. 
+In 2D the boundary is a Fourier series in the angle φ; in 3D it's the same idea with spherical harmonics over directions on the sphere. 
+The coefficients are amplitudes of global patterns, not points: each one perturbs the radius everywhere at once, at its own angular frequency.
+w is a spectral envelope. beta tilts it (how much coarse vs fine detail), and it's then 
+renormalised so the total is 4πκ² — which makes rough mean exactly "SD of log-radius", independent of beta and L.
+Multiplying coeff * w realises one specific cell's amplitudes: to be always positive, defined continuously in every direction.
+The only thing left is the size. A quadrature over the sphere measures this shape's volume at scale = 1, 
+and scale is then set so the volume equals (4/3)πR³. So radius is the equivalent-sphere radius, whatever the roughness.
+    """
+    # compute w with the spherical harmonics
+    
+    # compute the weight for each degree, such that all weights of a degree are equal 
+    w = sh_degrees(L, l_min).astype(float) ** -float(beta)
+    # renormalization factor to ensure the area is correct
+    # With this, changing beta only changes the kind of roughness, not the overall size of the cell.
+    w * (kappa * np.sqrt(4.0 * np.pi) / np.sqrt((w ** 2).sum() + 1e-30))
+    c = w*coeff
+    
+    # Compute quadrate to pinpount size and then scale accordingly
+    uq, wq = sphere_quadrature()
+    gq = sh_basis(uq, L, l_min) @ c
+    # volume at scale = 1
+    vol = float((np.exp(3.0 * gq) * wq).sum() / 3.0)          
+    scale = R * ((4.0 * np.pi / 3.0) / max(vol, 1e-30)) ** (1.0 / 3.0)
+    return lambda u: scale * np.exp(sh_eval(u, c, L, l_min))
+
+def rotation_matrix(polar_deg=0.0, azim_deg=0.0, roll_deg=0.0):
+    return R.from_euler('ZYZ', [azim_deg, polar_deg, roll_deg], degrees=True).as_matrix()
+
+
+def _stretch(elong):
+    """Volume-preserving ellipsoid semi-axes: `elong` along body-z, elong^-1/2 across.
+    The product A * B^2 = 1 always, so elongation cannot leak into cell size.
+    """
+    A = float(elong)
+    B = A ** -0.5
+    return np.array([B, B, A])
+
+def body_frame(grid, rot, centre = (0.0, 0.0, 0.0), angle_deg=0.0, elong=1.0):
+    """Image coordinates -> (rho, phi) in the cell's rotated, un-stretched frame.
+    Do this to prevent having to expensively re-derive the cells shape parameters """
+    # 1 Center to the cells coordinate systen
+    d = (grid - np.asarray(centre, np.float32)).astype(np.float32, copy=False)
+    # 2 Rotate so the long axis in in body-z
+    if rot is not None:
+        d = d @ np.asarray(rot, np.float32)
+    # 3 Unstretch ellipsoid
+    d = d / _stretch(elong).astype(np.float32)
+    rho = np.sqrt((d * d).sum(-1))
+    return rho, d / np.maximum(rho, 1e-6)[..., None]
+    
+
+
+def centred_grid_3d(shape, spacing=1.0):
+    """Full grid with the origin at the image centre -- the sandbox case in 3d."""
+    nz, ny, nx = shape
+    # set up bounding box of size nz, ny, nx but centered at 0,0,0. 
+    # The spacing is the distance between pixels in each dimension.
+    # Only relevant if the sampling is not isotropic, i.e. distances between 
+    # pixels in z direction are larger.
+    sz, sy, sx = (spacing,) * 3 if np.isscalar(spacing) else spacing
+    z = (np.arange(nz, dtype=np.float32) - (nz - 1) / 2.0) * sz
+    y = (np.arange(ny, dtype=np.float32) - (ny - 1) / 2.0) * sy
+    x = (np.arange(nx, dtype=np.float32) - (nx - 1) / 2.0) * sx
+    Z, Y, X = np.meshgrid(z, y, x, indexing="ij")
+    return np.stack([X, Y, Z], -1)
 
 
 def patch_grid(cy, cx, reach, tile):
@@ -53,31 +161,34 @@ def reach_px(R, elong, rough, grow=1.0, pad=2):
     return int(np.ceil(R * grow * max(s, 1.0 / s) * np.exp(3.0 * rough))) + pad
 
 
-def mix_harmonics(a, b, a2, b2, corr):
+def mix_harmonics(sh, sh2, corr):
     """Nuclear coefficients correlated with the cell's at level `corr`, without resampling."""
     c = float(np.clip(corr, 0.0, 1.0))
     s = np.sqrt(1.0 - c * c)
-    return c * a + s * a2, c * b + s * b2
+    return c * sh + s * sh2
 
+def to_world(offset_body, rot=None, elong=1.0):
+    """Body-frame (un-stretched) offset -> world offset: re-apply the stretch, then rotate.
 
-def nucleus_centre(cy, cx, radius, nuc_frac, rim, elong, angle_deg,
-                   nuc_offset, off_dir, off_mag):
-    """Displace the nucleus inside its cell; returns the IMAGE-frame nuclear centre.
-
-    `free` is a body-frame length, so the displacement is built in the body frame and then
-    mapped back out: undo the stretch, then undo the rotation. Adding it directly in image
-    coordinates would make nuc_offset mean something different at every orientation.
+    A body-frame length means the same thing at every orientation only if it is built here
+    and mapped out, never added directly in world coordinates.
     """
+    o = np.asarray(offset_body, float) * _stretch(elong)
+    return o if rot is None else np.asarray(rot, float) @ o
+
+def nucleus_centre(centre, radius, nuc_frac, rim, elong, rot,
+                   nuc_offset, off_dir, off_mag):
+    """Compute the nucleus centre, given the cell centre and shape parameters.
+    """
+    # Compute freespace to membrane with rim space
     free = max(radius * (1.0 - nuc_frac) - rim, 0.0)
-    m = nuc_offset * free * off_mag
-    t, s = np.deg2rad(angle_deg), np.sqrt(elong)
-    ox_b, oy_b = m * np.cos(off_dir), m * np.sin(off_dir)
-    ox, oy = ox_b * s, oy_b / s
-    return (cy + ox * np.sin(t) + oy * np.cos(t),
-            cx + ox * np.cos(t) - oy * np.sin(t))
+    
+    off = np.asarray(off_dir, float)
+    off = off / (np.linalg.norm(off) + 1e-30)
+    return np.asarray(centre, float) + to_world(off * (nuc_offset * free * off_mag), rot, elong)
 
 
-def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, body_grow=1.0):
+def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, grow=1.0):
     """Masks and coordinates from two supports about POSSIBLY DIFFERENT centres.
 
     psi = rho - r(phi) is signed (negative inside), measured relative to each contour --
@@ -85,12 +196,12 @@ def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, bo
     The containment clip is applied to psi_n ONCE and both outputs derive from it, so the
     labelled nuclear edge and the tau = 0 level set stay the same curve.
 
-    body_grow scales the CELL contour only (r_c -> body_grow * r_c), leaving the nucleus
+    grow scales the CELL contour only (r_c -> grow * r_c), leaving the nucleus
     untouched. 1.0 = the free shape (the mask uses this). grow > 1 gives the packed body: d,
     cell and tau then reference the grown membrane, so a marker rendered on these fields fills
     the tessellated territory instead of just the free shape.
     """
-    r_c = r_c * body_grow
+    r_c = r_c * grow
     d = rho_c / np.maximum(r_c, 1e-6)
     out = {"d": d, "cell": d <= 1.0, "phi": phi_c, "rho": rho_c}
     if r_n is None:
@@ -104,40 +215,51 @@ def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, bo
     return out
 
 
-def _cell_and_nucleus(a, b, a2, b2, y, x, cy, cx, radius, nuc_frac, rough, beta, K,
-                      elong, angle_deg, rim, nuc_corr, nuc_offset, off_dir, off_mag,
-                      body_grow=1.0):
+def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius, 
+                      rough, beta, rot, angle_deg, elong, rim, nuc_offset, off_dir, off_mag, grow, 
+                      centre = (0.0, 0.0, 0.0)):
     """Shared core: both wrappers do exactly this, only the grid differs.
 
     body_grow scales the cell contour (not the nucleus); see cell_fields. Default 1.0 = the
     free shape used everywhere for the mask; > 1 gives the packed body for marker rendering.
     """
-    an, bn = mix_harmonics(a, b, a2, b2, nuc_corr)          # nucleus ONLY
-    r_cell_fn = make_boundary(a, b, radius, rough, beta, K)
-    r_nuc_fn = make_boundary(an, bn, radius * nuc_frac, rough * 0.6, beta, K, extra=1.5)
+    cn = mix_harmonics(c_cell, c_nuc, nuc_corr)
+    r_cell_fn = make_boundary(c_cell, radius, rough, beta, L, l_min)
+    r_nuc_fn = make_boundary(c_nuc, radius * nuc_frac, rough * 0.6, beta, L, l_min)
+    rho_c, phi_c = body_frame(grid, rot = rot, centre = centre, angle_deg=angle_deg, elong=elong)
+    print(rho_c.shape, phi_c.shape)
+    ncentre = nucleus_centre(centre = centre, radius = radius, nuc_frac = nuc_frac, 
+                             rim = rim, elong = elong, rot = rot, 
+                             nuc_offset = nuc_offset, off_dir = off_dir, off_mag = off_mag)
+    
+    rho_n, phi_n = body_frame(grid, rot = rot, centre = ncentre, angle_deg=angle_deg, elong=elong)
 
-    rho_c, phi_c = body_frame(y, x, cy, cx, angle_deg, elong)
-    ncy, ncx = nucleus_centre(cy, cx, radius, nuc_frac, rim, elong, angle_deg,
-                              nuc_offset, off_dir, off_mag)
-    rho_n, phi_n = body_frame(y, x, ncy, ncx, angle_deg, elong)
-
-    f = cell_fields(rho_c, phi_c, r_cell_fn(phi_c), rho_n, phi_n, r_nuc_fn(phi_n), rim,
-                    body_grow=body_grow)
-    f["nuc_centre"] = (ncy, ncx)
+    f = cell_fields(rho_c, phi_c, r_cell_fn(phi_c), 
+                    rho_n, phi_n, r_nuc_fn(phi_n), 
+                    rim, grow=grow)
+    f["nuc_centre"] = ncentre
+    f["r_cell_fn"], f["r_nuc_fn"] = r_cell_fn, r_nuc_fn
     return f
 
 
-def generate_single_cell(Tape, i=0, size=201, radius=32, nuc_frac=0.45, rough=0.25,
-                         elong=1.6, angle_deg=30, beta=1.9, rim=1.5,
-                         nuc_corr=0.4, nuc_offset=0.6):
+def generate_single_cell_3d(Tape, 
+                            size=(128, 128, 128), spacing = 1.0, L=4, l_min=2,
+                            i = 0, 
+                            polar_deg=70.0, azim_deg=30.0, roll_deg=0.0,
+                            nuc_corr=0.5, nuc_frac=0.25, radius=32, rough=0.25, beta=0.5, 
+                            angle_deg = 0.0, elong = 1.0, rim = 1.5, nuc_offset = 0.6, 
+                            off_dir = 0.0, off_mag = 1.0, grow = 1.0
+                            ):
     """Sandbox: candidate i from the tape, centred in its own image."""
-    y, x = centred_grid(size)
+    
+    grid = centred_grid_3d(size, spacing=spacing)
+    rot = rotation_matrix(polar_deg=polar_deg, azim_deg=azim_deg, roll_deg=roll_deg)
     return _cell_and_nucleus(
-        Tape["a"][i], Tape["b"][i], Tape["a2"][i], Tape["b2"][i], y, x, 0.0, 0.0,
-        radius, nuc_frac, rough, beta, Tape["K"], elong, angle_deg, rim,
-        nuc_corr, nuc_offset,
-        off_dir=2 * np.pi * Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i])
-
+        c_cell = Tape["sh"][i], c_nuc = Tape["sh2"][i], grid = grid, L = L, l_min = l_min,
+        nuc_corr = nuc_corr, nuc_frac = nuc_frac, radius = radius, rough = rough, beta = beta,
+        rot = rot, angle_deg = angle_deg, elong = elong, rim = rim, 
+        nuc_offset = nuc_offset, off_dir=Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i], grow = grow
+        )
 
 ### Tissue
 from scipy.spatial import cKDTree

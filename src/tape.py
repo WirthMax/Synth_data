@@ -1,4 +1,5 @@
 import numpy as np
+from scene import n_sh
 
 
 class Tape(object):
@@ -44,6 +45,19 @@ class Tape(object):
         self.z_size=self.rng.standard_normal(n_cand)
         # per-cell orientation
         self.u_orient=self.rng.random(n_cand)
+        
+        
+    def draw3d(self, vol=(128, 128, 128), n_cand=1500, Pool = 3, l_min = 2, L = 4):
+        self.vol = tuple(vol)
+        self.L = L
+        self.l_min = l_min
+        self.n_lm = n_sh(L, l_min)
+        # Every degree l carries orders m = −l, −l+1, …, +l, which is 2l + 1 functions.
+        # cellular harmoics
+        self.sh = self.rng.standard_normal((n_cand, self.n_lm))
+        # nuclear harmoics
+        self.sh2 = self.rng.standard_normal((n_cand, self.n_lm))
+        
 
     # Add this method to allow bracket access
     def __getitem__(self, key):

@@ -2,6 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
+from scene import _stretch, rotation_matrix
+
 def plot_polar_phi(phi_img, background_mask=None):
     """
     Plots a polar coordinate image (phi) with a Cellpose-style rainbow colormap.
@@ -106,3 +108,104 @@ def plot_tau(tau_img, background_mask=None):
     ax.axis('off')
     
     return fig, ax
+
+
+
+def surface_xyz_inline(rfn, elong, polar_deg, azim_deg, roll_deg, centre=(0, 0, 0), nt=160, npz=320):
+    """Support function -> (X, Y, Z) grids for plot_surface, plus r for colouring."""
+    th = np.linspace(0, np.pi, nt)
+    ph = np.linspace(0, 2 * np.pi, npz)
+    T, P = np.meshgrid(th, ph, indexing="ij")
+    u = np.stack([np.sin(T) * np.cos(P), np.sin(T) * np.sin(P), np.cos(T)], -1)
+    r = rfn(u)                                                  # radius in the BODY frame
+    p = r[..., None] * u                                        # 1. template point
+    p = p * _stretch(elong)                                     # 2. stretch
+    p = p @ rotation_matrix(polar_deg, azim_deg, roll_deg).T    # 3. rotate  (row vectors -> .T)
+    p = p + np.asarray(centre, float)                           # 4. translate
+    return p[..., 0], p[..., 1], p[..., 2], r
+
+
+def plot_surface_xyz_inline(cell, elong, polar_deg, azim_deg, roll_deg):
+    X,  Y,  Z,  r = surface_xyz_inline(cell["r_cell_fn"], elong = elong,
+                                       polar_deg = polar_deg, azim_deg = azim_deg, 
+                                       roll_deg = roll_deg
+                                       )
+    Xn, Yn, Zn, _ = surface_xyz_inline(cell["r_nuc_fn"], elong = elong, 
+                                       polar_deg = polar_deg, azim_deg = azim_deg, 
+                                       roll_deg = roll_deg,
+                                       centre=cell["nuc_centre"]
+                                       )
+
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    n = (r - r.min()) / (np.ptp(r) + 1e-9)
+    ax.plot_surface(X, Y, Z, facecolors=plt.cm.viridis(n), rstride=2, cstride=2,
+                    linewidth=0, antialiased=True, shade=False, alpha=0.45)
+    ax.plot_surface(Xn, Yn, Zn, color="#111820", rstride=3, cstride=3, linewidth=0, shade=True)
+
+    # equal aspect -- see below
+    m   = np.array([X.mean(), Y.mean(), Z.mean()])
+    rad = max(np.ptp(X), np.ptp(Y), np.ptp(Z)) / 2 * 1.05
+    ax.set_xlim(m[0]-rad, m[0]+rad); ax.set_ylim(m[1]-rad, m[1]+rad); ax.set_zlim(m[2]-rad, m[2]+rad)
+    ax.set_box_aspect([1, 1, 1])
+    ax.set_title("3D Cell Boundary")
+    plt.show()
+    return fig
+
+import plotly.graph_objects as go
+
+def plot_surface_xyz_html(cell, elong, polar_deg, azim_deg, roll_deg, out_path):
+    
+    X,  Y,  Z,  r = surface_xyz_inline(cell["r_cell_fn"], elong = elong,
+                                       polar_deg = polar_deg, azim_deg = azim_deg, 
+                                       roll_deg = roll_deg
+                                       )
+    Xn, Yn, Zn, _ = surface_xyz_inline(cell["r_nuc_fn"], elong = elong, 
+                                       polar_deg = polar_deg, azim_deg = azim_deg, 
+                                       roll_deg = roll_deg,
+                                       centre=cell["nuc_centre"]
+                                       )
+    fig = go.Figure()
+
+    # 1. Add the Cell Membrane (Transparent, colored by radius)
+    fig.add_trace(go.Surface(
+        x=X, y=Y, z=Z,
+        surfacecolor=r,           # Color based on radius
+        colorscale='Viridis',
+        opacity=0.45,             # Matches your matplotlib alpha=0.45
+        name='Cell Membrane',
+        showscale=False           # Hides the colorbar
+    ))
+
+    # 2. Add the Nucleus (Solid dark color)
+    # Plotly surfaces expect a colorscale. To make it a solid hex color like "#111820", 
+    # we create a flat colorscale and pass a dummy surfacecolor array of zeros.
+    solid_dark = [[0, '#111820'], [1, '#111820']]
+
+    fig.add_trace(go.Surface(
+        x=Xn, y=Yn, z=Zn,
+        surfacecolor=np.zeros_like(Zn), 
+        colorscale=solid_dark,
+        opacity=1.0,
+        name='Nucleus',
+        showscale=False,
+        lighting=dict(ambient=0.4, diffuse=0.8, specular=0.2) # Approximates shade=True
+    ))
+
+    # 3. Configure the layout and 3D scene
+    fig.update_layout(
+        title="3D Cell Boundary",
+        scene=dict(
+            aspectmode='data',    # Automatically handles the equal aspect ratio bounding box!
+            xaxis_title='X',
+            yaxis_title='Y',
+            zaxis_title='Z'
+        ),
+        margin=dict(l=0, r=0, b=0, t=40)
+    )
+
+    # 4. Save to an interactive standalone HTML file
+    output_file = "interactive_cell_3d.html"
+    out_path.mkdir(parents=True, exist_ok=True)
+    fig.write_html(out_path / output_file)
+    print(f"Saved interactive plot to {output_file}")
