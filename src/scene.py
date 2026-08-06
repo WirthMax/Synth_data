@@ -2,6 +2,27 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 
+
+# To prevent rerunning things if they already ran once
+_QUAD = None
+_FIT_DIRS = None
+
+
+def _quad():
+    global _QUAD
+    if _QUAD is None:
+        _QUAD = sphere_quadrature()
+    return _QUAD
+
+def fit_directions(n_theta=24, n_phi=48):
+    """Cached unit directions for the containment tests.
+    """
+    global _FIT_DIRS
+    if _FIT_DIRS is None or _FIT_DIRS[1] != (n_theta, n_phi):
+        _FIT_DIRS = (sphere_quadrature(n_theta, n_phi)[0].astype(np.float64),
+                     (n_theta, n_phi))
+    return _FIT_DIRS[0]
+
 def _sh_terms(u, L=4, l_min=2):
     """Yield real orthonormal spherical harmonics one at a time, in (l, m) order.
     Assumes `u` is a normalized Cartesian vector array: u[..., 0]=x, u[..., 1]=y, u[..., 2]=z.
@@ -87,7 +108,10 @@ and scale is then set so the volume equals (4/3)πR³. So radius is the equivale
     """
     # compute w with the spherical harmonics
     
-    # compute the weight for each degree, such that all weights of a degree are equal 
+    # compute the weight for each degree, such that all weights of a degree are equal
+    print(L)
+    print(l_min)
+    print(beta)
     w = sh_degrees(L, l_min).astype(float) ** -float(beta)
     # renormalization factor to ensure the area is correct
     # With this, changing beta only changes the kind of roughness, not the overall size of the cell.
@@ -95,7 +119,7 @@ and scale is then set so the volume equals (4/3)πR³. So radius is the equivale
     c = w*coeff
     
     # Compute quadrate to pinpount size and then scale accordingly
-    uq, wq = sphere_quadrature()
+    uq, wq = _quad()
     gq = sh_basis(uq, L, l_min) @ c
     # volume at scale = 1
     vol = float((np.exp(3.0 * gq) * wq).sum() / 3.0)          
@@ -114,7 +138,7 @@ def _stretch(elong):
     B = A ** -0.5
     return np.array([B, B, A])
 
-def body_frame(grid, rot, centre = (0.0, 0.0, 0.0), angle_deg=0.0, elong=1.0):
+def body_frame(grid, rot, centre = (0.0, 0.0, 0.0), elong=1.0):
     """Image coordinates -> (rho, phi) in the cell's rotated, un-stretched frame.
     Do this to prevent having to expensively re-derive the cells shape parameters """
     # 1 Center to the cells coordinate systen
@@ -165,7 +189,7 @@ def mix_harmonics(sh, sh2, corr):
     """Nuclear coefficients correlated with the cell's at level `corr`, without resampling."""
     c = float(np.clip(corr, 0.0, 1.0))
     s = np.sqrt(1.0 - c * c)
-    return c * sh + s * sh2
+    return c * np.asarray(sh, float) + s * np.asarray(sh2, float)
 
 def to_world(offset_body, rot=None, elong=1.0):
     """Body-frame (un-stretched) offset -> world offset: re-apply the stretch, then rotate.
@@ -176,16 +200,69 @@ def to_world(offset_body, rot=None, elong=1.0):
     o = np.asarray(offset_body, float) * _stretch(elong)
     return o if rot is None else np.asarray(rot, float) @ o
 
-def nucleus_centre(centre, radius, nuc_frac, rim, elong, rot,
-                   nuc_offset, off_dir, off_mag):
-    """Compute the nucleus centre, given the cell centre and shape parameters.
-    """
-    # Compute freespace to membrane with rim space
-    free = max(radius * (1.0 - nuc_frac) - rim, 0.0)
+def containment_residual(r_cell_fn, r_nuc_fn, off_hat, delta, rim=1.5, dirs=None,
+                         euclid_rim=True, rim_eff=None, base=None):
+    dirs = fit_directions() if dirs is None else dirs
+    if base is None:
+        base = r_nuc_fn(dirs)[:, None] * dirs
+    if rim_eff is None:
+        rim_eff = rim * _rim_scale(r_cell_fn, dirs) if euclid_rim else rim
+    p = np.asarray(delta, float) * np.asarray(off_hat, float) + base
+    rho = np.linalg.norm(p, axis=-1)
+    return rho - r_cell_fn(p / np.maximum(rho, 1e-30)[..., None]) + rim_eff
     
-    off = np.asarray(off_dir, float)
-    off = off / (np.linalg.norm(off) + 1e-30)
-    return np.asarray(centre, float) + to_world(off * (nuc_offset * free * off_mag), rot, elong)
+def _rim_scale(r_cell_fn, dirs, eps=1e-4):
+    e = np.eye(3) * eps
+    p = np.concatenate([dirs[None] + e[:, None, :], dirs[None] - e[:, None, :]])   # (6, n, 3)
+    p /= np.linalg.norm(p, axis=-1, keepdims=True)
+    lg = np.log(np.maximum(r_cell_fn(p), 1e-30))                                   # (6, n)
+    d = (lg[:3] - lg[3:]) / (2 * eps)
+    return np.sqrt(1.0 + (d * d).sum(axis=0))
+
+def nuc_offset_budget(r_cell_fn, r_nuc_fn, off_hat, rim=1.5,
+                      n_scan=33, n_bisect=25, euclid_rim=True):
+    """
+    """
+    dirs = fit_directions(n_theta=24, n_phi=48)
+    off_hat = np.asarray(off_hat, float)
+    base = r_nuc_fn(dirs)[:, None] * dirs
+    rim_eff = rim * _rim_scale(r_cell_fn, dirs) if euclid_rim else rim
+
+    def worst(delta):
+        return containment_residual(r_cell_fn, r_nuc_fn, off_hat, delta, rim, dirs,
+                                    rim_eff=rim_eff, base=base).max()
+
+    hi = max(float(np.max(r_cell_fn(dirs))) - float(np.min(np.atleast_1d(rim_eff))), 0.0)
+    if hi <= 0.0:
+        return 0.0
+    grid = np.linspace(0.0, hi, n_scan)
+    vals = np.array([worst(d) for d in grid])
+    over = np.flatnonzero(vals > 0.0)
+    if over.size == 0:
+        return float(hi)                      # fits at any offset (near-spherical cell)
+    k = int(over[0])
+    if k == 0:
+        return 0.0                            # s0 < 1: infeasible even centred
+    lo, up = float(grid[k - 1]), float(grid[k])
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + up)
+        lo, up = (lo, mid) if worst(mid) > 0.0 else (mid, up)
+    return lo
+
+
+def nuc_fit_scale(r_cell_fn, r_nuc_fn, rim=1.5, dirs=None, euclid_rim=True):
+    """s0 = min_w (r_c(w) - rim_eff(w)) / r_n(w).
+
+    s0 >= 1 means the CENTRED nucleus already fits with the full rim. s0 < 1 means `rough`,
+    `nuc_frac` and `rim` are jointly infeasible for this cell and the clip in `cell_fields_3d`
+    will bite at EVERY offset, including 0 -- no choice of `nuc_offset` can rescue it.
+
+    Measured at radius = 24, rim = 1.5: at rough = 0.25 this affects 32% of cells for
+    nuc_frac = 0.45, but 0% for nuc_frac <= 0.30.
+    """
+    dirs = fit_directions() if dirs is None else dirs
+    rim_eff = rim * _rim_scale(r_cell_fn, dirs) if euclid_rim else rim
+    return float(np.min((r_cell_fn(dirs) - rim_eff) / np.maximum(r_nuc_fn(dirs), 1e-30)))
 
 
 def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, grow=1.0):
@@ -216,7 +293,7 @@ def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, gr
 
 
 def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius, 
-                      rough, beta, rot, angle_deg, elong, rim, nuc_offset, off_dir, off_mag, grow, 
+                      rough, beta, rot, elong, rim, nuc_offset, off_dir, off_mag, grow, 
                       centre = (0.0, 0.0, 0.0), rough_nuc = None, beta_nuc=None,
                       euclid_rim=True, nuc_fit_floor=None):
     """Shared core: both wrappers do exactly this, only the grid differs.
@@ -225,25 +302,47 @@ def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
     free shape used everywhere for the mask; > 1 gives the packed body for marker rendering.
     """
     cn = mix_harmonics(c_cell, c_nuc, nuc_corr)
-    r_cell_fn = make_boundary(c_cell, radius, rough, beta, L, l_min)
+    r_cell_fn = make_boundary(coeff = c_cell, R = radius, kappa = rough, 
+                              beta = beta, L = L, l_min = l_min)
     if rough_nuc is None:
         rough_nuc = rough * 0.6
     if rough_nuc is None:
         beta_nuc = beta
-    r_nuc_fn = make_boundary(cn, radius * nuc_frac, rough_nuc, beta_nuc, L, l_min)
-    rho_c, phi_c = body_frame(grid, rot = rot, centre = centre, angle_deg=angle_deg, elong=elong)
-    print(rho_c.shape, phi_c.shape)
-    ncentre = nucleus_centre(centre = centre, radius = radius, nuc_frac = nuc_frac, 
-                             rim = rim, elong = elong, rot = rot, 
-                             nuc_offset = nuc_offset, off_dir = off_dir, off_mag = off_mag)
+    r_nuc_fn = make_boundary(coeff = cn, R = radius * nuc_frac, kappa = rough_nuc, 
+                             beta = beta_nuc, L=L, l_min = l_min)
+    rho_c, phi_c = body_frame(grid = grid, rot = rot, centre = centre, elong=elong)
     
-    rho_n, phi_n = body_frame(grid, rot = rot, centre = ncentre, angle_deg=angle_deg, elong=elong)
+    off = np.asarray(off_dir, float)
+    off = off / (np.linalg.norm(off) + 1e-30)
+    
+    s0 = nuc_fit_scale(r_cell_fn, r_nuc_fn, rim, euclid_rim=euclid_rim)
+    if nuc_fit_floor is not None and s0 < 1.0:
+        # Opt-in rescue: shrink the nucleus uniformly. Smooth and isotropic, whereas the clip in
+        # `cell_fields_3d` would instead cut a flat facet. Off by default because silently
+        # shrinking nuclei would break what `nuc_frac` means.
+        _r_nuc_raw, _s = r_nuc_fn, max(float(s0), float(nuc_fit_floor))
+        r_nuc_fn = (lambda u, _f=_r_nuc_raw, _k=_s: _k * _f(u))
+        
+    # Compute freespace to membrane with rim space
+    free = nuc_offset_budget(r_cell_fn, r_nuc_fn, off, rim=rim,
+                        n_scan=33, n_bisect=25, euclid_rim=True)
+    ncentre =  np.asarray(centre, float) + to_world(off * (nuc_offset * free * off_mag), rot, elong)
+      
+    rho_n, phi_n = body_frame(grid, rot = rot, centre = ncentre, elong=elong)
 
     f = cell_fields(rho_c, phi_c, r_cell_fn(phi_c), 
                     rho_n, phi_n, r_nuc_fn(phi_n), 
                     rim, grow=grow)
+    h = containment_residual(r_cell_fn, r_nuc_fn, off, nuc_offset * free * off_mag, rim,
+                             dirs=_quad()[0], euclid_rim=euclid_rim)
     f["nuc_centre"] = ncentre
     f["r_cell_fn"], f["r_nuc_fn"] = r_cell_fn, r_nuc_fn
+    f["nuc_room"] = float(free)
+    f["nuc_fit_scale"] = float(s0)
+    f["nuc_shaved_frac"] = float((h > 0.0).mean())
+    f["nuc_shaved_max"] = float(h.max())
+    return f
+
     return f
 
 
@@ -259,13 +358,28 @@ def generate_single_cell_3d(Tape,
     
     grid = centred_grid_3d(size, spacing=spacing)
     rot = rotation_matrix(polar_deg=polar_deg, azim_deg=azim_deg, roll_deg=roll_deg)
+    
     return _cell_and_nucleus(
-        c_cell = Tape["sh"][i], c_nuc = Tape["sh2"][i], grid = grid, L = L, l_min = l_min,
-        nuc_corr = nuc_corr, nuc_frac = nuc_frac, radius = radius, rough = rough, rough_nuc =rough_nuc, 
-        beta=beta, beta_nuc=beta_nuc,
-        rot = rot, angle_deg = angle_deg, elong = elong, rim = rim, 
-        nuc_offset = nuc_offset, off_dir=Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i], grow = grow,
-        euclid_rim=euclid_rim, nuc_fit_floor=nuc_fit_floor
+        c_cell = Tape["sh"][i], 
+        c_nuc = Tape["sh2"][i], 
+        grid = grid, 
+        centre = (0.0, 0.0, 0.0), 
+        rot = rot, 
+        radius = radius, 
+        nuc_frac = nuc_frac, 
+        rough = rough,
+        beta = beta, 
+        L = L, l_min = l_min, 
+        elong = elong, 
+        rim = rim, 
+        nuc_corr = nuc_corr, 
+        nuc_offset = nuc_offset,
+        off_dir=Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i], 
+        grow=grow,
+        euclid_rim=euclid_rim, 
+        nuc_fit_floor=nuc_fit_floor,
+        rough_nuc = rough_nuc, 
+        beta_nuc=beta_nuc
         )
         
 
