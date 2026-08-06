@@ -4,6 +4,24 @@ import matplotlib.colors as mcolors
 
 from scene import _stretch, rotation_matrix
 
+
+
+
+def tau_cmap(vmax=1.0):
+    """The `plot_tau` colourmap, pinned to meaning: blue at tau=-1 (nucleus centre), white at
+    0 (nuclear envelope), red at 1 (plasma membrane), yellow beyond (packing outgrowth)."""
+    vmin, vmax = -1.0, max(float(vmax), 1.0)
+    span = vmax - vmin
+    nodes = [(0.0, "blue"), ((0.0 - vmin) / span, "white")]
+    if vmax <= 1.0:
+        nodes.append((1.0, "red"))
+    else:
+        nodes += [((1.0 - vmin) / span, "red"), (1.0, "yellow")]
+    cm = mcolors.LinearSegmentedColormap.from_list("tau_custom", nodes)
+    cm.set_bad(color="black")
+    return cm, vmin, vmax
+
+
 def plot_polar_phi(phi_img, background_mask=None):
     """
     Plots a polar coordinate image (phi) with a Cellpose-style rainbow colormap.
@@ -72,29 +90,11 @@ def plot_tau(tau_img, background_mask=None):
     pos_zero = (0.0 - vmin) / total_range  # Where 0 sits in the 0-1 scale
     pos_one = (1.0 - vmin) / total_range   # Where 1 sits in the 0-1 scale
     
-    # 3. Define the colors for each key point dynamically
-    color_nodes = [
-        (0.0, 'blue'),       # Maps to vmin (-1)
-        (pos_zero, 'white'), # Maps to 0
-    ]
-    
-    # If there is no outgrowth, cap the colormap at red at position 1.0
-    if vmax == 1.0:
-        color_nodes.append((1.0, 'red'))
-    else:
-        # If there is outgrowth, red is partway through, and yellow caps it
-        color_nodes.append((pos_one, 'red'))
-        color_nodes.append((1.0, 'yellow'))
-    
-    # 4. Generate the custom colormap
-    cmap = mcolors.LinearSegmentedColormap.from_list('tau_custom', color_nodes)
-    cmap.set_bad(color='black') # Set background to black
-    
     # 5. Plot the image
     fig, ax = plt.subplots()
     
     im = ax.imshow(tau_display, 
-                   cmap=cmap, 
+                   cmap=tau_cmap(vmax), 
                    interpolation='nearest',
                    vmin=vmin, 
                    vmax=vmax)
@@ -108,8 +108,6 @@ def plot_tau(tau_img, background_mask=None):
     ax.axis('off')
     
     return fig, ax
-
-
 
 def surface_xyz_inline(rfn, elong, polar_deg, azim_deg, roll_deg, centre=(0, 0, 0), nt=160, npz=320):
     """Support function -> (X, Y, Z) grids for plot_surface, plus r for colouring."""
@@ -209,3 +207,44 @@ def plot_surface_xyz_html(cell, elong, polar_deg, azim_deg, roll_deg, out_path):
     out_path.mkdir(parents=True, exist_ok=True)
     fig.write_html(out_path / output_file)
     print(f"Saved interactive plot to {output_file}")
+    
+
+def _centre(shape):
+    """center of the cell volume"""
+    return tuple(s // 2 for s in shape)
+
+def ortho(vol, idx = None, cmap="viridis", vmin=None, vmax=None, title="", mask=None,
+          figsize=(13, 4.4), axes=None):
+    """Three orthogonal slices through the volume: XY (axial), XZ and YZ.
+
+    `mask` (a boolean volume) blanks everything outside it to black, which is how the intrinsic
+    coordinates should be read.
+    """
+    vol = np.asarray(vol)
+    print(_centre(vol.shape))
+    kz, ky, kx = idx if not idx is None else _centre(vol.shape)
+    v = vol.astype(float)
+    if mask is not None:
+        v = np.where(mask, v, np.nan)
+    if vmin is None:
+        vmin = np.nanmin(v)
+    if vmax is None:
+        vmax = np.nanmax(v)
+    cm = plt.get_cmap(cmap).copy() if isinstance(cmap, str) else cmap
+    cm.set_bad(color="black")
+
+    panels = [(v[kz], f"XY  z={kz}", "x", "y"),
+              (v[:, ky], f"XZ  y={ky}", "x", "z"),
+              (v[:, :, kx], f"YZ  x={kx}", "y", "z")]
+    if axes is None:
+        fig, axes = plt.subplots(1, 3, figsize=figsize)
+    else:
+        fig = axes[0].figure
+    for ax, (im, t, xl, yl) in zip(axes, panels):
+        h = ax.imshow(im, cmap=cm, vmin=vmin, vmax=vmax, interpolation="nearest", origin="lower")
+        ax.set_title(t, fontsize=10)
+        ax.set_xlabel(xl); ax.set_ylabel(yl)
+    fig.colorbar(h, ax=axes, fraction=0.025, pad=0.02)
+    if title:
+        fig.suptitle(title, fontsize=12)
+    return fig, axes
