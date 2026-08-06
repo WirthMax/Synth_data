@@ -217,7 +217,8 @@ def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, gr
 
 def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius, 
                       rough, beta, rot, angle_deg, elong, rim, nuc_offset, off_dir, off_mag, grow, 
-                      centre = (0.0, 0.0, 0.0), rough_nuc = None, beta_nuc=None):
+                      centre = (0.0, 0.0, 0.0), rough_nuc = None, beta_nuc=None,
+                      euclid_rim=True, nuc_fit_floor=None):
     """Shared core: both wrappers do exactly this, only the grid differs.
 
     body_grow scales the cell contour (not the nucleus); see cell_fields. Default 1.0 = the
@@ -229,7 +230,7 @@ def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
         rough_nuc = rough * 0.6
     if rough_nuc is None:
         beta_nuc = beta
-    r_nuc_fn = make_boundary(c_nuc, radius * nuc_frac, rough_nuc, beta_nuc, L, l_min)
+    r_nuc_fn = make_boundary(cn, radius * nuc_frac, rough_nuc, beta_nuc, L, l_min)
     rho_c, phi_c = body_frame(grid, rot = rot, centre = centre, angle_deg=angle_deg, elong=elong)
     print(rho_c.shape, phi_c.shape)
     ncentre = nucleus_centre(centre = centre, radius = radius, nuc_frac = nuc_frac, 
@@ -253,8 +254,7 @@ def generate_single_cell_3d(Tape,
                             nuc_corr=0.5, nuc_frac=0.25, radius=32, rough=0.25, rough_nuc =0.1, 
                             beta=0.5, beta_nuc=0.9, 
                             angle_deg = 0.0, elong = 1.0, rim = 1.5, nuc_offset = 0.6, 
-                            off_dir = 0.0, off_mag = 1.0, grow = 1.0
-                            ):
+                            grow = 1.0, euclid_rim=True, nuc_fit_floor=None):
     """Sandbox: candidate i from the tape, centred in its own image."""
     
     grid = centred_grid_3d(size, spacing=spacing)
@@ -264,8 +264,10 @@ def generate_single_cell_3d(Tape,
         nuc_corr = nuc_corr, nuc_frac = nuc_frac, radius = radius, rough = rough, rough_nuc =rough_nuc, 
         beta=beta, beta_nuc=beta_nuc,
         rot = rot, angle_deg = angle_deg, elong = elong, rim = rim, 
-        nuc_offset = nuc_offset, off_dir=Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i], grow = grow
+        nuc_offset = nuc_offset, off_dir=Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i], grow = grow,
+        euclid_rim=euclid_rim, nuc_fit_floor=nuc_fit_floor
         )
+        
 
 ### Tissue
 from scipy.spatial import cKDTree
