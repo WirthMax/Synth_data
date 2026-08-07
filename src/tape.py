@@ -57,6 +57,8 @@ class Tape(object):
         self.sh = self.rng.standard_normal((n_cand, self.n_lm))
         # nuclear harmoics
         self.sh2 = self.rng.standard_normal((n_cand, self.n_lm))
+        # Noise for 3D case
+        self.noise3 = self.rng.standard_normal((Pool, *self.vol)).astype(np.float32)
         
 
     # Add this method to allow bracket access

@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-
+from pathlib import Path
 from scene import _stretch, rotation_matrix
 
 
@@ -209,6 +209,100 @@ def plot_surface_xyz_html(cell, elong, polar_deg, azim_deg, roll_deg, out_path):
     print(f"Saved interactive plot to {output_file}")
     
 
+def volume_grid(shape, spacing=1.0, step=1, origin_index=(0, 0, 0), full_shape=None):
+    """World coordinates of every `step`-th voxel centre, matching `centred_grid_3d`.
+    """
+    nz, ny, nx = shape[:3]
+    fz, fy, fx = (full_shape or shape)[:3]        # centring uses the FULL volume, not the crop
+    oz, oy, ox = origin_index
+    sz, sy, sx = (spacing,) * 3 if np.isscalar(spacing) else spacing
+    ax = lambda n, o, f, s: (np.arange(0, n, step) + o - (f - 1) / 2.0) * s
+    return ax(nx, ox, fx, sx), ax(ny, oy, fy, sy), ax(nz, oz, fz, sz)
+
+
+def plot_surface_rgb_html(cell, elong, polar_deg, azim_deg, roll_deg, out_path, volume=None,
+                          spacing=1.0, step=2, mask=None, iso_pct=(60.0, 99.7),
+                          crop_to_mask=True, crop_pad=3,
+                          opacity=0.18, surface_count=15,
+                          filename="interactive_cell_rgb_3d.html"):
+    X, Y, Z, r = surface_xyz_inline(cell["r_cell_fn"], elong, polar_deg, azim_deg, roll_deg)
+    Xn, Yn, Zn, _ = surface_xyz_inline(cell["r_nuc_fn"], elong, polar_deg, azim_deg, roll_deg,
+                                       centre=cell["nuc_centre"])
+    fig = go.Figure()
+
+    fig.add_trace(go.Surface(x=X, y=Y, z=Z, surfacecolor=r, colorscale="Viridis",
+                             opacity=0.15, name="Cell Membrane", showscale=False))
+    solid_dark = [[0, "#111820"], [1, "#111820"]]
+    fig.add_trace(go.Surface(x=Xn, y=Yn, z=Zn, surfacecolor=np.zeros_like(Zn),
+                             colorscale=solid_dark, opacity=0.8, name="Nucleus",
+                             showscale=False,
+                             lighting=dict(ambient=0.4, diffuse=0.8, specular=0.2)))
+
+    if volume is not None:
+        vol = np.asarray(volume, np.float32)
+        msk_full = None if mask is None else np.asarray(mask, bool)
+        off = (0, 0, 0)
+
+        # Crop to the cell before subsampling. The grid spans the whole box, so with
+        # anisotropic spacing (e.g. 4,1,1) it can be several times larger than the cell in z --
+        # under aspectmode="data" that leaves the cell a speck in a tall empty box, and you pay
+        # for every empty voxel in the HTML.
+        if crop_to_mask and msk_full is not None and msk_full.any():
+            sl = ndi.find_objects(msk_full.astype(np.uint8))[0]
+            sl = tuple(slice(max(0, s.start - crop_pad), min(n, s.stop + crop_pad))
+                       for s, n in zip(sl, vol.shape[:3]))
+            off = tuple(s.start for s in sl)
+            vol = vol[sl]
+            msk_full = msk_full[sl]
+
+        sub = vol[::step, ::step, ::step]                       # (nz', ny', nx', 3)
+        msk = None if msk_full is None else msk_full[::step, ::step, ::step]
+
+        xc, yc, zc = volume_grid(vol.shape, spacing, step, origin_index=off,
+                                 full_shape=np.asarray(volume).shape)
+        GX, GY, GZ = np.meshgrid(xc, yc, zc, indexing="ij")     # x varies SLOWEST
+        xv, yv, zv = (GX.ravel().astype(np.float32), GY.ravel().astype(np.float32),
+                      GZ.ravel().astype(np.float32))
+
+        scales = [[[0, "rgba(0,0,0,0)"], [1, "rgb(255,60,60)"]],
+                  [[0, "rgba(0,0,0,0)"], [1, "rgb(60,255,90)"]],
+                  [[0, "rgba(0,0,0,0)"], [1, "rgb(80,140,255)"]]]
+        for k, (nm, cs) in enumerate(zip(("Red", "Green", "Blue"), scales)):
+            ch = sub[..., k]
+            if msk is not None:
+                ch = np.where(msk, ch, 0.0)
+            inside = ch[msk] if msk is not None else ch
+            pos = inside[inside > 0]
+            if pos.size == 0:
+                continue
+            # Percentile limits per channel, on POSITIVE values. A fixed iso_min (and the
+            # `/255 if max>2` heuristic) silently blanks a marker whose scale happens to differ
+            # -- these markers are lognormal, so their absolute range varies a lot.
+            lo, hi = np.percentile(pos, iso_pct)
+            if not np.isfinite([lo, hi]).all() or hi <= lo:
+                continue
+            # match the (nz,ny,nx) volume to the (x,y,z) meshgrid above
+            val = np.ascontiguousarray(np.transpose(ch, (2, 1, 0)), np.float32).ravel()
+            fig.add_trace(go.Volume(
+                x=xv, y=yv, z=zv, value=val,
+                isomin=float(lo), isomax=float(hi),
+                opacity=opacity, surface_count=surface_count, colorscale=cs,
+                caps_x_show=False, caps_y_show=False, caps_z_show=False,
+                lighting=dict(ambient=0.9, diffuse=0.3, specular=0.05),
+                showscale=False, name=f"{nm} Channel", showlegend=True))
+
+    fig.update_layout(
+        title="3D Cell Boundary & RGB Marker Volumes",
+        scene=dict(aspectmode="data", xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
+        margin=dict(l=0, r=0, b=0, t=40))
+
+    out_path = Path(out_path)
+    out_path.mkdir(parents=True, exist_ok=True)
+    fig.write_html(out_path / filename)
+    print(f"Saved interactive volume plot to {out_path / filename}")
+    return fig
+
+
 def _centre(shape):
     """center of the cell volume"""
     return tuple(s // 2 for s in shape)
@@ -247,4 +341,19 @@ def ortho(vol, idx = None, cmap="viridis", vmin=None, vmax=None, title="", mask=
     fig.colorbar(h, ax=axes, fraction=0.025, pad=0.02)
     if title:
         fig.suptitle(title, fontsize=12)
+    return fig, axes
+
+
+def ortho_rgb(rgb, idx=None, title="", figsize=(13, 4.4)):
+    """Orthogonal slices of an RGB volume (nz, ny, nx, 3)."""
+    kz, ky, kx = idx or _centre(rgb.shape[:3])
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    for ax, (im, t) in zip(axes, [(rgb[kz], f"XY  z={kz}"),
+                                  (rgb[:, ky], f"XZ  y={ky}"),
+                                  (rgb[:, :, kx], f"YZ  x={kx}")]):
+        ax.imshow(np.clip(im, 0, 1), interpolation="nearest", origin="lower")
+        ax.set_title(t, fontsize=10); ax.axis("off")
+    if title:
+        fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
     return fig, axes

@@ -109,9 +109,6 @@ and scale is then set so the volume equals (4/3)πR³. So radius is the equivale
     # compute w with the spherical harmonics
     
     # compute the weight for each degree, such that all weights of a degree are equal
-    print(L)
-    print(l_min)
-    print(beta)
     w = sh_degrees(L, l_min).astype(float) ** -float(beta)
     # renormalization factor to ensure the area is correct
     # With this, changing beta only changes the kind of roughness, not the overall size of the cell.
@@ -351,8 +348,7 @@ def generate_single_cell_3d(Tape,
                             i = 0, 
                             polar_deg=70.0, azim_deg=30.0, roll_deg=0.0,
                             nuc_corr=0.5, nuc_frac=0.25, radius=32, rough=0.25, rough_nuc =0.1, 
-                            beta=0.5, beta_nuc=0.9, 
-                            angle_deg = 0.0, elong = 1.0, rim = 1.5, nuc_offset = 0.6, 
+                            beta=0.5, beta_nuc=0.9, elong = 1.0, rim = 1.5, nuc_offset = 0.6, 
                             grow = 1.0, euclid_rim=True, nuc_fit_floor=None):
     """Sandbox: candidate i from the tape, centred in its own image."""
     
