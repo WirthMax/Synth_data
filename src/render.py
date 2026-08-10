@@ -118,7 +118,7 @@ def render_image(tape, p_dict, cell_mask, tau, phi, d, spacing, polar_deg, azim_
                          polar_deg = polar_deg, azim_deg = azim_deg, edge_softness=0.15, edge_level=0.5, amp = general['amp'].v, 
                          pol_dir = [x.v for x in general['pol_dir']], polarity = general['polarity'].v)
             
-    return p_dict
+    return p_dict, general
 
 
 def to_rgb(mask, channels, pct=99.5):
