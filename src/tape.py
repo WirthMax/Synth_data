@@ -3,10 +3,11 @@ from scene import n_sh
 
 
 class Tape(object):
-    def __init__(self, seed, size=201, K=20):
+    def __init__(self, seed, size=201, K=20, n_ch_max = 20):
         self.seed = seed
         self.size = size
         self.K = K
+        self.n_ch_max = n_ch_max
         
         # Initialize the generator directly (avoids method naming collision)
         self.rng = np.random.default_rng(seed=self.seed)
@@ -59,6 +60,17 @@ class Tape(object):
         self.sh2 = self.rng.standard_normal((n_cand, self.n_lm))
         # Noise for 3D case
         self.noise3 = self.rng.standard_normal((Pool, *self.vol)).astype(np.float32)
+        
+    def drawSensor(self, shape=(128, 128, 3)):
+        ny, nx, nc = shape
+        # photon shot noise
+        self.z_shot = self.rng.standard_normal((nc, ny, nx), dtype=np.float32)
+        # camera read noise
+        self.z_read = self.rng.standard_normal((nc, ny, nx), dtype=np.float32)
+        # autofluorescence texture
+        self.w_af   = self.rng.standard_normal((nc, ny, nx), dtype=np.float32)
+        # flat field texture
+        self.w_ill  = self.rng.standard_normal((ny, nx), dtype=np.float32)
         
 
     # Add this method to allow bracket access
