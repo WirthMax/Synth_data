@@ -112,7 +112,7 @@ and scale is then set so the volume equals (4/3)πR³. So radius is the equivale
     w = sh_degrees(L, l_min).astype(float) ** -float(beta)
     # renormalization factor to ensure the area is correct
     # With this, changing beta only changes the kind of roughness, not the overall size of the cell.
-    w * (kappa * np.sqrt(4.0 * np.pi) / np.sqrt((w ** 2).sum() + 1e-30))
+    w = w * (kappa * np.sqrt(4.0 * np.pi) / np.sqrt((w ** 2).sum() + 1e-30))
     c = w*coeff
     
     # Compute quadrate to pinpount size and then scale accordingly

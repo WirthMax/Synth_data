@@ -59,7 +59,8 @@ class Tape(object):
         # nuclear harmoics
         self.sh2 = self.rng.standard_normal((n_cand, self.n_lm))
         # Noise for 3D case
-        self.noise3 = self.rng.standard_normal((Pool, *self.vol)).astype(np.float32)
+        self.texture_noise = self.rng.standard_normal((Pool, *self.vol)).astype(np.float32)
+        self.gate_noise = self.rng.standard_normal((Pool, *self.vol)).astype(np.float32)
         
     def drawSensor(self, shape=(128, 128, 3)):
         ny, nx, nc = shape

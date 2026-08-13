@@ -127,7 +127,7 @@ def pool_image(c, cell, tau, noise, spacing, polar_deg, azim_deg, um_per_vox, no
 
 def render_marker(tape, comps, cell, tau, phi, d, spacing, polar_deg,
     azim_deg, polarity=0.0, pol_dir=0.0, amp=1.0,
-                  edge_softness=0.06, edge_level=0.5, um_per_vox=1.0):
+                  edge_softness=0.0, edge_level=0.5, um_per_vox=1.0):
     """amp * normalise( sum_k w_k * normalise(loc_k x tex_k) x polarity x env(d) ).
 
     Normalise INSIDE each pool (a pool is a product), ADD across pools (means add), apply
@@ -135,22 +135,22 @@ def render_marker(tape, comps, cell, tau, phi, d, spacing, polar_deg,
     mean intensity over the interior AREA is exactly amp. `d` is the normalised radius from
     cell_fields; edge_softness / edge_level tune the falloff (see boundary_falloff).
     """
-    n_pool = tape["noise3"].shape[0]
+    
     out, wsum = np.zeros(cell.shape, float), 0.0
     for i, c in enumerate(comps):
         if c["w"].v <= 0:
             continue
-        out += c["w"].v * pool_image(c = c, cell = cell, tau = tau, noise = tape["noise3"][i], 
+        out += c["w"].v * pool_image(c = c, cell = cell, tau = tau, noise = tape["texture_noise"][i], 
                                      spacing = spacing, polar_deg = polar_deg, azim_deg = azim_deg,
                                      um_per_vox = um_per_vox,
-                                     noise2=tape["noise3"][(i + 1) % n_pool])
+                                     noise2=tape["gate_noise"][i])
         wsum += c["w"].v
     out = out / wsum if wsum > 0 else cell.astype(float)
     if polarity:
         pd = np.asarray(pol_dir, np.float32)
         pd = pd / (np.linalg.norm(pd) + 1e-30)
         out = out * np.exp(np.float32(polarity) * (phi @ pd))
-    out = out * boundary_falloff(d, edge_softness, edge_level) 
+    # out = out * boundary_falloff(d, edge_softness, edge_level) 
     
     denom = out.sum() / max(int(cell.sum()), 1)
     return (amp * out / (denom + 1e-12)).astype(np.float32)
@@ -160,7 +160,7 @@ def render_image(tape, p_dict, cell_mask, tau, phi, d, spacing, polar_deg, azim_
     general = p_dict.pop('general', None)
     for marker, vals in p_dict.items():
         p_dict[marker] = render_marker(tape = tape, comps = vals, cell = cell_mask, tau = tau, phi = phi, d = d, spacing = spacing,
-                         polar_deg = polar_deg, azim_deg = azim_deg, edge_softness=0.15, edge_level=0.5, amp = general['amp'].v, 
+                         polar_deg = polar_deg, azim_deg = azim_deg, edge_softness=0.0, edge_level=0.5, amp = general['amp'].v, 
                          pol_dir = [x.v for x in general['pol_dir']], polarity = general['polarity'].v,
                          um_per_vox=um_per_vox)
             
