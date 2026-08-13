@@ -150,7 +150,7 @@ def render_marker(tape, comps, cell, tau, phi, d, spacing, polar_deg,
         pd = np.asarray(pol_dir, np.float32)
         pd = pd / (np.linalg.norm(pd) + 1e-30)
         out = out * np.exp(np.float32(polarity) * (phi @ pd))
-    # out = out * boundary_falloff(d, edge_softness, edge_level) 
+    out = out * boundary_falloff(d, edge_softness, edge_level) 
     
     denom = out.sum() / max(int(cell.sum()), 1)
     return (amp * out / (denom + 1e-12)).astype(np.float32)
