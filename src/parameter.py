@@ -292,8 +292,12 @@ class CellProfile:
         return {k: m.fluorophore for k, m in self.Markers.items()}
 
     def n_pools(self):
-        """Largest component count over the markers -- the tape needs at least this many."""
-        return max((len(m.noise_components) for m in self.Markers.values()), default=0)
+        """Pools the tape must hold: ONE PER (marker, component) pair, not per component.
+
+        Each marker gets its own consecutive block, so two markers using the same noise kind
+        still draw independent frozen fields.
+        """
+        return sum(len(m.noise_components) for m in self.Markers.values())
     
     
     

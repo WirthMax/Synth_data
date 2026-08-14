@@ -1,19 +1,21 @@
-import numpy as np
-from scipy.special import ndtri 
 from dataclasses import dataclass
+
+import numpy as np
 
 POOL_NAMES = ["diffuse", "fibrillar", "punctate"]
 N_POOLS = 3
-KINDS = ("blob", "cluster", "network", "fibre", "sheet")
+
 
 def localization_function(x, mu=0.0, width=0.5, sharp=4.0, floor=0.0):
-    f = np.exp(-np.abs((x - mu) / width) ** sharp)
+    f = np.exp(-(np.abs((x - mu) / width) ** sharp))
     return (1.0 - floor) * f + floor
+
 
 def direction(polar_deg=0.0, azim_deg=0.0):
     """Unit vector (x, y, z) from a polar angle off +z and an azimuth in the xy plane."""
     t, p = np.deg2rad(polar_deg), np.deg2rad(azim_deg)
     return np.array([np.sin(t) * np.cos(p), np.sin(t) * np.sin(p), np.cos(t)])
+
 
 def _freq(shape, spacing=1.0, polar_deg=0.0, azim_deg=0.0):
     """Frequency grids (cycles/px) rotated into the texture's own frame."""
@@ -23,11 +25,12 @@ def _freq(shape, spacing=1.0, polar_deg=0.0, azim_deg=0.0):
     fz = np.fft.fftfreq(nz, sz)[:, None, None]
     fy = np.fft.fftfreq(ny, sy)[None, :, None]
     fx = np.fft.rfftfreq(nx, sx)[None, None, :]
-    f2 = fz ** 2 + fy ** 2 + fx ** 2
+    f2 = fz**2 + fy**2 + fx**2
     dx, dy, dz = direction(polar_deg, azim_deg)
     fpar = fx * dx + fy * dy + fz * dz
-    fpar2 = fpar ** 2
+    fpar2 = fpar**2
     return f2, fpar2, np.maximum(f2 - fpar2, 0.0)
+
 
 def _filtered(noise, H):
     """Frozen noise through a transfer function, standardised to zero mean / unit variance."""
@@ -35,13 +38,14 @@ def _filtered(noise, H):
     z = z - z.mean()
     return (z / (z.std() + 1e-12)).astype(np.float32)
 
+
 def boundary_falloff(d, edge_softness=0.06, edge_level=0.5):
     """Smooth cell-support envelope in the normalised radius d = rho / r(phi).
     Marker fades ACROSS the outline instead ofbeing clipped at it. 
     """
     p = float(np.clip(edge_level, 1e-3, 1.0 - 1e-3))
     s = max(float(edge_softness), 1e-6)
-    c = 1.0 + s * np.log(p / (1.0 - p))          # env(1) == p
+    c = 1.0 + s * np.log(p / (1.0 - p))  # env(1) == p
     return 1.0 / (1.0 + np.exp(np.clip((d - c) / s, -700.0, 700.0)))
 
 
@@ -51,10 +55,11 @@ def pool_image(c, cell, tau, ctx):
     f = loc * c.field_fct(ctx)
     return f / (f[cell].mean() + 1e-12)
 
+
 @dataclass
 class NoiseCtx:
-    """Everything a noise component needs, bundled so `field_fct` takes one argument.
-    """
+    """Everything a noise component needs, bundled so `field_fct` takes one argument."""
+
     noise: np.ndarray
     gate: np.ndarray
     f2: np.ndarray
@@ -65,8 +70,11 @@ class NoiseCtx:
     def px(self, p):
         """A `P` holding microns -> lateral voxels. `spacing` already carries the anisotropy."""
         return max(float(p.v) / float(self.um_per_vox), 1e-6)
-    
-def render_marker(tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0):
+
+
+def render_marker(
+    tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0, pool_offset=0
+):
     """amp * normalise( sum_k w_k * normalise(loc_k x tex_k) x polarity x env(d) ).
 
     Normalise INSIDE each pool (a pool is a product), ADD across pools (means add), apply
@@ -76,10 +84,12 @@ def render_marker(tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softne
     mask, tau, phi, d = cell["cell"], cell["tau"], cell["phi"], cell["d"]
     comps = marker.noise_components
     n_pool = tape["texture_noise"].shape[0]
-    if len(comps) > n_pool:
+    if pool_offset + len(comps) > n_pool:
         raise ValueError(
-            f"marker {marker.name!r} has {len(comps)} components but the tape holds {n_pool} "
-            f"pools. Call tape.draw3d(..., Pool={len(comps)}) or more.")
+            f"marker {marker.name!r} needs pools {pool_offset}..{pool_offset + len(comps) - 1} "
+            f"but the tape holds {n_pool}. The tape needs one pool per (marker, component) "
+            f"pair -- call tape.draw3d(..., Pool=PROFILE.n_pools())."
+        )
 
     f2, fpar2, fperp2 = _freq(mask.shape, spacing, geom.POLAR_DEG.v, geom.AZIM_DEG.v)
 
@@ -87,8 +97,15 @@ def render_marker(tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softne
     for i, c in enumerate(comps):
         if c.w.v <= 0:
             continue
-        ctx = NoiseCtx(noise=tape["texture_noise"][i], gate=tape["gate_noise"][i],
-                       f2=f2, fpar2=fpar2, fperp2=fperp2, um_per_vox=um_per_vox)
+        j = pool_offset + i
+        ctx = NoiseCtx(
+            noise=tape["texture_noise"][j],
+            gate=tape["gate_noise"][j],
+            f2=f2,
+            fpar2=fpar2,
+            fperp2=fperp2,
+            um_per_vox=um_per_vox,
+        )
         out += c.w.v * pool_image(c, mask, tau, ctx)
         wsum += c.w.v
     out = out / wsum if wsum > 0 else mask.astype(float)
@@ -105,11 +122,23 @@ def render_marker(tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softne
     denom = out.sum() / max(int(mask.sum()), 1)
     return (marker.amp.v * out / (denom + 1e-12)).astype(np.float32)
 
+
 def render_image(tape, profile, cell, spacing, um_per_vox=1.0, edge_softness=0.0):
     """Render every marker of a CellProfile on one cell. Returns {marker name: volume}."""
-    return {name: render_marker(tape, m, cell, spacing, profile.Geometry,
-                                um_per_vox=um_per_vox, edge_softness=edge_softness)
-            for name, m in profile.Markers.items()}
+    out, offset = {}, 0
+    for name, m in profile.Markers.items():
+        out[name] = render_marker(
+            tape,
+            m,
+            cell,
+            spacing,
+            profile.Geometry,
+            um_per_vox=um_per_vox,
+            edge_softness=edge_softness,
+            pool_offset=offset,
+        )
+        offset += len(m.noise_components)
+    return out
 
 
 def to_rgb(mask, channels, pct=99.5):
@@ -118,6 +147,9 @@ def to_rgb(mask, channels, pct=99.5):
     the generation path, or it normalises away exactly the brightness differences being fitted.
     """
     return np.stack(
-        [np.clip(im / (np.percentile(im[mask], pct) + 1e-9), 0, 1) for im in channels.values()],
+        [
+            np.clip(im / (np.percentile(im[mask], pct) + 1e-9), 0, 1)
+            for im in channels.values()
+        ],
         -1,
     )

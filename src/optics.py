@@ -140,7 +140,7 @@ def detector(img_psf, profile, det, opt, tape, markers, quantise=False,
     ill = illumination((ny, nx), illum_cv, vignette, tape)
     sig_px = max(af_scale_um / opt.um_per_px, 0.5)
 
-    adu, diag = np.empty_like(img_psf), []
+    adu = np.empty_like(img_psf)
     for k, m in enumerate(markers):
         fl = profile.Markers[m].fluorophore
         af_level = float(autofluor.get(fl, 0.0))
@@ -156,8 +156,4 @@ def detector(img_psf, profile, det, opt, tape, markers, quantise=False,
         noisy = e + np.sqrt(e) * tape["z_shot"][k] + read_e * tape["z_read"][k] + dark_e
         a = np.clip(noisy * adu_per_e + offset_adu, 0.0, 2 ** bit_depth - 1)
         adu[..., k] = np.rint(a) if quantise else a
-
-        pk = float(np.percentile(sig_e, 99.9))
-        bg = float(bg_e.mean())
-        diag.append((m, fl, pk, bg, pk / (np.sqrt(pk + bg + read_e ** 2) + 1e-12)))
     return adu
