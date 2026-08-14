@@ -343,39 +343,35 @@ def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
     return f
 
 
-def generate_single_cell_3d(Tape, 
-                            size=(128, 128, 128), spacing = 1.0, L=4, l_min=2,
-                            i = 0, 
-                            polar_deg=70.0, azim_deg=30.0, roll_deg=0.0,
-                            nuc_corr=0.5, nuc_frac=0.25, radius=32, rough=0.25, rough_nuc =0.1, 
-                            beta=0.5, beta_nuc=0.9, elong = 1.0, rim = 1.5, nuc_offset = 0.6, 
+def generate_single_cell_3d(Tape, geom,
+                            size=(128, 128, 128), spacing = 1.0, L=4, l_min=2, i = 0,
                             grow = 1.0, euclid_rim=True, nuc_fit_floor=None):
     """Sandbox: candidate i from the tape, centred in its own image."""
-    
     grid = centred_grid_3d(size, spacing=spacing)
-    rot = rotation_matrix(polar_deg=polar_deg, azim_deg=azim_deg, roll_deg=roll_deg)
-    
+    rot = rotation_matrix(polar_deg=geom.POLAR_DEG.v, azim_deg=geom.AZIM_DEG.v,
+                          roll_deg=geom.ROLL_DEG.v)
+
     return _cell_and_nucleus(
-        c_cell = Tape["sh"][i], 
-        c_nuc = Tape["sh2"][i], 
-        grid = grid, 
-        centre = (0.0, 0.0, 0.0), 
-        rot = rot, 
-        radius = radius, 
-        nuc_frac = nuc_frac, 
-        rough = rough,
-        beta = beta, 
-        L = L, l_min = l_min, 
-        elong = elong, 
-        rim = rim, 
-        nuc_corr = nuc_corr, 
-        nuc_offset = nuc_offset,
-        off_dir=Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i], 
+        c_cell = Tape["sh"][i],
+        c_nuc = Tape["sh2"][i],
+        grid = grid,
+        centre = (0.0, 0.0, 0.0),
+        rot = rot,
+        radius = geom.RADIUS.v,
+        nuc_frac = geom.NUC_FRAC.v,
+        rough = geom.ROUGH.v,
+        beta = geom.BETA.v,
+        L = L, l_min = l_min,
+        elong = geom.ELONG.v,
+        rim = geom.RIM.v,
+        nuc_corr = geom.NUC_CORR.v,
+        nuc_offset = geom.NUC_OFFSET.v,
+        off_dir=Tape["u_offdir"][i], off_mag=Tape["u_offmag"][i],
         grow=grow,
-        euclid_rim=euclid_rim, 
+        euclid_rim=euclid_rim,
         nuc_fit_floor=nuc_fit_floor,
-        rough_nuc = rough_nuc, 
-        beta_nuc=beta_nuc
+        rough_nuc = geom.NUC_ROUGH.v,
+        beta_nuc=geom.NUC_BETA.v
         )
         
 

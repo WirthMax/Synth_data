@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.special import ndtri 
+from dataclasses import dataclass
 
 POOL_NAMES = ["diffuse", "fibrillar", "punctate"]
 N_POOLS = 3
@@ -27,85 +28,12 @@ def _freq(shape, spacing=1.0, polar_deg=0.0, azim_deg=0.0):
     fpar = fx * dx + fy * dy + fz * dz
     fpar2 = fpar ** 2
     return f2, fpar2, np.maximum(f2 - fpar2, 0.0)
- 
-# def field(noise, c, spacing, polar_deg, azim_deg, slope=1.5, length_px=20.0
-#          #   kind="blob", scale_px=4.0, wavelength_px=8.0, coherence=2.0,
-#          #   length_px=20.0, slope=1.5, angle_deg=0.0
-#            ):
-#      f2, fpar2, fperp2 = _freq(shape = noise.shape, spacing = spacing, polar_deg = polar_deg, azim_deg = azim_deg)
-#      if c['scope'] == "blob":
-#          H = np.exp(-2 * np.pi ** 2 * c['scale'].v ** 2 * f2)
-#      elif c['scope'] == "cloud":
-#          H = np.zeros_like(f2); nz_ = f2 > 0
-#          H[nz_] = f2[nz_] ** (-slope / 2)
-#          H *= np.exp(-2 * np.pi ** 2 * c['scale'].v ** 2 * f2)
-#      elif c['scope'] == "network":
-#          f0, sf = 1.0 / c['scale'].v, 1.0 / (c['scale'].v * c['coherence'].v)
-#          H = np.exp(-(np.sqrt(f2) - f0) ** 2 / (2 * sf ** 2))
-#      elif c['scope'] == "fibre" or c['scope'] == "stripe":
-#          H = np.exp(-2 * np.pi ** 2 * (c['lam'].v ** 2 * fperp2 + length_px ** 2 * fpar2))
-#      elif c['scope'] == "sheet":
-#          f0, sf = 1.0 / c['lam'].v, 1.0 / (c['lam'].v * c['coherence'].v)
-#          H = (np.exp(-(np.sqrt(fpar2) - f0) ** 2 / (2 * sf ** 2))
-#               * np.exp(-2 * np.pi ** 2 * length_px ** 2 * fperp2))
-#      else:
-#          raise ValueError(f"unknown kind {c['scope']}; expected one of {KINDS}")
-#      z = np.fft.irfftn(np.fft.rfftn(noise) * H, s=noise.shape, axes=(0, 1, 2))
-#      return (z / (z.std() + 1e-12)).astype(np.float32)
-
 
 def _filtered(noise, H):
     """Frozen noise through a transfer function, standardised to zero mean / unit variance."""
     z = np.fft.irfftn(np.fft.rfftn(noise) * H, s=noise.shape, axes=(0, 1, 2))
     z = z - z.mean()
     return (z / (z.std() + 1e-12)).astype(np.float32)
-
-def field(noise, c, spacing, polar_deg, azim_deg, um_per_vox=1.0, noise2=None):
-    """The pool's TEXTURE -- non-negative, ready to multiply by the localisation.
-    units are in MICRONS
-    """
-    f2, fpar2, fperp2 = _freq(shape=noise.shape, spacing=spacing,
-                              polar_deg=polar_deg, azim_deg=azim_deg)
-    scope = str(c['scope'])
-    s = float(c['s'].v)
-    # microns -> LATERAL VOXELS; `spacing` already carries the axial anisotropy
-    px = lambda k: max(float(c[k].v) / float(um_per_vox), 1e-6)
-
-    if scope == "blob":
-        return np.exp(s * _filtered(noise, np.exp(-2 * np.pi ** 2 * px('scale') ** 2 * f2)))
-
-    if scope == "cluster":
-        # clusters of smaller blobs: fine speckle whose DENSITY is gated by a coarser field.
-        # One field at one scale can only be uniformly grainy or uniformly lumpy; this is
-        # patchy AND fine, which is what real vesicular staining looks like.
-        fine = _filtered(noise, np.exp(-2 * np.pi ** 2 * px('scale') ** 2 * f2))
-        coarse = _filtered(noise if noise2 is None else noise2,
-                           np.exp(-2 * np.pi ** 2 * px('clust') ** 2 * f2))
-        fill = float(np.clip(c['fill'].v, 1e-3, 1 - 1e-3))
-        soft = max(float(c['soft'].v), 1e-3)
-        # ndtri(1-fill) is the exact Gaussian quantile, so `fill` IS the occupied fraction
-        gate = 1.0 / (1.0 + np.exp(-(coarse - ndtri(1.0 - fill)) / soft))
-        return (gate * np.exp(s * fine)).astype(np.float32)
-
-    if scope == "network":
-        f0 = 1.0 / px('scale')
-        sf = f0 / max(float(c['coherence'].v), 1e-3)
-        return np.exp(s * _filtered(noise, np.exp(-(np.sqrt(f2) - f0) ** 2 / (2 * sf ** 2))))
-
-    if scope in ("fibre", "stripe"):
-        # anisotropic low-pass: thin across the axis (`lam`), long along it (`len`)
-        H = np.exp(-2 * np.pi ** 2 * (px('lam') ** 2 * fperp2 + px('len') ** 2 * fpar2))
-        return np.exp(s * _filtered(noise, H))
-
-    if scope == "sheet":
-        # band-pass ALONG the axis -> quasi-periodic bands (striations), coherent across it
-        f0 = 1.0 / px('lam')
-        sf = f0 / max(float(c['coherence'].v), 1e-3)
-        H = (np.exp(-(np.sqrt(fpar2) - f0) ** 2 / (2 * sf ** 2))
-             * np.exp(-2 * np.pi ** 2 * px('len') ** 2 * fperp2))
-        return np.exp(s * _filtered(noise, H))
-
-    raise ValueError(f"unknown kind {scope!r}; expected one of {KINDS}")
 
 def boundary_falloff(d, edge_softness=0.06, edge_level=0.5):
     """Smooth cell-support envelope in the normalised radius d = rho / r(phi).
@@ -117,54 +45,71 @@ def boundary_falloff(d, edge_softness=0.06, edge_level=0.5):
     return 1.0 / (1.0 + np.exp(np.clip((d - c) / s, -700.0, 700.0)))
 
 
-def pool_image(c, cell, tau, noise, spacing, polar_deg, azim_deg, um_per_vox, noise2):
+def pool_image(c, cell, tau, ctx):
     """One pool = its own localisation x its own texture, normalised to in-cell mean 1."""
-    loc = localization_function(tau, mu=c["mu"].v, width=c["width"].v, sharp=c["sharp"].v)
-    f = loc * field(noise=noise, c=c, spacing=spacing, polar_deg=polar_deg,
-                    azim_deg=azim_deg, um_per_vox=um_per_vox, noise2=noise2)
+    loc = localization_function(tau, mu=c.mu.v, width=c.width.v, sharp=c.sharp.v)
+    f = loc * c.field_fct(ctx)
     return f / (f[cell].mean() + 1e-12)
 
+@dataclass
+class NoiseCtx:
+    """Everything a noise component needs, bundled so `field_fct` takes one argument.
+    """
+    noise: np.ndarray
+    gate: np.ndarray
+    f2: np.ndarray
+    fpar2: np.ndarray
+    fperp2: np.ndarray
+    um_per_vox: float = 1.0
 
-def render_marker(tape, comps, cell, tau, phi, d, spacing, polar_deg,
-    azim_deg, polarity=0.0, pol_dir=0.0, amp=1.0,
-                  edge_softness=0.0, edge_level=0.5, um_per_vox=1.0):
+    def px(self, p):
+        """A `P` holding microns -> lateral voxels. `spacing` already carries the anisotropy."""
+        return max(float(p.v) / float(self.um_per_vox), 1e-6)
+    
+def render_marker(tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0):
     """amp * normalise( sum_k w_k * normalise(loc_k x tex_k) x polarity x env(d) ).
 
     Normalise INSIDE each pool (a pool is a product), ADD across pools (means add), apply
     polarity, then multiply by the SMOOTH boundary envelope and rescale once so the marker's
-    mean intensity over the interior AREA is exactly amp. `d` is the normalised radius from
-    cell_fields; edge_softness / edge_level tune the falloff (see boundary_falloff).
+    mean intensity over the interior AREA is exactly amp.
     """
-    
-    out, wsum = np.zeros(cell.shape, float), 0.0
-    for i, c in enumerate(comps):
-        if c["w"].v <= 0:
-            continue
-        out += c["w"].v * pool_image(c = c, cell = cell, tau = tau, noise = tape["texture_noise"][i], 
-                                     spacing = spacing, polar_deg = polar_deg, azim_deg = azim_deg,
-                                     um_per_vox = um_per_vox,
-                                     noise2=tape["gate_noise"][i])
-        wsum += c["w"].v
-    out = out / wsum if wsum > 0 else cell.astype(float)
-    if polarity:
-        pd = np.asarray(pol_dir, np.float32)
-        pd = pd / (np.linalg.norm(pd) + 1e-30)
-        out = out * np.exp(np.float32(polarity) * (phi @ pd))
-    out = out * boundary_falloff(d, edge_softness, edge_level) 
-    
-    denom = out.sum() / max(int(cell.sum()), 1)
-    return (amp * out / (denom + 1e-12)).astype(np.float32)
+    mask, tau, phi, d = cell["cell"], cell["tau"], cell["phi"], cell["d"]
+    comps = marker.noise_components
+    n_pool = tape["texture_noise"].shape[0]
+    if len(comps) > n_pool:
+        raise ValueError(
+            f"marker {marker.name!r} has {len(comps)} components but the tape holds {n_pool} "
+            f"pools. Call tape.draw3d(..., Pool={len(comps)}) or more.")
 
-def render_image(tape, p_dict, cell_mask, tau, phi, d, spacing, polar_deg, azim_deg, um_per_vox = 1.0):
-    # Build kwargs for the underlying components (excluding the top-level rendering params)
-    general = p_dict.pop('general', None)
-    for marker, vals in p_dict.items():
-        p_dict[marker] = render_marker(tape = tape, comps = vals, cell = cell_mask, tau = tau, phi = phi, d = d, spacing = spacing,
-                         polar_deg = polar_deg, azim_deg = azim_deg, edge_softness=0.0, edge_level=0.5, amp = general['amp'].v, 
-                         pol_dir = [x.v for x in general['pol_dir']], polarity = general['polarity'].v,
-                         um_per_vox=um_per_vox)
-            
-    return p_dict, general
+    f2, fpar2, fperp2 = _freq(mask.shape, spacing, geom.POLAR_DEG.v, geom.AZIM_DEG.v)
+
+    out, wsum = np.zeros(mask.shape, float), 0.0
+    for i, c in enumerate(comps):
+        if c.w.v <= 0:
+            continue
+        ctx = NoiseCtx(noise=tape["texture_noise"][i], gate=tape["gate_noise"][i],
+                       f2=f2, fpar2=fpar2, fperp2=fperp2, um_per_vox=um_per_vox)
+        out += c.w.v * pool_image(c, mask, tau, ctx)
+        wsum += c.w.v
+    out = out / wsum if wsum > 0 else mask.astype(float)
+
+    if marker.polarity.v:
+        pd = np.asarray([p.v for p in marker.pol_dir], np.float32)
+        pd = pd / (np.linalg.norm(pd) + 1e-30)
+        out = out * np.exp(np.float32(marker.polarity.v) * (phi @ pd))
+
+    # hard by default: the soft rim in a real image is made by the optics, and psf_project
+    # makes it. Anything but 0 here is blur invented before the microscope gets a look in.
+    out = out * (boundary_falloff(d, edge_softness) if edge_softness > 0 else mask)
+
+    denom = out.sum() / max(int(mask.sum()), 1)
+    return (marker.amp.v * out / (denom + 1e-12)).astype(np.float32)
+
+def render_image(tape, profile, cell, spacing, um_per_vox=1.0, edge_softness=0.0):
+    """Render every marker of a CellProfile on one cell. Returns {marker name: volume}."""
+    return {name: render_marker(tape, m, cell, spacing, profile.Geometry,
+                                um_per_vox=um_per_vox, edge_softness=edge_softness)
+            for name, m in profile.Markers.items()}
 
 
 def to_rgb(mask, channels, pct=99.5):

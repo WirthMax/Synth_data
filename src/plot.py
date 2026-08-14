@@ -123,7 +123,13 @@ def surface_xyz_inline(rfn, elong, polar_deg, azim_deg, roll_deg, centre=(0, 0, 
     return p[..., 0], p[..., 1], p[..., 2], r
 
 
-def plot_surface_xyz_inline(cell, elong, polar_deg, azim_deg, roll_deg):
+def plot_surface_xyz_inline(cell, geom):
+    
+    elong = geom.ELONG.v
+    polar_deg = geom.POLAR_DEG.v
+    azim_deg = geom.AZIM_DEG.v
+    roll_deg = geom.ROLL_DEG.v
+    
     X,  Y,  Z,  r = surface_xyz_inline(cell["r_cell_fn"], elong = elong,
                                        polar_deg = polar_deg, azim_deg = azim_deg, 
                                        roll_deg = roll_deg
@@ -152,7 +158,12 @@ def plot_surface_xyz_inline(cell, elong, polar_deg, azim_deg, roll_deg):
 
 import plotly.graph_objects as go
 
-def plot_surface_xyz_html(cell, elong, polar_deg, azim_deg, roll_deg, out_path):
+def plot_surface_xyz_html(cell, geom, out_path):
+    
+    elong = geom.ELONG.v
+    polar_deg = geom.POLAR_DEG.v
+    azim_deg = geom.AZIM_DEG.v
+    roll_deg = geom.ROLL_DEG.v
     
     X,  Y,  Z,  r = surface_xyz_inline(cell["r_cell_fn"], elong = elong,
                                        polar_deg = polar_deg, azim_deg = azim_deg, 
