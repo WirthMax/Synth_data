@@ -5,6 +5,8 @@ from pathlib import Path
 from scene import _stretch, rotation_matrix
 
 
+def NormalizeData(stack, pct=99.5):
+    return np.clip(stack / (np.percentile(stack, pct) + 1e-12), 0.0, 1.0)
 
 
 def tau_cmap(vmax=1.0):

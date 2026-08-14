@@ -322,6 +322,39 @@ class Detector(ParamHolder):
     BIT_DEPTH: int = 16
 
 
+# Optics: 
+@dataclass(frozen=True)
+class Optics:
+    """Known Physical properties of the detector (Macsima) and the experiment."""
+    um_per_px: float = 0.325 
+    um_per_pz: float = 0.325 
+    
+    focal_um: float = 0.0
+    
+    # VERIFY
+    # Numerical Aperture (NA)
+    na: float = 0.45 #or 0.75
+     
+    wavelength_um: float = 0.530 # fallback
+    
+    # different refractive index of tissue and medium. VERIFY
+    n_immersion: float = 1.0
+    n_sample: float = 1.33
+    
+    # Thickness of the section
+    section_um: float = 4.
+    # Depth of the section CENTRE below the coverslip
+    depth_um: float = 2.0
+    
+    @property
+    def sample_depth_um(self):
+        """Depth of the section centre below the coverslip."""
+        return max(self.depth_um, self.section_um / 2)
+    
+    @property
+    def tan_theta(self):
+        return float(np.tan(np.arcsin(np.clip(self.na / self.n_immersion, 0.0, 0.999))))
+
 @dataclass
 class Tissue:
     # Dictionary to hold multiple cell types, keyed by cell name
