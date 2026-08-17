@@ -1,7 +1,8 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-
+from parameter import CellContext
+from render import render_marker
 
 # To prevent rerunning things if they already ran once
 _QUAD = None
@@ -15,8 +16,7 @@ def _quad():
     return _QUAD
 
 def fit_directions(n_theta=24, n_phi=48):
-    """Cached unit directions for the containment tests.
-    """
+    """Cached unit directions for the containment tests."""
     global _FIT_DIRS
     if _FIT_DIRS is None or _FIT_DIRS[1] != (n_theta, n_phi):
         _FIT_DIRS = (sphere_quadrature(n_theta, n_phi)[0].astype(np.float64),
@@ -165,19 +165,17 @@ def centred_grid_3d(shape, spacing=1.0):
     return np.stack([X, Y, Z], -1)
 
 
-def patch_grid(cy, cx, reach, tile):
-    """Small grid around one centre, clipped to the tile -- the tissue case.
-
-    Returns (y, x, (y0, x0)) so the caller can write results back at the right offset.
-    """
-    y0, y1 = max(0, int(cy) - reach), min(tile, int(cy) + reach + 1)
-    x0, x1 = max(0, int(cx) - reach), min(tile, int(cx) + reach + 1)
-    y, x = np.mgrid[y0:y1, x0:x1]
-    return y.astype(float), x.astype(float), (y0, x0)
+def patch_grid(centre_xyz, reach, shape):
+    """Box of half-width `reach` around a centre, clipped to the volume."""
+    nz, ny, nx = shape
+    cx, cy, cz = centre_xyz
+    return (slice(max(0, int(cz) - reach), min(nz, int(cz) + reach + 1)),
+            slice(max(0, int(cy) - reach), min(ny, int(cy) + reach + 1)),
+            slice(max(0, int(cx) - reach), min(nx, int(cx) + reach + 1)))
 
 
 def reach_px(R, elong, rough, grow=1.0, pad=2):
-    """Furthest pixel this cell can claim, in image px"""
+    """Furthest pixel this cell can claim, in image vox"""
     s = np.sqrt(elong)
     return int(np.ceil(R * grow * max(s, 1.0 / s) * np.exp(3.0 * rough))) + pad
 
@@ -379,204 +377,115 @@ def generate_single_cell_3d(Tape, geom,
 from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter
 from scipy import ndimage as ndi
-from render import render_marker          # one-way: render.py imports no scene, so no cycle
+import dataclasses
 
 
+def stamp_cell(tape, i, geom, grid, sl, centre_world, L = 4, l_min = 2,
+               grow=1.0):
+    """Tissue: candidate i stamped at (cy, cx, cz) on a local patch.
 
-def stamp_cell(tape, i, cy, cx, tile, radius, nuc_frac, rough, elong, angle_deg, beta,
-               grow=1.0, rim=1.5, nuc_corr=0.4, nuc_offset=0.6, body_grow=1.0):
-    """Tissue: candidate i stamped at (cy, cx) on a local patch.
-
-    `grow` sizes the patch (reach); `body_grow` scales the rendered cell contour (see
+    `grow` sizes the cell contour only; `body_grow` scales the rendered cell contour (see
     cell_fields). They are set together (body_grow=grow) to render markers on the packed body.
     """
-    y, x, origin = patch_grid(cy, cx, reach_px(radius, elong, rough, grow), tile)
-    f = _cell_and_nucleus(
-        tape["a"][i], tape["b"][i], tape["a2"][i], tape["b2"][i], y, x, cy, cx,
-        radius, nuc_frac, rough, beta, tape["K"], elong, angle_deg, rim,
-        nuc_corr, nuc_offset,
-        off_dir=2 * np.pi * tape["u_offdir"][i], off_mag=tape["u_offmag"][i],
-        body_grow=body_grow)
-    return f, origin
+    return _cell_and_nucleus(
+        c_cell=tape["sh"][i], c_nuc=tape["sh2"][i], grid=grid[sl], L=L, l_min=l_min,
+        nuc_corr=geom.NUC_CORR.v, nuc_frac=geom.NUC_FRAC.v, radius=geom.RADIUS.v,
+        rough=geom.ROUGH.v, beta=geom.BETA.v,
+        rot=rotation_matrix(geom.POLAR_DEG.v, geom.AZIM_DEG.v, geom.ROLL_DEG.v),
+        elong=geom.ELONG.v, rim=geom.RIM.v, nuc_offset=geom.NUC_OFFSET.v,
+        off_dir=tape["u_offdir"][i], off_mag=tape["u_offmag"][i],
+        grow=grow, centre=centre_world,
+        rough_nuc=geom.NUC_ROUGH.v, beta_nuc=geom.NUC_BETA.v)
 
 
-def thin(tape, min_dist):
-    xy, order = tape["xy"], tape["order"]
-    keep = np.ones(len(xy), bool)
-    for i, j in cKDTree(xy).query_pairs(min_dist, output_type="ndarray"):
+def vox_to_world(pts_xyz, shape, spacing):
+    """(x,y,z) voxel indices -> the world coordinates centred_grid_3d uses."""
+    nz, ny, nx = shape
+    sz, sy, sx = spacing
+    return (np.asarray(pts_xyz, float)
+            - np.array([(nx - 1) / 2, (ny - 1) / 2, (nz - 1) / 2])) * np.array([sx, sy, sz])
+
+def cell_geometry(base, ttape, i, tg):
+    """This cell's own geometry: the base shape plus its frozen size / orientation draws.
+    """
+    r = float(np.clip(base.RADIUS.v * np.exp(tg.SIZE_SIGMA.v * ttape["z_size"][i]),
+                      base.RADIUS.lo, base.RADIUS.hi))
+    nf = float(np.clip(base.NUC_FRAC.v * np.exp(tg.NUC_FRAC_SIGMA.v * ttape["z_nucfrac"][i]),
+                       base.NUC_FRAC.lo, base.NUC_FRAC.hi))
+    o = ttape["u_orient3"][i]
+    return dataclasses.replace(base, RADIUS=r, NUC_FRAC=nf, POLAR_DEG=float(180.0 * o[0]),
+                               AZIM_DEG=float(360.0 * o[1]), ROLL_DEG=float(360.0 * o[2]))
+
+def thin(pts, order, min_dist):
+    keep = np.ones(len(pts), bool)
+    for i, j in cKDTree(pts).query_pairs(float(min_dist), output_type="ndarray"):
         keep[i if order[i] > order[j] else j] = False
     return np.flatnonzero(keep)
 
 
-def support_mask(tape, scale_px=40.0, cover=0.75):
-    z = gaussian_filter(tape["support"], scale_px, truncate=4.0)
+def support_mask(w, XY_scale_vox=40.0, Z_scale_vox=40.0, cover=0.75):
+    """Smooth the frozen field, then threshold at a quantile so `cover` IS the realised fraction."""
+    z = gaussian_filter(w.astype(np.float32),
+                        (float(Z_scale_vox), float(XY_scale_vox), float(XY_scale_vox)), truncate=3.0)
     z = (z - z.mean()) / (z.std() + 1e-12)
-    return z >= np.quantile(z, 1.0 - np.clip(cover, 0.0, 1.0))
+    return z >= np.quantile(z, 1.0 - float(np.clip(cover, 0.0, 1.0)))
 
 
-def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
-                 rough=0.15, beta=2.0, support_scale=40.0, cover=0.75, grow=1.35,
-                 nuc_frac=0.35, nuc_frac_sigma=0.15, rim=1.5, nuc_corr=0.5, nuc_offset=0.9,
-                 markers=None):
-    """Render a tile of packed cells: instance labels plus intrinsic coordinates.
-
-    Nothing here reads pixel data. The output is a deterministic function of (tape, theta),
-    which is what makes the label trustworthy as ground truth.
-
-    Parameters
-    ----------
-    tape : dict
-        Frozen randomness, drawn once and independent of every parameter below. Fields used
-        here: xy (candidate centres), order (hard-core priority), a/b (cell harmonics),
-        a2/b2 (independent nuclear harmonics), z_size, z_nucfrac, u_orient, u_offdir,
-        u_offmag, support, tile, K. Parameters only THRESHOLD or SMOOTHLY MAP these, never
-        resample them -- resampling per theta would make the fitting objective jagged.
-
-    Point process
-    -------------
-    min_dist : float, px
-        Hard-core radius: no two surviving centres are closer than this. GROUNDED -- measure
-        it from real nearest-neighbour distances rather than fitting it, since it defines the
-        mask. Roughly 1.2-1.8 x radius; too large and only a handful of candidates survive.
-    support_scale : float, px
-        Correlation length of the tissue-support field. Must stay >> cell size (>= ~4 x
-        radius) so the support boundary can never be mistaken for a cell edge.
-    cover : float in [0, 1]
-        Fraction of the tile that is tissue. Applied as a quantile of the support field, so
-        it maps monotonically onto realised coverage whatever the field's spread.
-
-    Cell geometry (all mask-defining -> GROUNDED, not fitted)
-    --------------------------------------------------------
-    radius : float, px
-        Median equivalent-circle radius of the FREE shape (area = pi r^2). Note the realised
-        label area differs after packing -- ground this against post-packing median area,
-        not against pi*radius^2.
-    size_sigma : float
-        Lognormal spread of cell size: realised r = radius * exp(size_sigma * z_size).
-        0.15 gives roughly +-15%.
-    elong : float >= 1
-        Median aspect ratio. Area-preserving (the body-frame map has unit determinant), so
-        this does not double as a size knob.
-    rough : float
-        Boundary irregularity, read as the SD of log radius: 0.15 ~ +-15% radial wobble.
-        Above ~0.35 territories start pinching apart -- watch info["orphan_px"].
-    beta : float
-        Spectral tilt of the boundary harmonics at FIXED amplitude. Large -> a few fat
-        lobes; small -> fine crenulation, which pinches at small radius. Below ~1.0 with
-        radius < 5 px the shape is no longer band-limited for the pixel grid.
-
-    Packing
-    -------
-    grow : float >= 1
-        How far a cell may claim pixels, in units of its own free boundary (d = rho/r).
-        1.0 -> free shapes with gaps between them; ~2 -> confluent, cells meeting along
-        contact surfaces. In dense regions a neighbour binds first and grow is inert; in
-        sparse regions grow alone sets the cell size.
-
-    Nucleus
-    -------
-    nuc_frac : float
-        Median nucleus:cell equivalent-radius ratio.
-    nuc_frac_sigma : float
-        Per-cell lognormal spread of that ratio. Set > 0, or nuclear area predicts cell area
-        exactly and a nucleus-only model can invert the whole segmentation.
-    nuc_corr : float in [0, 1]
-        How much the nuclear outline mirrors the cell outline. 1 -> a scaled copy (leaks
-        orientation and elongation); 0 -> independent. Implemented by mixing two frozen
-        draws, so it stays smooth and safe to fit.
-    nuc_offset : float in [0, 1]
-        Nuclear eccentricity, as a fraction of the free cytoplasmic room. 0 puts the nucleus
-        exactly on the tessellation seed, making the seed exactly recoverable from the
-        nucleus.
-    rim : float, px
-        Minimum cytoplasmic clearance between the nuclear and plasma membranes. Enforced on
-        the support function, so the labelled nuclear edge and the tau = 0 level set stay the
-        same curve. Must stay resolvable -- below ~1 px it vanishes after the PSF.
-
-    Markers (appearance -- opt-in; the mask is unchanged whether on or off)
-    ----------------------------------------------------------------------
-    markers : callable or None
-        Each cell's channels are rendered on its own patch with
-        `render_marker` and composited by the SAME tessellation winner as the label, so the
-        image can never disagree with the mask. Texture comes from `tape["noise_tile"]` sliced
-        to the patch, so it stays frozen and globally coherent across the tile.
-
-    Returns
-    -------
-    labels : (tile, tile) int32       0 = background, k = cell k. THE GROUND TRUTH.
-    nuc_labels : (tile, tile) int32   nuclei, same ids as `labels`.
-    tau_img : (tile, tile) float      -1 nucleus centre, 0 nuclear envelope, +1 free
-                                      membrane. Exceeds 1 in contact zones when grow > 1.
-    phi_img : (tile, tile) float      body-frame angle, co-rotating with each cell.
-    info : dict                       n_cells, centres, r_eff, support, orphan_px, empty,
-                                      packing (cell pixels / support pixels), d_img (the winning
-                                      normalised radius per pixel; inf in background), and
-                                      markers (list of (tile, tile) channels, or None).
+def assign_types(info, tape, Profiles, fractions, rule=None):
+    """ecide each cell's type
     """
-    tile = tape["tile"]
-    # generate a support mask to limit the area where cells can be placed
-    sup = support_mask(tape, support_scale, cover)
-    # keep only the candidates that are sufficiently far apart and within the support mask
-    keep = thin(tape, min_dist)
-    cy0, cx0 = tape["xy"][keep].T
-    keep = keep[sup[np.clip(cy0.astype(int), 0, tile-1),
-                    np.clip(cx0.astype(int), 0, tile-1)]]
+    type_names = list(Profiles)
+    cuts = np.cumsum(np.asarray(fractions, float) / np.sum(fractions))
+    types = {}
+    for n in info["labels_present"]:
+        i = info["cand_idx"][n]
+        base = type_names[int(np.searchsorted(cuts, tape["u_type"][i]))]
+        ctx = CellContext(label=n, index=i, centre=info["centres_vox"][n],
+                          geom=info["geoms"][n], neigh_labels=info["neighbours"][n],
+                          types=types)
+        types[int(n)] = base if rule is None else rule(ctx, base)
+    return types
 
-    best       = np.full((tile, tile), np.inf)
-    labels     = np.zeros((tile, tile), np.int32)
-    nuc_labels = np.zeros((tile, tile), np.int32)
-    tau_img    = np.zeros((tile, tile))
-    phi_img    = np.zeros((tile, tile))
-    channels   = None                    # allocated lazily once we know how many markers
-    r_eff = radius * np.exp(size_sigma * tape["z_size"][keep])
+class TapeDict(dict):
+    """dict that also allows attribute access, so it works wherever a Tape does."""
+    __getattr__ = dict.__getitem__
 
-
-    nf = np.clip(nuc_frac * np.exp(nuc_frac_sigma * tape["z_nucfrac"][keep]), 0.15, 0.85)
+def build_tissue(tape, TG, shape, base_geom, spacing, Profiles, Fractions, um_per_vox, L = 4, l_min = 2):
+    sup = support_mask(w = tape["support3"], XY_scale_vox = TG.SUPPORT_SCALE.v, 
+                    Z_scale_vox = TG.SUPPORT_SCALE_Z.v,
+                    cover = TG.COVER.v)
+    keep = thin(tape["xyz"], tape["order"], TG.MIN_DIST.v)
+    cx, cy, cz = tape["xyz"][keep].T
+    nz, ny, nx = shape
+    keep = keep[sup[np.clip(cz.astype(int), 0, nz - 1),
+                    np.clip(cy.astype(int), 0, ny - 1),
+                    np.clip(cx.astype(int), 0, nx - 1)]]
+    
+    grid = centred_grid_3d(shape, spacing)
+    best = np.full(shape, np.inf, np.float32)
+    labels = np.zeros(shape, np.int32)
+    nuc_labels = np.zeros(shape, np.int32)
+    tau_img = np.zeros(shape, np.float32)
+    geoms, slices, centres_w = {}, {}, {}
 
     for n, i in enumerate(keep, start=1):
-        cy, cx = tape["xy"][i]
-        
-        f, (y0, x0) = stamp_cell(
-            tape = tape, i = i, cy = cy, cx = cx, tile = tile, radius = r_eff[n-1], 
-            nuc_frac = nf[n-1], rough = rough, elong = elong, 
-            angle_deg = 180.0 * tape["u_orient"][i], beta = beta,
-            grow=grow, rim=rim, nuc_corr=nuc_corr, nuc_offset=nuc_offset, 
-        )
-        h, w = f["d"].shape
-        if h == 0 or w == 0:
+        g = cell_geometry(base_geom, tape, i, TG)
+        sl = patch_grid(tape["xyz"][i],
+                         reach_px(R=g.RADIUS.v, elong=g.ELONG.v, rough=g.ROUGH.v, grow=TG.GROW.v), 
+                         shape)
+        if any(s.stop - s.start <= 0 for s in sl):
             continue
-        sl = (slice(y0, y0+h), slice(x0, x0+w))
-        
+        cw = vox_to_world(tape["xyz"][i], shape, spacing)
+        f = stamp_cell(tape, i, g, grid, sl, cw, L = L, l_min = l_min, grow=1.0)
+
         # tesselation to decide which cell is closest to each pixel 
-        # -> find boundries
-        win = (f["d"] < best[sl]) & (f["d"] <= grow) & sup[sl]
+        win = (f["d"] < best[sl]) & (f["d"] <= TG.GROW.v) & sup[sl]
         best[sl] = np.where(win, f["d"], best[sl])
         labels[sl] = np.where(win, n, labels[sl])
         tau_img[sl] = np.where(win, f["tau"], tau_img[sl])
-        phi_img[sl] = np.where(win, f["phi"], phi_img[sl])
-        nuc_labels[sl] = np.where(win, f["nuc"]*n, nuc_labels[sl])
-
-        # markers: render this cell's channels and composite by the SAME winner mask, so the
-        # image can never disagree with the label. Render on the GROWN body (body_grow=grow):
-        # its boundary is grow * r(phi), which coincides with the label extent (f["d"] <= grow),
-        # so a marker fills the packed territory instead of only the free shape. Same patch,
-        # so the offsets/shape match the mask fields above.
-        if markers is not None:
-            fm, _ = stamp_cell(
-                tape=tape, i=i, cy=cy, cx=cx, tile=tile, radius=r_eff[n-1],
-                nuc_frac=nf[n-1], rough=rough, elong=elong,
-                angle_deg=180.0 * tape["u_orient"][i], beta=beta,
-                grow=grow, rim=rim, nuc_corr=nuc_corr, nuc_offset=nuc_offset, body_grow=grow)
-            if fm["cell"].any():
-                specs = markers()                    # [(comps, amp, polarity, pol_dir), ...]
-                if channels is None:
-                    channels = [np.zeros((tile, tile)) for _ in specs]
-                ptape = {"noise": tape["noise_tile"][:, y0:y0+h, x0:x0+w]}   # render_marker reads only ["noise"]
-                for ch, (comps, amp, pol, pdir) in zip(channels, specs):
-                    img = render_marker(comps, fm["cell"], fm["tau"], fm["phi"], fm["d"],
-                                        ptape, pol, pdir, amp)
-                    ch[sl] = np.where(win, img, ch[sl])
-
+        nuc_labels[sl] = np.where(win, f["nuc"] * n, nuc_labels[sl])
+        geoms[n], slices[n], centres_w[n] = g, sl, cw
+        
     # keep only the piece holding the seed; a two-piece "cell" is a wrong annotation
     orphan = 0
     for n, slc in enumerate(ndi.find_objects(labels), start=1):
@@ -590,15 +499,45 @@ def build_tissue(tape, min_dist=11.0, radius=8.0, size_sigma=0.15, elong=1.6,
             labels[slc][drop] = 0
             nuc_labels[slc][drop] = 0
             tau_img[slc][drop] = 0.0
-            if channels is not None:
-                for ch in channels:
-                    ch[slc][drop] = 0.0          # keep the image matching the trimmed mask
             orphan += int(drop.sum())
+            orphan += int(drop.sum())
+    
+    present = sorted(set(np.unique(labels)) - {0})
+    cvox = tape["xyz"][keep]
+    tree = cKDTree(cvox)
+    neigh = {n: [j + 1 for j in tree.query_ball_point(cvox[n - 1], TG.NEIGH_RADIUS.v)
+                 if j + 1 != n] for n in present}
+    neigh = {n: [j for j in v if j in neigh] for n, v in neigh.items()}
 
-    present = np.flatnonzero(np.bincount(labels.ravel(), minlength=len(keep)+1)[1:])
-    info = dict(n_cells=len(keep), centres=tape["xy"][keep], r_eff=r_eff, support=sup,
-                orphan_px=orphan, empty=len(keep)-len(present),
-                packing=float((labels > 0).sum() / max(sup.sum(), 1)),
-                d_img=best, markers=channels)
-    return labels, nuc_labels, tau_img, phi_img, info
+    info = dict(labels_present=present, cand_idx={n: int(keep[n - 1]) for n in present},
+        geoms=geoms, slices=slices, centres_w=centres_w,
+        centres_vox={n: cvox[n - 1] for n in present},
+        neighbours=neigh, support=sup, orphan_vox=orphan,
+        packing=float((labels > 0).sum() / max(sup.sum(), 1)))
+    
+    types = assign_types(info, tape, Profiles, Fractions)
+    
+    names = sorted({m for p in Profiles.values() for m in p.Markers})
+    out = {m: np.zeros(shape, np.float32) for m in names}
+    grid = centred_grid_3d(shape, spacing)
+
+    for n in info["labels_present"]:
+        prof = Profiles[types[n]]
+        g, sl = info["geoms"][n], info["slices"][n]
+        win = labels[sl] == n
+        if not win.any():
+            continue
+        # the packed body, so a marker fills the claimed territory, not just the free shape
+        f = stamp_cell(tape, info["cand_idx"][n], g, grid, sl, info["centres_w"][n],
+                          grow=TG.GROW.v)
+        ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
+                         gate_noise=tape["gate_noise"][(slice(None),) + sl])
+        off = 0
+        for name, marker in prof.Markers.items():
+            img = render_marker(tape = ptape, marker = marker, cell = f, spacing = spacing, geom = g, um_per_vox=um_per_vox,
+                                edge_softness=0.0, pool_offset=off)
+            out[name][sl] = np.where(win, img, out[name][sl])
+            off += len(marker.noise_components)
+    
+    return out, labels, nuc_labels, tau_img, types, info
 

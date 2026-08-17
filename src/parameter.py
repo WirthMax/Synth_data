@@ -394,6 +394,28 @@ class TissueGeometry(ParamHolder):
                             "neighbourhood-dependent marker expression.")
 
     
+@dataclass
+class CellContext:
+    """What a rule may look at when deciding one cell's expression."""
+    label: int
+    # candidate index in the tape
+    index: int
+    # voxel coords         
+    centre: np.ndarray
+    geom: CellGeometry
+    # labels within NEIGH_RADIUS
+    neigh_labels: list
+    # label -> type name, for cells already assigned
+    types: dict
+
+    def n_neighbours(self):
+        return len(self.neigh_labels)
+
+    def neighbour_types(self):
+        return [self.types[j] for j in self.neigh_labels if j in self.types]
+    
+    
+    
 def get_all_parameters(obj, prefix=""):
     """Recursively fetches all P instances from dataclasses, dicts, and lists."""
     params = {}

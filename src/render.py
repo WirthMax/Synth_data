@@ -1,6 +1,6 @@
 from dataclasses import dataclass
-
 import numpy as np
+
 
 POOL_NAMES = ["diffuse", "fibrillar", "punctate"]
 N_POOLS = 3
@@ -153,3 +153,4 @@ def to_rgb(mask, channels, pct=99.5):
         ],
         -1,
     )
+    
