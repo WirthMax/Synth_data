@@ -283,6 +283,7 @@ class CellMarker(ParamHolder):
 @dataclass
 class CellProfile:
     """Geometry plus every marker stained on this cell type."""
+    Color:str = "black"
     Geometry: CellGeometry = field(default_factory=CellGeometry)
     Markers: Dict[str, CellMarker] = field(default_factory=dict)
 
@@ -364,6 +365,33 @@ class Tissue:
     # Dictionary to hold multiple cell types, keyed by cell name
     CellTypes: Dict[str, CellProfile] = field(default_factory=dict)
     # Tissue params...
+    
+
+@dataclass
+class TissueGeometry(ParamHolder):
+    """How cells are laid out in the volume. Lengths in VOXELS, like CellGeometry."""
+    MIN_DIST: P = P(2., 60., .5, 11.0, "min dist", note="min dist",
+                    comment="hard-core spacing: no two centres closer than this. Roughly "
+                            "1.2-1.8 x radius; too large and few candidates survive.")
+    SUPPORT_SCALE: P = P(2., 200., 1., 40.0, "support scale", note="support",
+                    comment="correlation length of the tissue-support field. Keep >> cell size "
+                            "or the support boundary starts looking like a cell edge.")
+    SUPPORT_SCALE_Z: P = P(1., 200., 1., 25.0, "support scale z", note="support z",
+                    comment="AXIAL correlation length, separately.")
+    COVER: P = P(.05, 1., .05, .75, "cover", note="cover",
+                    comment="fraction of the volume that is tissue. Applied as a quantile of "
+                            "the support field, so it maps monotonically onto realised cover.")
+    GROW: P = P(1., 3., .05, 1.35, "grow", note="grow",
+                    comment="how far a cell may claim, in units of its own boundary. 1 = free "
+                            "shapes with gaps between them; ~2 = confluent.")
+    SIZE_SIGMA: P = P(0., .6, .01, .15, "size sigma", note="size sd",
+                    comment="lognormal spread of cell size: r = RADIUS * exp(sigma * z).")
+    NUC_FRAC_SIGMA: P = P(0., .6, .01, .15, "nuc frac sigma", note="nucfrac sd",
+                    comment="spread of the nucleus:cell ratio. Keep > 0, or nuclear size "
+                            "predicts cell size exactly and the segmentation is invertible.")
+    NEIGH_RADIUS: P = P(2., 100., 1., 24.0, "neigh radius", note="neigh r",
+                    comment="radius of the neighbour graph, voxels -- what 'nearby' means for "
+                            "neighbourhood-dependent marker expression.")
 
     
 def get_all_parameters(obj, prefix=""):

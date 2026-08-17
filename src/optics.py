@@ -1,7 +1,7 @@
 import psfmodels as psfm
 import numpy as np
 from scipy.signal import fftconvolve
-from dataclasses import dataclass
+from scipy import ndimage as ndi
 
 _KERNEL_CACHE = {}
 # Verify
@@ -77,18 +77,48 @@ def kryostat(vol, opt, centre_um = 0.0):
     keep = np.abs(z - centre_um) <= opt.section_um / 2
     return vol[keep], z[keep]
 
-def mask_collapse(mask, z_um, opt=None, mask_pct=0.95):
+def _cov_thresh(cov, mask_pct):
+            flat = np.sort(cov.ravel())[::-1]
+            csum = np.cumsum(flat)
+            if csum[-1] <= 0:
+                return np.zeros(cov.shape, bool), cov
+            k = int(np.searchsorted(csum, mask_pct * csum[-1])) 
+            return flat[min(k, flat.size - 1)]
+        
+def mask_collapse(mask, z_um, opt=None, mask_pct=0.95, keep_largest = True):
     """The honest 2D footprint of a 3D object seen through the exact optics.
     """
-    cov = psf_project(slice_vol = mask.astype(np.float32), 
-                      z_um = z_um, optics = opt)
-    flat = np.sort(cov.ravel())[::-1]
-    csum = np.cumsum(flat)
-    if csum[-1] <= 0:
-        return np.zeros(cov.shape, bool), cov
-    k = int(np.searchsorted(csum, mask_pct * csum[-1]))
-    thr = flat[min(k, flat.size - 1)]
-    return cov >= thr, cov
+    # single mask case
+    mask = np.asarray(mask)
+    if mask.dtype == bool or mask.max() <= 1:
+        cov = psf_project(slice_vol=mask.astype(np.float32), z_um=z_um, optics=opt)
+        thr = _cov_thresh(cov, mask_pct)
+        return cov >= thr, cov
+    
+    # Tissue case
+    ids = np.unique(mask)
+    ids = ids[ids > 0]
+    if ids.size == 0:
+        z = np.zeros(mask.shape[1:], np.float32)
+        return z.astype(np.int32), z
+
+    # project every label, then decide ownership once
+    covs = np.stack([psf_project(slice_vol=(mask == n).astype(np.float32), z_um=z_um, optics=opt)
+                     for n in ids])
+    thr = np.array([_cov_thresh(c, mask_pct) for c in covs], np.float32)
+    scored = np.where(covs >= thr[:, None, None], covs, -1.0)
+    out = np.where(scored.max(0) > 0, ids[scored.argmax(0)], 0).astype(np.int32)
+
+    if keep_largest:
+        for n in ids:
+            m = out == n
+            if not m.any():
+                continue
+            cc, k = ndi.label(m)
+            if k > 1:
+                main = 1 + int(np.argmax(np.bincount(cc.ravel())[1:]))
+                out[m & (cc != main)] = 0
+    return out, covs.sum(0)
 
 
 ### DETECTOR
