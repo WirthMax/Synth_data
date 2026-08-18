@@ -81,7 +81,7 @@ def _cov_thresh(cov, mask_pct):
             flat = np.sort(cov.ravel())[::-1]
             csum = np.cumsum(flat)
             if csum[-1] <= 0:
-                return np.zeros(cov.shape, bool), cov
+                return np.zeros(cov.shape, bool)
             k = int(np.searchsorted(csum, mask_pct * csum[-1])) 
             return flat[min(k, flat.size - 1)]
         
@@ -93,7 +93,7 @@ def mask_collapse(mask, z_um, opt=None, mask_pct=0.95, keep_largest = True):
     if mask.dtype == bool or mask.max() <= 1:
         cov = psf_project(slice_vol=mask.astype(np.float32), z_um=z_um, optics=opt)
         thr = _cov_thresh(cov, mask_pct)
-        return cov >= thr, cov
+        return (cov >= thr), cov
     
     # Tissue case
     ids = np.unique(mask)

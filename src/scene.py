@@ -176,8 +176,7 @@ def patch_grid(centre_xyz, reach, shape):
 
 def reach_px(R, elong, rough, grow=1.0, pad=2):
     """Furthest pixel this cell can claim, in image vox"""
-    s = np.sqrt(elong)
-    return int(np.ceil(R * grow * max(s, 1.0 / s) * np.exp(3.0 * rough))) + pad
+    return int(np.ceil(R * grow * max(elong, 1.0 / elong) * np.exp(3.0 * rough))) + pad
 
 
 def mix_harmonics(sh, sh2, corr):
@@ -432,7 +431,7 @@ def support_mask(w, XY_scale_vox=40.0, Z_scale_vox=40.0, cover=0.75):
 
 
 def assign_types(info, tape, Profiles, fractions, rule=None):
-    """ecide each cell's type
+    """Decide each cell's type
     """
     type_names = list(Profiles)
     cuts = np.cumsum(np.asarray(fractions, float) / np.sum(fractions))
@@ -450,7 +449,8 @@ class TapeDict(dict):
     """dict that also allows attribute access, so it works wherever a Tape does."""
     __getattr__ = dict.__getitem__
 
-def build_tissue(tape, TG, shape, base_geom, spacing, Profiles, Fractions, um_per_vox, L = 4, l_min = 2):
+def build_tissue(tape, TG, shape, base_geom, spacing, Profiles, Fractions, 
+                 um_per_vox, L = 4, l_min = 2, rule = None):
     sup = support_mask(w = tape["support3"], XY_scale_vox = TG.SUPPORT_SCALE.v, 
                     Z_scale_vox = TG.SUPPORT_SCALE_Z.v,
                     cover = TG.COVER.v)
@@ -500,7 +500,6 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Profiles, Fractions, um_pe
             nuc_labels[slc][drop] = 0
             tau_img[slc][drop] = 0.0
             orphan += int(drop.sum())
-            orphan += int(drop.sum())
     
     present = sorted(set(np.unique(labels)) - {0})
     cvox = tape["xyz"][keep]
@@ -515,11 +514,10 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Profiles, Fractions, um_pe
         neighbours=neigh, support=sup, orphan_vox=orphan,
         packing=float((labels > 0).sum() / max(sup.sum(), 1)))
     
-    types = assign_types(info, tape, Profiles, Fractions)
+    types = assign_types(info, tape, Profiles, Fractions, rule)
     
     names = sorted({m for p in Profiles.values() for m in p.Markers})
     out = {m: np.zeros(shape, np.float32) for m in names}
-    grid = centred_grid_3d(shape, spacing)
 
     for n in info["labels_present"]:
         prof = Profiles[types[n]]
@@ -529,7 +527,7 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Profiles, Fractions, um_pe
             continue
         # the packed body, so a marker fills the claimed territory, not just the free shape
         f = stamp_cell(tape, info["cand_idx"][n], g, grid, sl, info["centres_w"][n],
-                          grow=TG.GROW.v)
+                          grow=TG.GROW.v, L=L, l_min=l_min)
         ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
                          gate_noise=tape["gate_noise"][(slice(None),) + sl])
         off = 0
