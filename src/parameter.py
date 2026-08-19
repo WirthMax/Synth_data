@@ -6,6 +6,11 @@ import numpy as np
 import ipywidgets as W
 from scipy.special import ndtri 
 
+DYES = ("DAPI", "FITC", "PE", "APC")
+DAPI_NAME = "DAPI"
+DAPI_DYE = "DAPI"
+NUCLEAR_TAU_MAX = 0.0
+
 
 @dataclass(frozen=True)
 class P:
@@ -47,6 +52,38 @@ def _as_p(default, value, where):
         raise ValueError(f"{where} = {v} is outside its declared range "
                          f"[{default.lo}, {default.hi}]  ({default.comment or default.name})")
     return dataclasses.replace(default, v=v)
+
+
+
+def narrow(p, lo, hi, v=None):
+    """A copy of `p` with tighter bounds, and its value pulled inside them.
+    """
+    lo, hi = float(lo), float(hi)
+    v = p.v if v is None else v
+    return dataclasses.replace(p, lo=lo, hi=hi, v=float(np.clip(v, lo, hi)))
+
+
+def make_nuclear(comp, mu=(-0.85, -0.15), width=(0.25, 0.85)):
+    """Force a noise component to live inside the nucleus, by bounds.
+    """
+    comp.mu = narrow(comp.mu, mu[0], min(mu[1], NUCLEAR_TAU_MAX), -0.55)
+    comp.width = narrow(comp.width, width[0], width[1], 0.55)
+    return comp
+
+
+def dapi_marker(components=None, amp=(1.4, 2.6), strength=(0.6, 1.6), name=DAPI_NAME):
+    comps = components if components is not None else [
+        ClusterNoise(w=.8, s=1.2, mu=-.55, width=.55, sharp=4., scale=.30, clust=1.2,
+                     fill=.45, soft=.30),
+        BlobNoise(w=.5, s=1.1, mu=-.60, width=.65, sharp=3., scale=.40),
+    ]
+    for c in comps:
+        make_nuclear(c)
+        c.s = narrow(c.s, strength[0], strength[1], float(np.clip(c.s.v, *strength)))
+    m = PanelMarker(name=name, fluorophore=DAPI_DYE, noise_components=comps,
+                    polarity=P(-2, 2, .1, 0.0, "polarity"))
+    m.amp = narrow(m.amp, amp[0], amp[1], float(np.clip(m.amp.v, *amp)))
+    return m
 
 
 class ParamHolder:
@@ -256,9 +293,6 @@ class SheetNoise(BaseNoise):
              * np.exp(-2 * np.pi ** 2 * ctx.px(self.length) ** 2 * ctx.fperp2))
         return np.exp(self.s.v * _filtered(ctx.noise, H))
 
-
-NOISE_KINDS = (BlobNoise, ClusterNoise, NetworkNoise, FibreNoise, SheetNoise)
-
 @dataclass
 class PanelMarker(ParamHolder):
     name: str = "Unnamed Marker"
@@ -285,6 +319,34 @@ class PanelMarker(ParamHolder):
 class MarkerPanel:
     """Every marker imaged in one experiment. Shared by all cell types in the image."""
     Markers: Dict[str, PanelMarker] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        # an empty panel is "not configured yet", not an error
+        if not self.Markers:
+            return                      
+        d = self.Markers.get(DAPI_NAME)
+        if d is None:
+            raise ValueError(
+                f"every panel needs a {DAPI_NAME!r} marker.\
+                    Build one with parameter.dapi_marker().")
+        if d.fluorophore != DAPI_DYE:
+            raise ValueError(f"{DAPI_NAME} must use the {DAPI_DYE!r} dye, got "
+                             f"{d.fluorophore!r}")
+        clash = [n for n, m in self.Markers.items()
+                 if n != DAPI_NAME and m.fluorophore == DAPI_DYE]
+        if clash:
+            raise ValueError(f"{DAPI_DYE!r} is reserved for {DAPI_NAME}; also used by {clash}")
+        bad = [c.scope for c in d.noise_components if c.mu.hi > NUCLEAR_TAU_MAX]
+        if bad:
+            raise ValueError(
+                f"{DAPI_NAME} must be nuclear: every component needs mu.hi <= "
+                f"{NUCLEAR_TAU_MAX} (tau is -1 at the nucleus centre, 0 at the envelope, "
+                f"+1 at the membrane). Offending components: {bad}. Use dapi_marker(), which "
+                f"narrows the bounds so no prior draw or fit can leave the nucleus.")
+    
+    @property
+    def dapi(self):
+        return self.Markers.get(DAPI_NAME)
 
     @property
     def names(self):
@@ -467,3 +529,6 @@ def get_all_parameters(obj, prefix=""):
                 params.update(get_all_parameters(attr, new_prefix))
                 
     return params
+
+
+NOISE_KINDS = (BlobNoise, ClusterNoise, NetworkNoise, FibreNoise, SheetNoise)
