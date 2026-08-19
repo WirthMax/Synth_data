@@ -430,10 +430,10 @@ def support_mask(w, XY_scale_vox=40.0, Z_scale_vox=40.0, cover=0.75):
     return z >= np.quantile(z, 1.0 - float(np.clip(cover, 0.0, 1.0)))
 
 
-def assign_types(info, tape, Profiles, fractions, rule=None):
+def assign_types(info, tape, CellTypes, fractions, rule=None):
     """Decide each cell's type
     """
-    type_names = list(Profiles)
+    type_names = list(CellTypes)
     cuts = np.cumsum(np.asarray(fractions, float) / np.sum(fractions))
     types = {}
     for n in info["labels_present"]:
@@ -449,8 +449,9 @@ class TapeDict(dict):
     """dict that also allows attribute access, so it works wherever a Tape does."""
     __getattr__ = dict.__getitem__
 
-def build_tissue(tape, TG, shape, base_geom, spacing, Profiles, Fractions, 
-                 um_per_vox, L = 4, l_min = 2, rule = None):
+def build_tissue(tape, TG, shape, base_geom, spacing, Panel, CellTypes, Fractions,
+                 um_per_vox, L=4, l_min=2, rule=None, pool_bank=None):
+    """Tissue in three phases: geometry, then type assignment, then appearance."""
     sup = support_mask(w = tape["support3"], XY_scale_vox = TG.SUPPORT_SCALE.v, 
                     Z_scale_vox = TG.SUPPORT_SCALE_Z.v,
                     cover = TG.COVER.v)
@@ -514,13 +515,13 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Profiles, Fractions,
         neighbours=neigh, support=sup, orphan_vox=orphan,
         packing=float((labels > 0).sum() / max(sup.sum(), 1)))
     
-    types = assign_types(info, tape, Profiles, Fractions, rule)
+    types = assign_types(info, tape, CellTypes, Fractions, rule=rule)
     
-    names = sorted({m for p in Profiles.values() for m in p.Markers})
+    names = list(Panel.Markers)
     out = {m: np.zeros(shape, np.float32) for m in names}
 
     for n in info["labels_present"]:
-        prof = Profiles[types[n]]
+        ctype = CellTypes[types[n]]
         g, sl = info["geoms"][n], info["slices"][n]
         win = labels[sl] == n
         if not win.any():
@@ -531,10 +532,16 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Profiles, Fractions,
         ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
                          gate_noise=tape["gate_noise"][(slice(None),) + sl])
         off = 0
-        for name, marker in prof.Markers.items():
-            img = render_marker(tape = ptape, marker = marker, cell = f, spacing = spacing, geom = g, um_per_vox=um_per_vox,
-                                edge_softness=0.0, pool_offset=off)
-            out[name][sl] = np.where(win, img, out[name][sl])
+        for name, marker in Panel.Markers.items():
+            lvl = ctype.level(name)
+            if lvl > 0.0:
+                img = render_marker(tape=ptape, marker=marker, cell=f, spacing=spacing, geom=g,
+                                    um_per_vox=um_per_vox, edge_softness=0.0, pool_offset=off,
+                                    pool_bank=pool_bank)
+                # the level multiplies the rendered volume, which is exactly scaling amp
+                if lvl != 1.0:
+                    img = img * np.float32(lvl)
+                out[name][sl] = np.where(win, img, out[name][sl])
             off += len(marker.noise_components)
     
     return out, labels, nuc_labels, tau_img, types, info

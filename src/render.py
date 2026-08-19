@@ -72,8 +72,23 @@ class NoiseCtx:
         return max(float(p.v) / float(self.um_per_vox), 1e-6)
 
 
+def _pool_field(bank_field, j, n_bank, shift_seed):
+    """Field for logical pool `j` from a bank of `n_bank` stored fields.
+    Keep a small bank and, when index j wraps, take the field ROLLED by a deterministic
+    per-j offset. 
+    """
+    f = bank_field[j % n_bank]
+    lap = j // n_bank
+    if lap == 0:
+        return f
+    rng = np.random.default_rng(shift_seed + 7919 * j)
+    sh = [int(rng.integers(0, s)) for s in f.shape]
+    return np.roll(f, sh, axis=tuple(range(f.ndim)))
+
+
 def render_marker(
-    tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0, pool_offset=0
+    tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0, pool_offset=0,
+    pool_bank=None, shift_seed=0
 ):
     """amp * normalise( sum_k w_k * normalise(loc_k x tex_k) x polarity x env(d) ).
 
@@ -84,13 +99,14 @@ def render_marker(
     mask, tau, phi, d = cell["cell"], cell["tau"], cell["phi"], cell["d"]
     comps = marker.noise_components
     n_pool = tape["texture_noise"].shape[0]
-    if pool_offset + len(comps) > n_pool:
+    n_bank = n_pool if not pool_bank else min(int(pool_bank), n_pool)
+    if not pool_bank and pool_offset + len(comps) > n_pool:
         raise ValueError(
             f"marker {marker.name!r} needs pools {pool_offset}..{pool_offset + len(comps) - 1} "
-            f"but the tape holds {n_pool}. The tape needs one pool per (marker, component) "
-            f"pair -- call tape.draw3d(..., Pool=PROFILE.n_pools())."
+            f"but the tape holds {n_pool}. Either draw the tape with "
+            f"Pool=panel.n_pools(), or pass pool_bank=<n> to reuse fields at a shift."
         )
-
+        
     f2, fpar2, fperp2 = _freq(mask.shape, spacing, geom.POLAR_DEG.v, geom.AZIM_DEG.v)
 
     out, wsum = np.zeros(mask.shape, float), 0.0
@@ -99,8 +115,8 @@ def render_marker(
             continue
         j = pool_offset + i
         ctx = NoiseCtx(
-            noise=tape["texture_noise"][j],
-            gate=tape["gate_noise"][j],
+            noise=_pool_field(tape["texture_noise"], j, n_bank, shift_seed),
+            gate=_pool_field(tape["gate_noise"], j, n_bank, shift_seed + 104729),
             f2=f2,
             fpar2=fpar2,
             fperp2=fperp2,
@@ -122,21 +138,22 @@ def render_marker(
     denom = out.sum() / max(int(mask.sum()), 1)
     return (marker.amp.v * out / (denom + 1e-12)).astype(np.float32)
 
-
-def render_image(tape, profile, cell, spacing, um_per_vox=1.0, edge_softness=0.0):
+def render_image(tape, panel, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0,
+                 expression=None, pool_offset=0, pool_bank=None, shift_seed=0):
     """Render every marker of a CellProfile on one cell. Returns {marker name: volume}."""
-    out, offset = {}, 0
-    for name, m in profile.Markers.items():
-        out[name] = render_marker(
-            tape,
-            m,
-            cell,
-            spacing,
-            profile.Geometry,
-            um_per_vox=um_per_vox,
-            edge_softness=edge_softness,
-            pool_offset=offset,
-        )
+    out, offset = {}, pool_offset
+    for name, m in panel.Markers.items():
+        lvl = 1.0 if expression is None else float(expression.get(name, 0.0))
+        # Only render markers that are expressed in the cell
+        if lvl > 0.0:
+            v = render_marker(
+                tape, m, cell, spacing, geom,
+                um_per_vox=um_per_vox, edge_softness=edge_softness,
+                pool_offset=offset, pool_bank=pool_bank, shift_seed=shift_seed,
+            )
+            out[name] = v if lvl == 1.0 else (v * np.float32(lvl)).astype(np.float32)
+        else:
+            out[name] = np.zeros(cell["cell"].shape, np.float32)
         offset += len(m.noise_components)
     return out
 

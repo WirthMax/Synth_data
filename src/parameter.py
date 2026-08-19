@@ -260,11 +260,12 @@ class SheetNoise(BaseNoise):
 NOISE_KINDS = (BlobNoise, ClusterNoise, NetworkNoise, FibreNoise, SheetNoise)
 
 @dataclass
-class CellMarker(ParamHolder):
+class PanelMarker(ParamHolder):
     name: str = "Unnamed Marker"
     fluorophore: str = "FITC"
     amp: P = P(.1, 3, .1, 2.0, "amp",
-               comment="mean intensity inside the cell. amp x E_PER_UNIT = photons per cell.")
+               comment="mean intensity inside a cell expressing this marker at level 1. "
+                       "amp x level x E_PER_UNIT = photons per cell.")
     polarity: P = P(-2, 2, .1, 0.0, "polarity",
                     comment="von Mises-Fisher lobe strength along pol_dir. 0 = isotropic.")
     pol_dir: Tuple[P, P, P] = (P(-np.pi, np.pi, .1, 0.0, "pol dir x"),
@@ -277,16 +278,18 @@ class CellMarker(ParamHolder):
     def __post_init__(self):
         super().__post_init__()
         for noise in self.noise_components:
-            assert type(noise) in NOISE_KINDS, f"This noise: {type(noise)} is not defined!"
+            assert isinstance(noise, BaseNoise), f"This noise: {type(noise)} is not defined!"
             
 
 @dataclass
-class CellProfile:
-    """Geometry plus every marker stained on this cell type."""
-    Color:str = "black"
-    Geometry: CellGeometry = field(default_factory=CellGeometry)
-    Markers: Dict[str, CellMarker] = field(default_factory=dict)
+class MarkerPanel:
+    """Every marker imaged in one experiment. Shared by all cell types in the image."""
+    Markers: Dict[str, PanelMarker] = field(default_factory=dict)
 
+    @property
+    def names(self):
+        return list(self.Markers)
+    
     @property
     def fluorophores(self):
         """marker name -> dye, the mapping the optics and the detector need."""
@@ -296,11 +299,30 @@ class CellProfile:
         """Pools the tape must hold: ONE PER (marker, component) pair, not per component.
 
         Each marker gets its own consecutive block, so two markers using the same noise kind
-        still draw independent frozen fields.
+        still draw independent frozen fields. 
         """
         return sum(len(m.noise_components) for m in self.Markers.values())
     
-    
+@dataclass
+class CellType(ParamHolder):
+    """A cell type is its shape plus HOW MUCH of each panel marker it expresses.
+
+    `Expression` maps a marker name to a level: 0 is negative, 1 is the panel's nominal
+    brightness, above 1 is bright. A level multiplies the rendered volume, which is exactly
+    equivalent to scaling `PanelMarker.amp` but cannot run out of `amp`'s declared bounds.
+    Markers missing from `Expression` are treated as not expressed.
+    """
+    name: str = "Unnamed"
+    Color: str = "black"
+    Geometry: CellGeometry = field(default_factory=CellGeometry)
+    Expression: Dict[str, P] = field(default_factory=dict)
+
+    def level(self, marker_name):
+        p = self.Expression.get(marker_name)
+        return 0.0 if p is None else float(p.v if hasattr(p, "v") else p)
+
+    def expressed(self, thresh=1e-3):
+        return [k for k in self.Expression if self.level(k) > thresh]
     
 @dataclass
 class Detector(ParamHolder):
@@ -361,9 +383,9 @@ class Optics:
         return float(np.tan(np.arcsin(np.clip(self.na / self.n_immersion, 0.0, 0.999))))
 
 @dataclass
-class Tissue:
-    # Dictionary to hold multiple cell types, keyed by cell name
-    CellTypes: Dict[str, CellProfile] = field(default_factory=dict)
+class Tissue:    
+    Panel: MarkerPanel = field(default_factory=MarkerPanel)
+    CellTypes: Dict[str, CellType] = field(default_factory=dict)
     # Tissue params...
     
 
@@ -418,7 +440,10 @@ class CellContext:
     
 def get_all_parameters(obj, prefix=""):
     """Recursively fetches all P instances from dataclasses, dicts, and lists."""
-    params = {}
+    params = {}    
+    
+    if isinstance(obj, P):
+        return {prefix: obj} if prefix else {}
     
     if isinstance(obj, dict):
         for key, value in obj.items():
