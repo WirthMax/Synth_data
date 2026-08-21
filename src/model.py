@@ -6,6 +6,8 @@ import torch.utils.data
 from torch import nn
 from torchinfo import summary
 
+import config as cfg
+
 ADU_MAX = cfg.ADU_MAX
 LOGVAR_MIN, LOGVAR_MAX = cfg.LOGVAR_MIN, cfg.LOGVAR_MAX
 
