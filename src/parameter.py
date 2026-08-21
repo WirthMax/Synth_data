@@ -1,3 +1,4 @@
+import re
 import dataclasses
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
@@ -6,11 +7,15 @@ import numpy as np
 import ipywidgets as W
 from scipy.special import ndtri 
 
-DYES = ("DAPI", "FITC", "PE", "APC")
-DAPI_NAME = "DAPI"
-DAPI_DYE = "DAPI"
-NUCLEAR_TAU_MAX = 0.0
+import config as cfg
 
+PIN_DEGENERATE = cfg.PIN_DEGENERATE
+PIN_GROUNDED = cfg.PIN_GROUNDED
+PIN = cfg.PIN
+KEEP = cfg.KEEP
+DAPI_NAME = cfg.DAPI_NAME
+DAPI_DYE = cfg.DAPI_DYE
+NUCLEAR_TAU_MAX = cfg.NUCLEAR_TAU_MAX
 
 @dataclass(frozen=True)
 class P:
@@ -43,7 +48,6 @@ def _as_p(default, value, where):
     """A bare number -> the declared `P` with only its value replaced.
 
     The RANGE belongs to the class and is a hard boundary, so anything outside it raises here
-    rather than quietly producing a nonsense texture several hundred lines later.
     """
     if isinstance(value, P):
         return value
@@ -53,10 +57,30 @@ def _as_p(default, value, where):
                          f"[{default.lo}, {default.hi}]  ({default.comment or default.name})")
     return dataclasses.replace(default, v=v)
 
+def _log_ok(p):
+    return p.tf == "log" and p.lo > 0 and p.hi > 0
 
+
+def to_u(p, v=None):
+    """value -> u in [0, 1]."""
+    v = p.v if v is None else v
+    if _log_ok(p):
+        lo, hi, v = np.log(p.lo), np.log(p.hi), np.log(max(float(v), 1e-300))
+    else:
+        lo, hi, v = p.lo, p.hi, float(v)
+    span = hi - lo
+    return 0.5 if abs(span) < 1e-300 else float((v - lo) / span)
+
+
+def from_u(p, u):
+    """u in [0, 1] -> value. Clipped, because ParamHolder treats the bounds as hard."""
+    u = float(np.clip(u, 0.0, 1.0))
+    if _log_ok(p):
+        return float(np.exp(np.log(p.lo) + u * (np.log(p.hi) - np.log(p.lo))))
+    return float(p.lo + u * (p.hi - p.lo))
 
 def narrow(p, lo, hi, v=None):
-    """A copy of `p` with tighter bounds, and its value pulled inside them.
+    """A copy of p with tighter bounds, and its value pulled inside them.
     """
     lo, hi = float(lo), float(hi)
     v = p.v if v is None else v
@@ -222,7 +246,7 @@ class BaseNoise(ParamHolder):
     scope: str = "base" # Will be overwritten by subclasses
     w: P = P(0, 1, .05, .50, "weight")
     s: P = P(0, 2, .05, 1.00, "strength")
-    mu: P = P(-1, 1.5, .05, -0.50, "mu")
+    mu: P = P(-1, 1, .05, -0.50, "mu")
     width: P = P(.05, 1.5, .05, .60, "width")
     sharp: P = P(.5, 10, .5, 4.0, "sharp")
     
@@ -531,4 +555,99 @@ def get_all_parameters(obj, prefix=""):
     return params
 
 
+DEFAULT_PIN = (r"noise_components\[0\]\.w$",) + (r"^DET\.",)
+_IDX = re.compile(r"^(.+?)\[(\d+)\]$")
+
+def _step(obj, name, idx):
+    obj = obj[name] if isinstance(obj, dict) else getattr(obj, name)
+    return obj if idx is None else obj[idx]
+
+
+def _split(part):
+    m = _IDX.match(part)
+    return (m.group(1), int(m.group(2))) if m else (part, None)
+
+
+def _resolve(root, path):
+    """Walk to the parent of `path` and return (parent, attr_name, index_or_None)."""
+    parts = path.split(".")
+    cur = root
+    for part in parts[:-1]:
+        name, idx = _split(part)
+        cur = _step(cur, name, idx)
+    name, idx = _split(parts[-1])
+    return cur, name, idx
+
+
+def get_p(root, path):
+    """The `P` object living at `path`."""
+    parent, name, idx = _resolve(root, path)
+    return _step(parent, name, idx)
+
+
+def set_p(root, path, newp):
+    """Replace the `P` at `path` in place. Handles tuple fields (pol_dir) by rebuilding them."""
+    parent, name, idx = _resolve(root, path)
+    if idx is None:
+        if isinstance(parent, dict):
+            parent[name] = newp
+        else:
+            setattr(parent, name, newp)
+        return
+    seq = parent[name] if isinstance(parent, dict) else getattr(parent, name)
+    if isinstance(seq, tuple):
+        lst = list(seq)
+        lst[idx] = newp
+        seq = tuple(lst)
+        if isinstance(parent, dict):
+            parent[name] = seq
+        else:
+            setattr(parent, name, seq)
+    else:
+        seq[idx] = newp
+
+
+def fitted_paths(root, pin=DEFAULT_PIN, keep=None):
+    """Sorted, deterministic list of the paths that go into theta.
+    """
+    paths = sorted(get_all_parameters(root))
+    if pin:
+        paths = [p for p in paths if not any(re.search(pat, p) for pat in pin)]
+    if keep:
+        paths = [p for p in paths if any(re.search(pat, p) for pat in keep)]
+    return paths
+
+
+def sample_prior(rng, paths):
+    """Uniform in NORMALISED space, i.e. uniform in value, or log-uniform where tf='log'."""
+    return rng.random(len(paths))
+
+def bounds(root, paths):
+    """(lo, hi) per path in raw units -- for reporting predictions in physical terms."""
+    ps = [get_p(root, p) for p in paths]
+    return (np.array([p.lo for p in ps], float), np.array([p.hi for p in ps], float))
+
+
+def set_vector(root, paths, u):
+    """Write u back into the tree, in place. Returns `root` for chaining."""
+    u = np.asarray(u, float).ravel()
+    if u.size != len(paths):
+        raise ValueError(f"theta has {u.size} entries but {len(paths)} paths were given")
+    for path, ui in zip(paths, u):
+        p = get_p(root, path)
+        set_p(root, path, dataclasses.replace(p, v=from_u(p, ui)))
+    return root
+
 NOISE_KINDS = (BlobNoise, ClusterNoise, NetworkNoise, FibreNoise, SheetNoise)
+
+DEVICE_DETECTOR = Detector(
+    E_PER_UNIT=120.0,
+    READ_E=2.5,
+    DARK_E=5.0,
+    ADU_PER_E=0.5,
+    OFFSET_ADU=100.0,
+    AF_SCALE_UM=25.0,
+    AF_CV=0.45,
+    ILLUM_CV=0.06,
+    VIGNETTE=0.18,
+)
