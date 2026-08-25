@@ -1,13 +1,12 @@
-import re
 import dataclasses
+import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
-from render import _filtered
-import numpy as np
-import ipywidgets as W
-from scipy.special import ndtri 
 
 import config as cfg
+import ipywidgets as W
+import numpy as np
+from render import _filtered
+from scipy.special import ndtri
 
 PIN_DEGENERATE = cfg.PIN_DEGENERATE
 PIN_GROUNDED = cfg.PIN_GROUNDED
@@ -17,33 +16,40 @@ DAPI_NAME = cfg.DAPI_NAME
 DAPI_DYE = cfg.DAPI_DYE
 NUCLEAR_TAU_MAX = cfg.NUCLEAR_TAU_MAX
 
+
 @dataclass(frozen=True)
 class P:
     """One scalar parameter plus the metadata that decides what may be done to it."""
+
     lo: float | None = None
     hi: float | None = None
     Step: float | None = None
     v: float | None = None
-    name: str = None          # Name of the variable
-    tf: str = "linear"          # "linear" or "log" interpolation inside [lo, hi]
+    name: str = None  # Name of the variable
+    tf: str = "linear"  # "linear" or "log" interpolation inside [lo, hi]
     note: str = ""
     comment: str = ""
-    
- 
+
     def __post_init__(self):
         if self.lo is None or self.hi is None:
             raise ValueError(f"a fitted parameter needs bounds: {self}")
         if self.tf == "log" and self.lo <= 0:
             raise ValueError(f"log transform needs lo > 0: {self}")
- 
+
     def return_Slider(self):
-        """Return a Floatslider that can be used to adjust this parameter 
+        """Return a Floatslider that can be used to adjust this parameter
         in an interactive plot"""
-    
-        return W.FloatSlider(min=self.lo, max=self.hi, step=self.Step, value=self.v,
-                                           description=self.note, continuous_update=False)
-        
-    
+
+        return W.FloatSlider(
+            min=self.lo,
+            max=self.hi,
+            step=self.Step,
+            value=self.v,
+            description=self.note,
+            continuous_update=False,
+        )
+
+
 def _as_p(default, value, where):
     """A bare number -> the declared `P` with only its value replaced.
 
@@ -53,9 +59,12 @@ def _as_p(default, value, where):
         return value
     v = float(value)
     if not (default.lo <= v <= default.hi):
-        raise ValueError(f"{where} = {v} is outside its declared range "
-                         f"[{default.lo}, {default.hi}]  ({default.comment or default.name})")
+        raise ValueError(
+            f"{where} = {v} is outside its declared range "
+            f"[{default.lo}, {default.hi}]  ({default.comment or default.name})"
+        )
     return dataclasses.replace(default, v=v)
+
 
 def _log_ok(p):
     return p.tf == "log" and p.lo > 0 and p.hi > 0
@@ -79,34 +88,51 @@ def from_u(p, u):
         return float(np.exp(np.log(p.lo) + u * (np.log(p.hi) - np.log(p.lo))))
     return float(p.lo + u * (p.hi - p.lo))
 
+
 def narrow(p, lo, hi, v=None):
-    """A copy of p with tighter bounds, and its value pulled inside them.
-    """
+    """A copy of p with tighter bounds, and its value pulled inside them."""
     lo, hi = float(lo), float(hi)
     v = p.v if v is None else v
     return dataclasses.replace(p, lo=lo, hi=hi, v=float(np.clip(v, lo, hi)))
 
 
 def make_nuclear(comp, mu=(-0.85, -0.15), width=(0.25, 0.85)):
-    """Force a noise component to live inside the nucleus, by bounds.
-    """
+    """Force a noise component to live inside the nucleus, by bounds."""
     comp.mu = narrow(comp.mu, mu[0], min(mu[1], NUCLEAR_TAU_MAX), -0.55)
     comp.width = narrow(comp.width, width[0], width[1], 0.55)
     return comp
 
 
 def dapi_marker(components=None, amp=(1.4, 2.6), strength=(0.6, 1.6), name=DAPI_NAME):
-    comps = components if components is not None else [
-        ClusterNoise(w=.8, s=1.2, mu=-.55, width=.55, sharp=4., scale=.30, clust=1.2,
-                     fill=.45, soft=.30),
-        BlobNoise(w=.5, s=1.1, mu=-.60, width=.65, sharp=3., scale=.40),
-    ]
+    comps = (
+        components
+        if components is not None
+        else [
+            ClusterNoise(
+                w=0.8,
+                s=1.2,
+                mu=-0.55,
+                width=0.55,
+                sharp=4.0,
+                scale=0.30,
+                clust=1.2,
+                fill=0.45,
+                soft=0.30,
+            ),
+            BlobNoise(w=0.5, s=1.1, mu=-0.60, width=0.65, sharp=3.0, scale=0.40),
+        ]
+    )
     for c in comps:
         make_nuclear(c)
         c.s = narrow(c.s, strength[0], strength[1], float(np.clip(c.s.v, *strength)))
-    m = PanelMarker(name=name, fluorophore=DAPI_DYE, noise_components=comps,
-                    polarity=P(-2, 2, .1, 0.0, "polarity"))
+    m = PanelMarker(
+        name=name,
+        fluorophore=DAPI_DYE,
+        noise_components=comps,
+        polarity=P(-2, 2, 0.1, 0.0, "polarity"),
+    )
     m.amp = narrow(m.amp, amp[0], amp[1], float(np.clip(m.amp.v, *amp)))
+    m.artifact_affinity = narrow(m.artifact_affinity, 0.0, 0.0, 0.0)
     return m
 
 
@@ -128,12 +154,21 @@ class ParamHolder:
             if isinstance(default, P):
                 if not isinstance(cur, P):
                     setattr(self, f.name, _as_p(default, cur, where))
-            elif (isinstance(default, tuple) and default
-                  and all(isinstance(x, P) for x in default)):
-                setattr(self, f.name, tuple(
-                    _as_p(d, c, f"{where}[{i}]")
-                    for i, (d, c) in enumerate(zip(default, cur))))
-        
+            elif (
+                isinstance(default, tuple)
+                and default
+                and all(isinstance(x, P) for x in default)
+            ):
+                setattr(
+                    self,
+                    f.name,
+                    tuple(
+                        _as_p(d, c, f"{where}[{i}]")
+                        for i, (d, c) in enumerate(zip(default, cur))
+                    ),
+                )
+
+
 # 2. Component Dataclasses
 @dataclass
 class CellGeometry(ParamHolder):
@@ -236,112 +271,142 @@ class CellGeometry(ParamHolder):
     POLAR_DEG: P = P(0.0, 180.0, 5.0, 65.0, "polar_deg", note="polar")
     AZIM_DEG: P = P(0.0, 360.0, 5.0, 25.0, "azim_deg", note="azim")
     ROLL_DEG: P = P(0.0, 360.0, 5.0, 0.0, "roll_deg", note="roll")
-    
-    
 
 
 @dataclass
 class BaseNoise(ParamHolder):
     """Base class containing the parameters shared by ALL noise types."""
-    scope: str = "base" # Will be overwritten by subclasses
-    w: P = P(0, 1, .05, .50, "weight")
-    s: P = P(0, 2, .05, 1.00, "strength")
-    mu: P = P(-1, 1, .05, -0.50, "mu")
-    width: P = P(.05, 1.5, .05, .60, "width")
-    sharp: P = P(.5, 10, .5, 4.0, "sharp")
-    
+
+    scope: str = "base"  # Will be overwritten by subclasses
+    w: P = P(0, 1, 0.05, 0.50, "weight")
+    s: P = P(0, 2, 0.05, 1.00, "strength")
+    mu: P = P(-1, 1, 0.05, -0.50, "mu")
+    width: P = P(0.05, 1.5, 0.05, 0.60, "width")
+    sharp: P = P(0.5, 10, 0.5, 4.0, "sharp")
+
     def field_fct(self, ctx):
         raise NotImplementedError(f"{type(self).__name__} defines no field_fct")
 
+
 @dataclass
 class FlatNoise(BaseNoise):
-    """No spatial texture at all, used for the fussel that binds uniformly
-    """
+    """No spatial texture at all, used for the fussel that binds uniformly"""
 
     scope: str = "flat"
 
     def field_fct(self, ctx):
         return np.ones(ctx.noise.shape, np.float32)
 
+
 @dataclass
 class BlobNoise(BaseNoise):
     scope: str = "blob"
-    scale: P = P(.1, 3, .05, 0.40, "grain um")
-    
+    scale: P = P(0.1, 3, 0.05, 0.40, "grain um")
+
     def field_fct(self, ctx):
-        H = np.exp(-2 * np.pi ** 2 * ctx.px(self.scale) ** 2 * ctx.f2)
+        H = np.exp(-2 * np.pi**2 * ctx.px(self.scale) ** 2 * ctx.f2)
         return np.exp(self.s.v * _filtered(ctx.noise, H))
+
 
 @dataclass
 class ClusterNoise(BaseNoise):
     scope: str = "cluster"
-    scale: P = P(.1, 1.5, .05, 0.30, "speckle um")
-    clust: P = P(.5, 8, .1, 1.40, "cluster um")
-    fill: P = P(.02, 1, .02, 0.35, "fill frac")
-    soft: P = P(.05, 1, .05, 0.30, "gate soft")    
-    
+    scale: P = P(0.1, 1.5, 0.05, 0.30, "speckle um")
+    clust: P = P(0.5, 8, 0.1, 1.40, "cluster um")
+    fill: P = P(0.02, 1, 0.02, 0.35, "fill frac")
+    soft: P = P(0.05, 1, 0.05, 0.30, "gate soft")
+
     def field_fct(self, ctx):
-        fine = _filtered(ctx.noise, np.exp(-2 * np.pi ** 2 * ctx.px(self.scale) ** 2 * ctx.f2))
-        coarse = _filtered(ctx.gate, np.exp(-2 * np.pi ** 2 * ctx.px(self.clust) ** 2 * ctx.f2))
+        fine = _filtered(
+            ctx.noise, np.exp(-2 * np.pi**2 * ctx.px(self.scale) ** 2 * ctx.f2)
+        )
+        coarse = _filtered(
+            ctx.gate, np.exp(-2 * np.pi**2 * ctx.px(self.clust) ** 2 * ctx.f2)
+        )
         fill = float(np.clip(self.fill.v, 1e-3, 1 - 1e-3))
         soft = max(float(self.soft.v), 1e-3)
         # ndtri(1-fill) is the exact Gaussian quantile, so `fill` IS the occupied fraction
         gate = 1.0 / (1.0 + np.exp(-(coarse - ndtri(1.0 - fill)) / soft))
         return (gate * np.exp(self.s.v * fine)).astype(np.float32)
-    
+
+
 @dataclass
 class NetworkNoise(BaseNoise):
     scope: str = "network"
-    scale: P = P(.2, 3, .05, 0.70, "mesh um")
-    coherence: P = P(.05, 1, .05, 0.30, "coherence")
+    scale: P = P(0.2, 3, 0.05, 0.70, "mesh um")
+    coherence: P = P(0.05, 1, 0.05, 0.30, "coherence")
 
     def field_fct(self, ctx):
         f0 = 1.0 / ctx.px(self.scale)
         sf = f0 / max(float(self.coherence.v), 1e-3)
-        H = np.exp(-(np.sqrt(ctx.f2) - f0) ** 2 / (2 * sf ** 2))
+        H = np.exp(-((np.sqrt(ctx.f2) - f0) ** 2) / (2 * sf**2))
         return np.exp(self.s.v * _filtered(ctx.noise, H))
+
 
 @dataclass
 class FibreNoise(BaseNoise):
     scope: str = "fibre"
-    sharp: P = P(.5, 10, .5, 4.0, "sharp")
-    lam: P = P(.1, 1.5, .05, 0.25, "thickness um")
-    length: P = P(1, 20, .5, 6.0, "length um")
+    sharp: P = P(0.5, 10, 0.5, 4.0, "sharp")
+    lam: P = P(0.1, 1.5, 0.05, 0.25, "thickness um")
+    length: P = P(1, 20, 0.5, 6.0, "length um")
 
     def field_fct(self, ctx):
-        H = np.exp(-2 * np.pi ** 2 * (ctx.px(self.lam) ** 2 * ctx.fperp2
-                                      + ctx.px(self.length) ** 2 * ctx.fpar2))
+        H = np.exp(
+            -2
+            * np.pi**2
+            * (
+                ctx.px(self.lam) ** 2 * ctx.fperp2
+                + ctx.px(self.length) ** 2 * ctx.fpar2
+            )
+        )
         return np.exp(self.s.v * _filtered(ctx.noise, H))
+
 
 @dataclass
 class SheetNoise(BaseNoise):
     scope: str = "sheet"
-    lam: P = P(.5, 5, .1, 1.90, "band period um")
-    coherence: P = P(.05, 1, .05, 0.35, "coherence")
-    length: P = P(1., 20., .5, 6.0, "across um")
-    
+    lam: P = P(0.5, 5, 0.1, 1.90, "band period um")
+    coherence: P = P(0.05, 1, 0.05, 0.35, "coherence")
+    length: P = P(1.0, 20.0, 0.5, 6.0, "across um")
+
     def field_fct(self, ctx):
         f0 = 1.0 / ctx.px(self.lam)
         sf = f0 / max(float(self.coherence.v), 1e-3)
-        H = (np.exp(-(np.sqrt(ctx.fpar2) - f0) ** 2 / (2 * sf ** 2))
-             * np.exp(-2 * np.pi ** 2 * ctx.px(self.length) ** 2 * ctx.fperp2))
+        H = np.exp(-((np.sqrt(ctx.fpar2) - f0) ** 2) / (2 * sf**2)) * np.exp(
+            -2 * np.pi**2 * ctx.px(self.length) ** 2 * ctx.fperp2
+        )
         return np.exp(self.s.v * _filtered(ctx.noise, H))
+
 
 @dataclass
 class PanelMarker(ParamHolder):
     name: str = "Unnamed Marker"
     fluorophore: str = "FITC"
-    amp: P = P(.1, 3, .1, 2.0, "amp",
-               comment="mean intensity inside a cell expressing this marker at level 1. "
-                       "amp x level x E_PER_UNIT = photons per cell.")
-    polarity: P = P(-2, 2, .1, 0.0, "polarity",
-                    comment="von Mises-Fisher lobe strength along pol_dir. 0 = isotropic.")
-    pol_dir: Tuple[P, P, P] = (P(-np.pi, np.pi, .1, 0.0, "pol dir x"),
-                               P(-np.pi, np.pi, .1, 1.0, "pol dir y"),
-                               P(-np.pi, np.pi, .1, 2.0, "pol dir z"))
+    amp: P = P(
+        0.1,
+        3,
+        0.1,
+        2.0,
+        "amp",
+        comment="mean intensity inside a cell expressing this marker at level 1. "
+        "amp x level x E_PER_UNIT = photons per cell.",
+    )
+    polarity: P = P(
+        -2,
+        2,
+        0.1,
+        0.0,
+        "polarity",
+        comment="von Mises-Fisher lobe strength along pol_dir. 0 = isotropic.",
+    )
+    pol_dir: tuple[P, P, P] = (
+        P(-np.pi, np.pi, 0.1, 0.0, "pol dir x"),
+        P(-np.pi, np.pi, 0.1, 1.0, "pol dir y"),
+        P(-np.pi, np.pi, 0.1, 2.0, "pol dir z"),
+    )
     # A list to hold any combination of noise components
-    noise_components: List[BaseNoise] = field(default_factory=list)
-    
+    noise_components: list[BaseNoise] = field(default_factory=list)
+
     artifact_affinity: P = P(
         0.0,
         2.0,
@@ -351,42 +416,53 @@ class PanelMarker(ParamHolder):
         note="art aff",
         comment="how strongly this marker's antibody binds artifacts",
     )
-     
+
     def __post_init__(self):
         super().__post_init__()
         for noise in self.noise_components:
-            assert isinstance(noise, BaseNoise), f"This noise: {type(noise)} is not defined!"
-            
+            assert isinstance(noise, BaseNoise), (
+                f"This noise: {type(noise)} is not defined!"
+            )
+
 
 @dataclass
 class MarkerPanel:
     """Every marker imaged in one experiment. Shared by all cell types in the image."""
-    Markers: Dict[str, PanelMarker] = field(default_factory=dict)
-    
+
+    Markers: dict[str, PanelMarker] = field(default_factory=dict)
+
     def __post_init__(self):
         # an empty panel is "not configured yet", not an error
         if not self.Markers:
-            return                      
+            return
         d = self.Markers.get(DAPI_NAME)
         if d is None:
             raise ValueError(
                 f"every panel needs a {DAPI_NAME!r} marker.\
-                    Build one with parameter.dapi_marker().")
+                    Build one with parameter.dapi_marker()."
+            )
         if d.fluorophore != DAPI_DYE:
-            raise ValueError(f"{DAPI_NAME} must use the {DAPI_DYE!r} dye, got "
-                             f"{d.fluorophore!r}")
-        clash = [n for n, m in self.Markers.items()
-                 if n != DAPI_NAME and m.fluorophore == DAPI_DYE]
+            raise ValueError(
+                f"{DAPI_NAME} must use the {DAPI_DYE!r} dye, got {d.fluorophore!r}"
+            )
+        clash = [
+            n
+            for n, m in self.Markers.items()
+            if n != DAPI_NAME and m.fluorophore == DAPI_DYE
+        ]
         if clash:
-            raise ValueError(f"{DAPI_DYE!r} is reserved for {DAPI_NAME}; also used by {clash}")
+            raise ValueError(
+                f"{DAPI_DYE!r} is reserved for {DAPI_NAME}; also used by {clash}"
+            )
         bad = [c.scope for c in d.noise_components if c.mu.hi > NUCLEAR_TAU_MAX]
         if bad:
             raise ValueError(
                 f"{DAPI_NAME} must be nuclear: every component needs mu.hi <= "
                 f"{NUCLEAR_TAU_MAX} (tau is -1 at the nucleus centre, 0 at the envelope, "
                 f"+1 at the membrane). Offending components: {bad}. Use dapi_marker(), which "
-                f"narrows the bounds so no prior draw or fit can leave the nucleus.")
-    
+                f"narrows the bounds so no prior draw or fit can leave the nucleus."
+            )
+
     @property
     def dapi(self):
         return self.Markers.get(DAPI_NAME)
@@ -394,7 +470,7 @@ class MarkerPanel:
     @property
     def names(self):
         return list(self.Markers)
-    
+
     @property
     def fluorophores(self):
         """marker name -> dye, the mapping the optics and the detector need."""
@@ -404,10 +480,11 @@ class MarkerPanel:
         """Pools the tape must hold: ONE PER (marker, component) pair, not per component.
 
         Each marker gets its own consecutive block, so two markers using the same noise kind
-        still draw independent frozen fields. 
+        still draw independent frozen fields.
         """
         return sum(len(m.noise_components) for m in self.Markers.values())
-    
+
+
 @dataclass
 class CellType(ParamHolder):
     """A cell type is its shape plus HOW MUCH of each panel marker it expresses.
@@ -417,10 +494,11 @@ class CellType(ParamHolder):
     equivalent to scaling `PanelMarker.amp` but cannot run out of `amp`'s declared bounds.
     Markers missing from `Expression` are treated as not expressed.
     """
+
     name: str = "Unnamed"
     Color: str = "black"
     Geometry: CellGeometry = field(default_factory=CellGeometry)
-    Expression: Dict[str, P] = field(default_factory=dict)
+    Expression: dict[str, P] = field(default_factory=dict)
 
     def level(self, marker_name):
         p = self.Expression.get(marker_name)
@@ -428,7 +506,7 @@ class CellType(ParamHolder):
 
     def expressed(self, thresh=1e-3):
         return [k for k in self.Expression if self.level(k) > thresh]
-    
+
 
 @dataclass
 class ArtifactMap(ParamHolder):
@@ -476,8 +554,7 @@ class ArtifactMap(ParamHolder):
 
 @dataclass
 class Fussel(ParamHolder):
-    """A lint fibre or eyelash lying on the plate, coated in non-specifically bound antibody.
-    """
+    """A lint fibre or eyelash lying on the plate, coated in non-specifically bound antibody."""
 
     N: P = P(
         0.0,
@@ -552,11 +629,11 @@ class Fussel(ParamHolder):
         0.0,
         1.0,
         0.05,
-        0.5,
+        0.15,
         "fussel z",
         note="z frac",
         comment="axial centre toward the coverslip, as a fraction of the half-section. "
-        "1.0 is the coverslip itself.",
+        "1.0 is the coverslip itself."
     )
     Z_WOBBLE_FRAC: P = P(
         0.0,
@@ -703,24 +780,6 @@ class Aggregate(ParamHolder):
         note="gain sd",
         comment="lognormal brightness spread.",
     )
-    Z_FRAC: P = P(
-        -1.0,
-        1.0,
-        0.05,
-        0.60,
-        "agg z",
-        note="z frac",
-        comment="signed band centre as a fraction of the half-section.",
-    )
-    Z_SIGMA_FRAC: P = P(
-        0.0,
-        1.0,
-        0.05,
-        0.40,
-        "agg z sd",
-        note="z sd",
-        comment="axial scatter between aggregates.",
-    )
     SPILL: P = P(
         0.0,
         0.3,
@@ -731,7 +790,8 @@ class Aggregate(ParamHolder):
         comment="fraction leaking into the OTHER antibody channels (bleed-through, or a "
         "clump carrying two conjugates).",
     )
-    
+
+
 @dataclass
 class ArtifactMask(ParamHolder):
     """How to build the 2D artifact mask from  the 3D labels."""
@@ -755,6 +815,7 @@ class ArtifactMask(ParamHolder):
         comment="grow the reported extent by this much.",
     )
 
+
 @dataclass
 class Artifacts(ParamHolder):
     """Everything about artifacts, hung off the world as `AR` so config.PIN's `^AR\\.` reaches
@@ -764,106 +825,225 @@ class Artifacts(ParamHolder):
     Fussel: Fussel = field(default_factory=Fussel)
     Aggregate: Aggregate = field(default_factory=Aggregate)
     Mask: ArtifactMask = field(default_factory=ArtifactMask)
-    
+
+
 @dataclass
 class Detector(ParamHolder):
     """Everything that happens AFTER the optics. Not a property of any cell."""
-    AF_SCALE_UM: P = P(1., 100., 1., 25.0, "af scale", note="af scale",
-                       comment="spatial scale of the autofluorescence field, in microns")
-    AF_CV: P = P(0., 1.5, .05, 0.45, "af cv", note="af cv",
-                 comment="relative SD of the autofluorescence field. 0 = perfectly flat")
-    ILLUM_CV: P = P(0., .5, .01, 0.06, "illum cv", note="illum cv",
-                    comment="random flat-field non-uniformity, as a fraction")
-    VIGNETTE: P = P(0., .6, .05, 0.18, "vignette", note="vignette",
-                    comment="radial illumination falloff at the frame corners, as a fraction")
-    E_PER_UNIT: P = P(1., 2000., 10., 120.0, "e per unit", note="e/unit",
-                      comment="photoelectrons per unit of marker amplitude. THIS sets the "
-                              "shot-noise level: doubling it halves the relative noise.")
-    READ_E: P = P(0., 50., .5, 2.5, "read noise", note="read e-",
-                  comment="camera read noise, electrons RMS. Dominates where the signal is dark.")
-    DARK_E: P = P(0., 200., 1., 5.0, "dark", note="dark e-",
-                  comment="dark current + stray light, in electrons")
-    ADU_PER_E: P = P(.05, 10., .05, 0.5, "adu per e", note="adu/e-",
-                     comment="digitiser conversion gain")
-    OFFSET_ADU: P = P(0., 2000., 10., 100.0, "offset", note="offset",
-                      comment="camera black level")
+
+    AF_SCALE_UM: P = P(
+        1.0,
+        100.0,
+        1.0,
+        25.0,
+        "af scale",
+        note="af scale",
+        comment="spatial scale of the autofluorescence field, in microns",
+    )
+    AF_CV: P = P(
+        0.0,
+        1.5,
+        0.05,
+        0.45,
+        "af cv",
+        note="af cv",
+        comment="relative SD of the autofluorescence field. 0 = perfectly flat",
+    )
+    ILLUM_CV: P = P(
+        0.0,
+        0.5,
+        0.01,
+        0.06,
+        "illum cv",
+        note="illum cv",
+        comment="random flat-field non-uniformity, as a fraction",
+    )
+    VIGNETTE: P = P(
+        0.0,
+        0.6,
+        0.05,
+        0.18,
+        "vignette",
+        note="vignette",
+        comment="radial illumination falloff at the frame corners, as a fraction",
+    )
+    E_PER_UNIT: P = P(
+        1.0,
+        2000.0,
+        10.0,
+        120.0,
+        "e per unit",
+        note="e/unit",
+        comment="photoelectrons per unit of marker amplitude. THIS sets the "
+        "shot-noise level: doubling it halves the relative noise.",
+    )
+    READ_E: P = P(
+        0.0,
+        50.0,
+        0.5,
+        2.5,
+        "read noise",
+        note="read e-",
+        comment="camera read noise, electrons RMS. Dominates where the signal is dark.",
+    )
+    DARK_E: P = P(
+        0.0,
+        200.0,
+        1.0,
+        5.0,
+        "dark",
+        note="dark e-",
+        comment="dark current + stray light, in electrons",
+    )
+    ADU_PER_E: P = P(
+        0.05,
+        10.0,
+        0.05,
+        0.5,
+        "adu per e",
+        note="adu/e-",
+        comment="digitiser conversion gain",
+    )
+    OFFSET_ADU: P = P(
+        0.0, 2000.0, 10.0, 100.0, "offset", note="offset", comment="camera black level"
+    )
     BIT_DEPTH: int = 16
 
 
-# Optics: 
+# Optics:
 @dataclass(frozen=True)
 class Optics:
     """Known Physical properties of the detector (Macsima) and the experiment."""
-    um_per_px: float = 0.325 
-    um_per_pz: float = 0.325 
-    
+
+    um_per_px: float = 0.325
+    um_per_pz: float = 0.325
+
     focal_um: float = 0.0
-    
+
     # VERIFY
     # Numerical Aperture (NA)
-    na: float = 0.45 #or 0.75
-     
-    wavelength_um: float = 0.530 # fallback
-    
+    na: float = 0.45  # or 0.75
+
+    wavelength_um: float = 0.530  # fallback
+
     # different refractive index of tissue and medium. VERIFY
     n_immersion: float = 1.0
     n_sample: float = 1.33
-    
+
     # Thickness of the section
-    section_um: float = 4.
+    section_um: float = 4.0
     # Depth of the section CENTRE below the coverslip
     depth_um: float = 2.0
-    
+
     @property
     def sample_depth_um(self):
         """Depth of the section centre below the coverslip."""
         return max(self.depth_um, self.section_um / 2)
-    
+
     @property
     def tan_theta(self):
         return float(np.tan(np.arcsin(np.clip(self.na / self.n_immersion, 0.0, 0.999))))
 
+
 @dataclass
-class Tissue:    
+class Tissue:
     Panel: MarkerPanel = field(default_factory=MarkerPanel)
-    CellTypes: Dict[str, CellType] = field(default_factory=dict)
+    CellTypes: dict[str, CellType] = field(default_factory=dict)
     # Tissue params...
-    
+
 
 @dataclass
 class TissueGeometry(ParamHolder):
     """How cells are laid out in the volume. Lengths in VOXELS, like CellGeometry."""
-    MIN_DIST: P = P(2., 60., .5, 11.0, "min dist", note="min dist",
-                    comment="hard-core spacing: no two centres closer than this. Roughly "
-                            "1.2-1.8 x radius; too large and few candidates survive.")
-    SUPPORT_SCALE: P = P(2., 200., 1., 40.0, "support scale", note="support",
-                    comment="correlation length of the tissue-support field. Keep >> cell size "
-                            "or the support boundary starts looking like a cell edge.")
-    SUPPORT_SCALE_Z: P = P(1., 200., 1., 25.0, "support scale z", note="support z",
-                    comment="AXIAL correlation length, separately.")
-    COVER: P = P(.05, 1., .05, .75, "cover", note="cover",
-                    comment="fraction of the volume that is tissue. Applied as a quantile of "
-                            "the support field, so it maps monotonically onto realised cover.")
-    GROW: P = P(1., 3., .05, 1.35, "grow", note="grow",
-                    comment="how far a cell may claim, in units of its own boundary. 1 = free "
-                            "shapes with gaps between them; ~2 = confluent.")
-    SIZE_SIGMA: P = P(0., .6, .01, .15, "size sigma", note="size sd",
-                    comment="lognormal spread of cell size: r = RADIUS * exp(sigma * z).")
-    NUC_FRAC_SIGMA: P = P(0., .6, .01, .15, "nuc frac sigma", note="nucfrac sd",
-                    comment="spread of the nucleus:cell ratio. Keep > 0, or nuclear size "
-                            "predicts cell size exactly and the segmentation is invertible.")
-    NEIGH_RADIUS: P = P(2., 100., 1., 24.0, "neigh radius", note="neigh r",
-                    comment="radius of the neighbour graph, voxels -- what 'nearby' means for "
-                            "neighbourhood-dependent marker expression.")
 
-    
+    MIN_DIST: P = P(
+        2.0,
+        60.0,
+        0.5,
+        11.0,
+        "min dist",
+        note="min dist",
+        comment="hard-core spacing: no two centres closer than this. Roughly "
+        "1.2-1.8 x radius; too large and few candidates survive.",
+    )
+    SUPPORT_SCALE: P = P(
+        2.0,
+        200.0,
+        1.0,
+        40.0,
+        "support scale",
+        note="support",
+        comment="correlation length of the tissue-support field. Keep >> cell size "
+        "or the support boundary starts looking like a cell edge.",
+    )
+    SUPPORT_SCALE_Z: P = P(
+        1.0,
+        200.0,
+        1.0,
+        25.0,
+        "support scale z",
+        note="support z",
+        comment="AXIAL correlation length, separately.",
+    )
+    COVER: P = P(
+        0.05,
+        1.0,
+        0.05,
+        0.75,
+        "cover",
+        note="cover",
+        comment="fraction of the volume that is tissue. Applied as a quantile of "
+        "the support field, so it maps monotonically onto realised cover.",
+    )
+    GROW: P = P(
+        1.0,
+        3.0,
+        0.05,
+        1.35,
+        "grow",
+        note="grow",
+        comment="how far a cell may claim, in units of its own boundary. 1 = free "
+        "shapes with gaps between them; ~2 = confluent.",
+    )
+    SIZE_SIGMA: P = P(
+        0.0,
+        0.6,
+        0.01,
+        0.15,
+        "size sigma",
+        note="size sd",
+        comment="lognormal spread of cell size: r = RADIUS * exp(sigma * z).",
+    )
+    NUC_FRAC_SIGMA: P = P(
+        0.0,
+        0.6,
+        0.01,
+        0.15,
+        "nuc frac sigma",
+        note="nucfrac sd",
+        comment="spread of the nucleus:cell ratio. Keep > 0, or nuclear size "
+        "predicts cell size exactly and the segmentation is invertible.",
+    )
+    NEIGH_RADIUS: P = P(
+        2.0,
+        100.0,
+        1.0,
+        24.0,
+        "neigh radius",
+        note="neigh r",
+        comment="radius of the neighbour graph, voxels -- what 'nearby' means for "
+        "neighbourhood-dependent marker expression.",
+    )
+
+
 @dataclass
 class CellContext:
     """What a rule may look at when deciding one cell's expression."""
+
     label: int
     # candidate index in the tape
     index: int
-    # voxel coords         
+    # voxel coords
     centre: np.ndarray
     geom: CellGeometry
     # labels within NEIGH_RADIUS
@@ -876,42 +1056,42 @@ class CellContext:
 
     def neighbour_types(self):
         return [self.types[j] for j in self.neigh_labels if j in self.types]
-    
-    
-    
+
+
 def get_all_parameters(obj, prefix=""):
     """Recursively fetches all P instances from dataclasses, dicts, and lists."""
-    params = {}    
-    
+    params = {}
+
     if isinstance(obj, P):
         return {prefix: obj} if prefix else {}
-    
+
     if isinstance(obj, dict):
         for key, value in obj.items():
             new_prefix = f"{prefix}.{key}" if prefix else key
             params.update(get_all_parameters(value, new_prefix))
-            
+
     elif isinstance(obj, (list, tuple)):
         # Handle lists by appending the index to the prefix (e.g., noise_components[0])
         for i, item in enumerate(obj):
             new_prefix = f"{prefix}[{i}]"
             params.update(get_all_parameters(item, new_prefix))
-            
+
     elif dataclasses.is_dataclass(obj):
         for f in dataclasses.fields(obj):
             attr = getattr(obj, f.name)
             new_prefix = f"{prefix}.{f.name}" if prefix else f.name
-            
+
             if isinstance(attr, P):
                 params[new_prefix] = attr
             else:
                 params.update(get_all_parameters(attr, new_prefix))
-                
+
     return params
 
 
 DEFAULT_PIN = (r"noise_components\[0\]\.w$",) + (r"^DET\.",)
 _IDX = re.compile(r"^(.+?)\[(\d+)\]$")
+
 
 def _step(obj, name, idx):
     obj = obj[name] if isinstance(obj, dict) else getattr(obj, name)
@@ -963,8 +1143,7 @@ def set_p(root, path, newp):
 
 
 def fitted_paths(root, pin=DEFAULT_PIN, keep=None):
-    """Sorted, deterministic list of the paths that go into theta.
-    """
+    """Sorted, deterministic list of the paths that go into theta."""
     paths = sorted(get_all_parameters(root))
     if pin:
         paths = [p for p in paths if not any(re.search(pat, p) for pat in pin)]
@@ -977,6 +1156,7 @@ def sample_prior(rng, paths):
     """Uniform in NORMALISED space, i.e. uniform in value, or log-uniform where tf='log'."""
     return rng.random(len(paths))
 
+
 def bounds(root, paths):
     """(lo, hi) per path in raw units -- for reporting predictions in physical terms."""
     ps = [get_p(root, p) for p in paths]
@@ -987,11 +1167,14 @@ def set_vector(root, paths, u):
     """Write u back into the tree, in place. Returns `root` for chaining."""
     u = np.asarray(u, float).ravel()
     if u.size != len(paths):
-        raise ValueError(f"theta has {u.size} entries but {len(paths)} paths were given")
+        raise ValueError(
+            f"theta has {u.size} entries but {len(paths)} paths were given"
+        )
     for path, ui in zip(paths, u):
         p = get_p(root, path)
         set_p(root, path, dataclasses.replace(p, v=from_u(p, ui)))
     return root
+
 
 NOISE_KINDS = (BlobNoise, ClusterNoise, NetworkNoise, FibreNoise, SheetNoise)
 

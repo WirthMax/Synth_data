@@ -1,7 +1,10 @@
 # grid and physical scale
-UM_PER_VOX = 0.325          # microns per LATERAL voxel -- the conversion, not a resolution knob
-Z_RATIO = 1.0               # axial voxel this many times COARSER than lateral
-SPACING = (Z_RATIO, 1.0, 1.0)   # (sz, sy, sx) voxel size per axis, in lateral units
+# microns per LATERAL voxel -- the conversion, not a resolution knob
+UM_PER_VOX = 0.325
+# axial voxel this many times COARSER than lateral
+Z_RATIO = 1.0
+# (sz, sy, sx) voxel size per axis, in lateral units
+SPACING = (Z_RATIO, 1.0, 1.0)
 
 CELL_VOL = (128, 128, 128)  # single-cell sandbox
 TISSUE_VOL = (40, 160, 160)  # tissue block: 13 x 52 x 52 um at 0.325 um/vox
@@ -85,11 +88,12 @@ DETECTOR = dict(
     VIGNETTE=0.18,
 )
 BIT_DEPTH = 16
-ADU_MAX = 2 ** BIT_DEPTH - 1
+ADU_MAX = 2**BIT_DEPTH - 1
 
 PIN_DEGENERATE = (r"noise_components\[0\]\.w$",)
 PIN_GROUNDED = (r"^DET\.",)
-PIN = PIN_DEGENERATE + PIN_GROUNDED
+PIN_ARTIFACT = (r"^AR\.",)
+PIN = PIN_DEGENERATE + PIN_GROUNDED + PIN_ARTIFACT
 KEEP = [r"\.scale$", r"\.clust$", r"\.fill$", r"\.s$", r"\.amp$"]
 
 
@@ -97,4 +101,5 @@ ARTIFACTS = dict(n_cand=256, n_mode=16)
 # This should be larger than the possible amount of cells that can be generated
 ARTIFACT_ID0 = 100000
 # ============================================================ amortized inversion
-LOGVAR_MIN, LOGVAR_MAX = -12.0, 4.0     # sigma in [2.5e-3, 7.4]; theta lives in [0, 1]
+# sigma in [2.5e-3, 7.4]; theta lives in [0, 1]
+LOGVAR_MIN, LOGVAR_MAX = -12.0, 4.0
