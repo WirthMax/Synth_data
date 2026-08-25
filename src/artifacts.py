@@ -254,7 +254,7 @@ def build_artifacts(vols, tape, cfg, AR, opt, shape, panel, um_per_vox, spacing,
     # FUSSEL generation
     for j in fib_rows:
         fb = make_fussel(tape=tape, F=F, j=int(j), shape = shape, opt = opt, cfg = cfg, um_per_vox=um_per_vox, n_t = n_t, spacing = spacing)
-        if not fb["geom"]["cell"].any():
+        if fb is None or not fb["geom"]["cell"].any(): 
             continue
         
         # Marker expression
@@ -293,8 +293,7 @@ def build_artifacts(vols, tape, cfg, AR, opt, shape, panel, um_per_vox, spacing,
         xyz = np.array([agg_xy[k][0], agg_xy[k][1], tape["u_art_z"][int(j)] * (shape[0] - 1)])
         ag = make_aggregates(tape, int(j), G, xyz, shape, spacing, um_per_vox, grid,
                             L=L, l_min=l_min)
-        
-        if not ag["geom"]["cell"].any(): 
+        if ag is None or not ag["geom"]["cell"].any(): 
             continue
         
         # Marker expression
