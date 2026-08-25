@@ -174,7 +174,7 @@ def patch_grid(centre_xyz, reach, shape):
             slice(max(0, int(cx) - reach), min(nx, int(cx) + reach + 1)))
 
 
-def reach_px(R, elong, rough, grow=1.0, pad=2):
+def reach_px(R, rough, elong = 1.0, grow=1.0, pad=2):
     """Furthest pixel this cell can claim, in image vox"""
     return int(np.ceil(R * grow * max(elong, 1.0 / elong) * np.exp(3.0 * rough))) + pad
 
@@ -472,7 +472,7 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Panel, CellTypes, Fraction
     for n, i in enumerate(keep, start=1):
         g = cell_geometry(base_geom, tape, i, TG)
         sl = patch_grid(tape["xyz"][i],
-                         reach_px(R=g.RADIUS.v, elong=g.ELONG.v, rough=g.ROUGH.v, grow=TG.GROW.v), 
+                         reach_px(R=g.RADIUS.v, rough=g.ROUGH.v, elong=g.ELONG.v, grow=TG.GROW.v), 
                          shape)
         if any(s.stop - s.start <= 0 for s in sl):
             continue

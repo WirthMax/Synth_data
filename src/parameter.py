@@ -332,6 +332,15 @@ class PanelMarker(ParamHolder):
     # A list to hold any combination of noise components
     noise_components: List[BaseNoise] = field(default_factory=list)
     
+    artifact_affinity: P = P(
+        0.0,
+        2.0,
+        0.05,
+        0.6,
+        "artifact affinity",
+        note="art aff",
+        comment="how strongly this marker's antibody binds artifacts",
+    )
      
     def __post_init__(self):
         super().__post_init__()
@@ -409,6 +418,342 @@ class CellType(ParamHolder):
 
     def expressed(self, thresh=1e-3):
         return [k for k in self.Expression if self.level(k) > thresh]
+    
+
+@dataclass
+class ArtifactMap(ParamHolder):
+    """Artifact map. Artifacts only appear where there is tissue for them to stick to."""
+
+    MIN_DIST: P = P(
+        2.0,
+        200.0,
+        1.0,
+        12.0,
+        "art min dist",
+        note="min dist",
+        comment="hard-core spacing between artifacts, voxels. Sets a ceiling on how "
+        "many can be placed.",
+    )
+    SUPPORT_SCALE: P = P(
+        2.0,
+        200.0,
+        1.0,
+        30.0,
+        "art support scale",
+        note="support",
+        comment="correlation length of the artifact-support field.",
+    )
+    SUPPORT_SCALE_Z: P = P(
+        1.0,
+        200.0,
+        1.0,
+        25.0,
+        "art support scale z",
+        note="support z",
+        comment="axial correlation length (Barely relevant).",
+    )
+    COVER: P = P(
+        0.05,
+        1.0,
+        0.05,
+        0.60,
+        "art cover",
+        note="cover",
+        comment="fraction of the field where artifacts are allowed, as a quantile. "
+        "1.0 = anywhere there is tissue.",
+    )
+
+
+@dataclass
+class Fussel(ParamHolder):
+    """A lint fibre or eyelash lying on the plate, coated in non-specifically bound antibody.
+    """
+
+    N: P = P(
+        0.0,
+        4.0,
+        1.0,
+        1.0,
+        "n fussel",
+        note="n fibres",
+        comment="how many fibres to place.",
+    )
+    WIDTH_UM: P = P(
+        0.4,
+        12.0,
+        0.1,
+        2.0,
+        "fussel width",
+        tf="log",
+        note="width um",
+        comment="fibre diameter.",
+    )
+    WIDTH_SIGMA: P = P(
+        0.0,
+        0.6,
+        0.05,
+        0.25,
+        "fussel width sd",
+        note="width sd",
+        comment="lognormal spread of width between fibres:",
+    )
+    P_END_INSIDE: P = P(
+        0.0,
+        1.0,
+        0.05,
+        0.95,
+        "fussel end inside",
+        note="end inside",
+        comment="Per end probability, that the fibre terminates inside the frame instead "
+        "of running off the edge.",
+    )
+    END_TRIM: P = P(
+        0.05,
+        0.45,
+        0.05,
+        0.30,
+        "fussel end trim",
+        note="end trim",
+        comment="how far in an inside-terminating end may sit, as a fraction of the "
+        "chord. Capped below 0.5 so the two ends can never cross and leave "
+        "nothing to draw.",
+    )
+    WOBBLE_UM: P = P(
+        0.0,
+        20.0,
+        0.5,
+        6.0,
+        "fussel wobble",
+        note="wobble um",
+        comment="RMS lateral deviation from the straight entry-to-exit chord. 6 um on a "
+        "52 um frame is a clear worm; 0 is a straight.",
+    )
+    BETA: P = P(
+        0.5,
+        4.0,
+        0.1,
+        2.0,
+        "fussel beta",
+        note="beta",
+        comment="spectral tilt of the wobble at FIXED RMS -- high = one long smooth bend, "
+        "low = kinked.",
+    )
+    Z_FRAC: P = P(
+        0.0,
+        1.0,
+        0.05,
+        0.5,
+        "fussel z",
+        note="z frac",
+        comment="axial centre toward the coverslip, as a fraction of the half-section. "
+        "1.0 is the coverslip itself.",
+    )
+    Z_WOBBLE_FRAC: P = P(
+        0.0,
+        1.0,
+        0.05,
+        0.90,
+        "fussel z wobble",
+        note="z wobble",
+        comment="axial meander along the fibre, as a fraction of the room below it.",
+    )
+    MU: P = P(
+        0.0,
+        0.3,
+        0.05,
+        0.0,
+        "fussel mu",
+        note="mu",
+        comment="Centre of the expression band in the blob's tau",
+    )
+    WIDTH: P = P(
+        1.25,
+        1.5,
+        0.05,
+        1.40,
+        "fussel band",
+        note="band",
+        comment="width.",
+    )
+    SHARP: P = P(
+        0.5,
+        10.0,
+        0.5,
+        8.0,
+        "fussel band sharp",
+        note="band sharp",
+        comment="Sharpness of the cutoff.",
+    )
+    GAIN: P = P(
+        0.5,
+        500.0,
+        0.5,
+        60.0,
+        "fussel gain",
+        tf="log",
+        note="gain",
+        comment="brightness as a multiple of the contaminated marker's own amp.",
+    )
+    GAIN_SIGMA: P = P(
+        0.0,
+        1.0,
+        0.05,
+        0.30,
+        "fussel gain sd",
+        note="gain sd",
+        comment="lognormal brightness spread between fibres.",
+    )
+
+
+@dataclass
+class Aggregate(ParamHolder):
+    """Precipitated conjugated antibody: a small, bright, roughly circular blob.
+    """
+
+    N: P = P(
+        0.0,
+        32.0,
+        1.0,
+        6.0,
+        "n aggregates",
+        note="n aggs",
+        comment="how many to place in the frame.",
+    )
+    DIAM_UM: P = P(
+        0.3,
+        4.0,
+        0.1,
+        1.0,
+        "agg diameter",
+        tf="log",
+        note="diam um",
+        comment="median Aggregate diameter.",
+    )
+    DIAM_SIGMA: P = P(
+        0.0,
+        1.0,
+        0.05,
+        0.45,
+        "agg diameter sd",
+        note="diam sd",
+        comment="lognormal size spread.",
+    )
+    ROUGH: P = P(
+        0.0,
+        0.30,
+        0.01,
+        0.12,
+        "agg rough",
+        note="rough",
+        comment="SD of log-radius: 0.25 ~ +-25% radial wobble. Orthogonal to radius and beta.",
+    )
+    MU: P = P(
+        -1.0,
+        1.0,
+        0.05,
+        0.0,
+        "agg mu",
+        note="mu",
+        comment="centre of the expression band in the blob's tau.",
+    )
+    WIDTH: P = P(
+        0.05,
+        1.5,
+        0.05,
+        1.20,
+        "agg band",
+        note="band",
+        comment="width of that band. Wide, so the blob is solid rather than a shell.",
+    )
+    SHARP: P = P(
+        0.5,
+        10.0,
+        0.5,
+        6.0,
+        "agg band sharp",
+        note="band sharp",
+        comment="Sharpness of the cutoff.",
+    )
+    GAIN: P = P(
+        1.0,
+        5000.0,
+        1.0,
+        150.0,
+        "agg gain",
+        tf="log",
+        note="gain",
+        comment="Brightness as a multiple of the marker's amp.",
+    )
+    GAIN_SIGMA: P = P(
+        0.0,
+        1.5,
+        0.05,
+        0.70,
+        "agg gain sd",
+        note="gain sd",
+        comment="lognormal brightness spread.",
+    )
+    Z_FRAC: P = P(
+        -1.0,
+        1.0,
+        0.05,
+        0.60,
+        "agg z",
+        note="z frac",
+        comment="signed band centre as a fraction of the half-section.",
+    )
+    Z_SIGMA_FRAC: P = P(
+        0.0,
+        1.0,
+        0.05,
+        0.40,
+        "agg z sd",
+        note="z sd",
+        comment="axial scatter between aggregates.",
+    )
+    SPILL: P = P(
+        0.0,
+        0.3,
+        0.01,
+        0.0,
+        "agg spill",
+        note="spill",
+        comment="fraction leaking into the OTHER antibody channels (bleed-through, or a "
+        "clump carrying two conjugates).",
+    )
+    
+@dataclass
+class ArtifactMask(ParamHolder):
+    """How to build the 2D artifact mask from  the 3D labels."""
+
+    MASK_PCT: P = P(
+        0.50,
+        0.999,
+        0.005,
+        0.95,
+        "art mask pct",
+        note="mask pct",
+        comment="coverage quantile for the artifact's own 2D footprint.",
+    )
+    DILATE_PX: P = P(
+        0.0,
+        10.0,
+        1.0,
+        2.0,
+        "art dilate",
+        note="dilate px",
+        comment="grow the reported extent by this much.",
+    )
+
+@dataclass
+class Artifacts(ParamHolder):
+    """Everything about artifacts, hung off the world as `AR` so config.PIN's `^AR\\.` reaches
+    all of it."""
+
+    Map: ArtifactMap = field(default_factory=ArtifactMap)
+    Fussel: Fussel = field(default_factory=Fussel)
+    Aggregate: Aggregate = field(default_factory=Aggregate)
+    Mask: ArtifactMask = field(default_factory=ArtifactMask)
     
 @dataclass
 class Detector(ParamHolder):

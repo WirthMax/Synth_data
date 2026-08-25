@@ -73,6 +73,33 @@ class Tape(object):
         # flat field texture
         self.w_ill  = self.rng.standard_normal((ny, nx), dtype=np.float32)
         
+    def drawArtifacts(self, shape=(40, 160, 160), n_cand=256, n_mark=64, n_mode=16,
+                      n_t=512, n_lm=21):
+        """RNG for Fussel and Aggregate"""
+        nz, ny, nx = shape
+        # Aggregate map: its own support field, later multiplied by the tissue's
+        self.art_support3 = self.rng.standard_normal(shape, dtype=np.float32)
+        self.art_xy = self.rng.random((n_cand, 2)) * np.array([nx, ny])
+        self.art_order = self.rng.random(n_cand)
+
+        # fussel: the centreline. Endpoints live on the frame perimeter, the wobble modes bend
+        # the chord between them, and the along-length noise makes the staining patchy.
+        self.u_fib_end = self.rng.random((n_cand, 2))
+        self.z_fib_lat = self.rng.standard_normal((n_cand, n_mode))
+        self.z_fib_ax = self.rng.standard_normal((n_cand, n_mode))
+
+        # shared jitter: width / diameter, brightness, axial position
+        self.z_art_size = self.rng.standard_normal(n_cand)
+        self.z_art_gain = self.rng.standard_normal(n_cand)
+        self.u_art_z = self.rng.random(n_cand)
+
+        # aggregate: SH deformation (a precipitate is lumpy, not spherical) and its channel
+        self.art_sh = self.rng.standard_normal((n_cand, n_lm))
+        self.u_art_ch = self.rng.random(n_cand)
+
+        # where the fibre STOPS.
+        self.u_fib_span = self.rng.random((n_cand, 4))
+        
     def drawTissue(self, shape=(128, 128, 3), n_cand=1500, n_lm = 21, Pool = 3):
         nz, ny, nx = shape
         v = self.rng.standard_normal((n_cand, 3))

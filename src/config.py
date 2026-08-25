@@ -60,9 +60,10 @@ DAPI_NAME = "DAPI"
 DAPI_DYE = "DAPI"
 NUCLEAR_TAU_MAX = 0.0
 
+# Normalised distance is clipped to this OUTSIDE the object.
+_TAU_CLIP = 4.0
 
 # Camera
-
 DETECTOR = dict(
     # photoelectrons per unit of marker amplitude
     E_PER_UNIT=120.0,
@@ -91,5 +92,9 @@ PIN_GROUNDED = (r"^DET\.",)
 PIN = PIN_DEGENERATE + PIN_GROUNDED
 KEEP = [r"\.scale$", r"\.clust$", r"\.fill$", r"\.s$", r"\.amp$"]
 
+
+ARTIFACTS = dict(n_cand=256, n_mode=16)
+# This should be larger than the possible amount of cells that can be generated
+ARTIFACT_ID0 = 100000
 # ============================================================ amortized inversion
 LOGVAR_MIN, LOGVAR_MAX = -12.0, 4.0     # sigma in [2.5e-3, 7.4]; theta lives in [0, 1]
