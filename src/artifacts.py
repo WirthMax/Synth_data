@@ -127,7 +127,7 @@ def fibre_centreline(tape, j, F, shape, opt, um_per_vox, n_t=512, pad=None, widt
     zz = z0 + float(F.Z_WOBBLE_FRAC.v) * np.tanh(ax_raw) * room
     return np.stack([zz, yy, xx], -1)
 
-def make_fussel(tape, F, j, shape, opt, cfg, um_per_vox, n_t, spacing):
+def make_fussel(tape, F, j, shape, opt, um_per_vox, n_t, spacing):
     nz, ny, nx = shape
     # get radius of fussel
     r_um = 0.5 * float(F.WIDTH_UM.v) * np.exp(float(F.WIDTH_SIGMA.v) * tape["z_art_size"][j])
@@ -224,7 +224,7 @@ def to_flat_artifact_marker(marker, mu, width, sharp):
     return dataclasses.replace(marker, noise_components=[comp])
 
 
-def build_artifacts(vols, tape, cfg, AR, opt, shape, panel, um_per_vox, spacing, geom = None, tissue_support= None, 
+def build_artifacts(vols, tape, AR, opt, shape, panel, um_per_vox, spacing, geom = None, tissue_support= None,
                     pool_bank=None ,L=4, l_min=2, n_t=512
                 #     , TG, shape, base_geom, spacing, Panel, CellTypes, Fractions,
                 #  um_per_vox, L=4, l_min=2, rule=None, pool_bank=None
@@ -253,7 +253,7 @@ def build_artifacts(vols, tape, cfg, AR, opt, shape, panel, um_per_vox, spacing,
     
     # FUSSEL generation
     for j in fib_rows:
-        fb = make_fussel(tape=tape, F=F, j=int(j), shape = shape, opt = opt, cfg = cfg, um_per_vox=um_per_vox, n_t = n_t, spacing = spacing)
+        fb = make_fussel(tape=tape, F=F, j=int(j), shape = shape, opt = opt, um_per_vox=um_per_vox, n_t = n_t, spacing = spacing)
         if not fb["geom"]["cell"].any():
             continue
         
