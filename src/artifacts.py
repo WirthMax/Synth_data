@@ -5,7 +5,7 @@ from scipy import ndimage as ndi
 from scene import support_mask, thin, vox_to_world, body_frame, make_boundary, patch_grid, centred_grid_3d, TapeDict
 from render import render_marker
 import config as cfg
-from parameter import CellGeometry
+from parameter import CellGeometry, FlatNoise
 
 def artifact_sites(tape, AR, shape, n, tissue_support, skip = 0):
     nz, ny, nx = shape
@@ -214,10 +214,15 @@ def make_aggregates(tape, j, G, xyz, shape, spacing, um_per_vox, grid, L=4, l_mi
 
 def to_artifact_marker(marker, mu, width, sharp):
     """The panel marker's TEXTURE, relocalised onto the artifact's own tau."""
-    # comps = [dataclasses.replace(c, mu=mu, width=width, sharp=sharp)
-    #          for c in marker.noise_components]
-    comps = []
+    comps = [dataclasses.replace(c, mu=mu, width=width, sharp=sharp)
+             for c in marker.noise_components]
     return dataclasses.replace(marker, noise_components=comps)
+
+def to_flat_artifact_marker(marker, mu, width, sharp):
+    """Flat marker channel for the Fussel."""
+    comp = FlatNoise(w=1.0, mu=mu, width=width, sharp=sharp)
+    return dataclasses.replace(marker, noise_components=[comp])
+
 
 def build_artifacts(vols, tape, cfg, AR, opt, shape, panel, um_per_vox, spacing, geom = None, tissue_support= None, 
                     pool_bank=None ,L=4, l_min=2, n_t=512
@@ -266,7 +271,7 @@ def build_artifacts(vols, tape, cfg, AR, opt, shape, panel, um_per_vox, spacing,
             # Compute expression based on affinity
             lvl = aff[name] * gain
             if lvl > 1e-3:
-                img = render_marker(tape=ptape, marker=to_artifact_marker(m, F.MU, F.WIDTH,
+                img = render_marker(tape=ptape, marker=to_flat_artifact_marker(m, F.MU, F.WIDTH,
                                                                         F.SHARP),
                                     cell=gm, spacing=spacing, geom=base_geom,
                                     um_per_vox=um_per_vox, edge_softness=0.0,

@@ -254,6 +254,16 @@ class BaseNoise(ParamHolder):
         raise NotImplementedError(f"{type(self).__name__} defines no field_fct")
 
 @dataclass
+class FlatNoise(BaseNoise):
+    """No spatial texture at all, used for the fussel that binds uniformly
+    """
+
+    scope: str = "flat"
+
+    def field_fct(self, ctx):
+        return np.ones(ctx.noise.shape, np.float32)
+
+@dataclass
 class BlobNoise(BaseNoise):
     scope: str = "blob"
     scale: P = P(.1, 3, .05, 0.40, "grain um")
