@@ -1,7 +1,6 @@
 import numpy as np
 import dataclasses
 from scipy import ndimage as ndi
-from scipy.special import ndtri
 
 from scene import support_mask, thin, vox_to_world, body_frame, make_boundary, patch_grid, centred_grid_3d, TapeDict
 from render import render_marker
@@ -256,7 +255,7 @@ def build_artifacts(vols, tape, AR, opt, shape, panel, um_per_vox, spacing, geom
     # FUSSEL generation
     for j in fib_rows:
         fb = make_fussel(tape=tape, F=F, j=int(j), shape = shape, opt = opt, um_per_vox=um_per_vox, n_t = n_t, spacing = spacing)
-        if not fb["geom"]["cell"].any():
+        if fb is None or not fb["geom"]["cell"].any():
             continue
         
         # Marker expression
@@ -354,12 +353,14 @@ def detachment_map(tape, DET, tissue_support, spacing, um_per_vox, um_per_pz):
         soft = max(float(DET.SOFT.v), 1e-3)
         gate = 1.0 / (1.0 + np.exp(-(coarse - thr) / soft))
     
-    elevation_um = (float(DET.ELEVATION_UM.v) * gate).astype(np.float32)
+    elevation_um = (float(DET.ELEVATION_UM.v) * gate * col).astype(np.float32)
+    shift = np.rint(elevation_um / float(um_per_pz)).astype(int)
     return {"elevation_um": elevation_um,
             "gate": gate.astype(np.float32),
             "lifted": (gate >= 0.5) & col,
+            "moved": shift >= 1,
             "tissue_col": col,
-            "shift": np.rint(np.asarray(elevation_um) / float(um_per_pz)).astype(int),
+            "shift": shift,
             }
     
     
@@ -373,12 +374,18 @@ def extend_z(z_um, n_ext, um_per_pz):
     return np.concatenate([z_um, tail])
 
 
-def lift_slab(sub, shift, n_ext, fill=0):
+def _n_ext(shift, n_ext=None):
+    """Planes to add. Never fewer than shift.max(), or displaced content falls off the end."""
+    need = int(np.max(shift)) if np.size(shift) else 0
+    return need if n_ext is None else max(int(n_ext), need)
+
+
+def lift_slab(sub, shift, n_ext=None, fill=0):
     """Displace each lateral column of a cut slab down by `shift[y, x]` planes.
     """
     sub = np.asarray(sub)
     nz = sub.shape[0]
-    idx = np.arange(nz + int(n_ext))[:, None, None] - np.asarray(shift)[None, :, :]
+    idx = np.arange(nz + _n_ext(shift, n_ext))[:, None, None] - np.asarray(shift)[None, :, :]
     bad = (idx < 0) | (idx >= nz)
     out = np.take_along_axis(sub, np.clip(idx, 0, nz - 1), axis=0)
     return np.where(bad, np.asarray(fill, sub.dtype), out)
@@ -388,6 +395,7 @@ def lift_project(sub, z_um, shift, n_ext, opt, fluorophore=None):
     """psf_project a slab whose columns have been displaced. To be used instead of psf_project.
     """
     nz = np.asarray(sub).shape[0]
+    n_ext = _n_ext(shift, n_ext)
     w0 = quad_weights(nz).astype(np.float32)
     pre = np.asarray(sub, np.float32) * w0[:, None, None]
     lifted = lift_slab(pre, shift, n_ext)
