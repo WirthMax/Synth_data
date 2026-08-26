@@ -100,6 +100,9 @@ class Tape(object):
         # where the fibre STOPS.
         self.u_fib_span = self.rng.random((n_cand, 4))
         
+        # 2D map of tissue detachment frozen field
+        self.detach_field = self.rng.standard_normal((ny, nx), dtype=np.float32)
+        
     def drawTissue(self, shape=(128, 128, 3), n_cand=1500, n_lm = 21, Pool = 3):
         nz, ny, nx = shape
         v = self.rng.standard_normal((n_cand, 3))

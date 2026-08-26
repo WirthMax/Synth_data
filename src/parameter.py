@@ -814,6 +814,69 @@ class ArtifactMask(ParamHolder):
         note="dilate px",
         comment="grow the reported extent by this much.",
     )
+    
+    
+@dataclass
+class Detachment(ParamHolder):
+    """Tissue that came loose from the slide and flaps, so it images out of focus."""
+
+    SCALE_VOX: P = P(
+        2.0,
+        200.0,
+        1.0,
+        20.0,
+        "detach scale",
+        note="scale",
+        comment="correlation length of the frozen lift field, voxels. \
+            Keep it BELOW TissueGeometry.SUPPORT_SCALE.",
+    )
+    EDGE_WIDTH_UM: P = P(
+        0.5,
+        30.0,
+        0.5,
+        3.0,
+        "detach edge width",
+        note="edge um",
+        comment="how far in from the tissue border the edge bias still reaches in  microns. ",
+    )
+    EDGE_BIAS: P = P(
+        0.0,
+        6.0,
+        0.1,
+        2.5,
+        "detach edge bias",
+        note="edge bias",
+        comment="how many SDs the edge bump adds to the gate before thresholding. \
+            0 = edges are no likelier to lift than the middle.",
+    )
+    COVER: P = P(
+        0.0,
+        1.0,
+        0.02,
+        0.10,
+        "detach cover",
+        note="cover",
+        comment="fraction of the off the tissue that comes off the slide, as a quantile.",
+    )
+    SOFT: P = P(
+        0.05,
+        1.0,
+        0.05,
+        0.25,
+        "detach soft",
+        note="soft",
+        comment="softness of the gate, the same setting ClusterNoise.soft is.",
+    )
+    ELEVATION_UM: P = P(
+        0.0,
+        8.0,
+        0.1,
+        8.0,
+        "detach elevation",
+        note="elev um",
+        comment="how far the fully-detached part of the flap lifts in microns.",
+    )
+
 
 
 @dataclass
@@ -825,6 +888,7 @@ class Artifacts(ParamHolder):
     Fussel: Fussel = field(default_factory=Fussel)
     Aggregate: Aggregate = field(default_factory=Aggregate)
     Mask: ArtifactMask = field(default_factory=ArtifactMask)
+    Detachment: Detachment = field(default_factory=Detachment)
 
 
 @dataclass

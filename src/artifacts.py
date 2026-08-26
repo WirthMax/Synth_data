@@ -1,9 +1,11 @@
 import numpy as np
 import dataclasses
 from scipy import ndimage as ndi
+from scipy.special import ndtri
 
 from scene import support_mask, thin, vox_to_world, body_frame, make_boundary, patch_grid, centred_grid_3d, TapeDict
 from render import render_marker
+from optics import _smooth_unit, psf_project, quad_weights
 import config as cfg
 from parameter import CellGeometry, FlatNoise
 
@@ -329,4 +331,67 @@ def build_artifacts(vols, tape, AR, opt, shape, panel, um_per_vox, spacing, geom
         "n_aggregate": sum(r["kind"] == "aggregate" for r in table),
         "shortfall": {"fussel": short[0], "aggregate": short[1]},
     }
+
     
+def detachment_map(tape, DET, tissue_support, spacing, um_per_vox, um_per_pz):
+    """The lift field: how far each lateral column of the cut section came off the slide in um.
+    """
+    # get binary tissue/background mask
+    col = np.asarray(tissue_support, bool)
+    col = col.any(0) if col.ndim == 3 else col
+    # Distance into the tissue from the nearest background voxel
+    edge_um = ndi.distance_transform_edt(col, sampling=(spacing[1] * um_per_vox,
+                                                        spacing[2] * um_per_vox))
+    bump = np.exp(-edge_um / max(float(DET.EDGE_WIDTH_UM.v), 1e-6)) * col
+
+    coarse = _smooth_unit(tape["detach_field"], DET.SCALE_VOX.v) + float(DET.EDGE_BIAS.v) * bump
+    cover = float(np.clip(DET.COVER.v, 0.0, 1.0))
+    if cover <= 0.0 or not col.any():
+        gate = np.zeros(col.shape, np.float32)
+    else:
+        # empirical quantile over the tissue, exactly as support_mask does 
+        thr = float(np.quantile(coarse[col], 1.0 - cover))
+        soft = max(float(DET.SOFT.v), 1e-3)
+        gate = 1.0 / (1.0 + np.exp(-(coarse - thr) / soft))
+    
+    elevation_um = (float(DET.ELEVATION_UM.v) * gate).astype(np.float32)
+    return {"elevation_um": elevation_um,
+            "gate": gate.astype(np.float32),
+            "lifted": (gate >= 0.5) & col,
+            "tissue_col": col,
+            "shift": np.rint(np.asarray(elevation_um) / float(um_per_pz)).astype(int),
+            }
+    
+    
+def extend_z(z_um, n_ext, um_per_pz):
+    """The slab's plane heights, plus n_ext more at the deep end
+    """
+    z_um = np.asarray(z_um, float)
+    if n_ext <= 0:
+        return z_um
+    tail = z_um[-1] + np.arange(1, int(n_ext) + 1) * float(um_per_pz)
+    return np.concatenate([z_um, tail])
+
+
+def lift_slab(sub, shift, n_ext, fill=0):
+    """Displace each lateral column of a cut slab down by `shift[y, x]` planes.
+    """
+    sub = np.asarray(sub)
+    nz = sub.shape[0]
+    idx = np.arange(nz + int(n_ext))[:, None, None] - np.asarray(shift)[None, :, :]
+    bad = (idx < 0) | (idx >= nz)
+    out = np.take_along_axis(sub, np.clip(idx, 0, nz - 1), axis=0)
+    return np.where(bad, np.asarray(fill, sub.dtype), out)
+
+
+def lift_project(sub, z_um, shift, n_ext, opt, fluorophore=None):
+    """psf_project a slab whose columns have been displaced. To be used instead of psf_project.
+    """
+    nz = np.asarray(sub).shape[0]
+    w0 = quad_weights(nz).astype(np.float32)
+    pre = np.asarray(sub, np.float32) * w0[:, None, None]
+    lifted = lift_slab(pre, shift, n_ext)
+    n_tot = lifted.shape[0]
+    out = psf_project(lifted, extend_z(z_um, n_ext, opt.um_per_pz), opt, fluorophore,
+                      weights=np.ones(n_tot))
+    return out * np.float32(n_tot / float(w0.sum()))

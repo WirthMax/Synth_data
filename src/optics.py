@@ -57,11 +57,11 @@ def psf_kernels(opt, nxy, wavelength_um, z_um):
     return ks
 
 
-def psf_project(slice_vol, z_um, optics, fluorophore = None):
+def psf_project(slice_vol, z_um, optics, fluorophore = None, weights = None):
     nz = slice_vol.shape[0]
     # the dye is a property of the marker, so the caller hands it over directly
     wavelength_um = optics.wavelength_um if fluorophore is None else FLUOROPHORES[fluorophore]
-    w = quad_weights(nz)
+    w = quad_weights(nz) if weights is None else np.asarray(weights, float)
     nxy = psf_support_px(opt = optics, thickness_um = float(np.ptp(z_um)) + optics.um_per_pz)
     ks = psf_kernels(opt = optics, nxy = nxy, wavelength_um = wavelength_um, z_um = z_um)
     out = np.zeros(slice_vol.shape[1:], np.float32)
