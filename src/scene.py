@@ -3,6 +3,7 @@ from scipy.spatial.transform import Rotation as R
 
 from parameter import CellContext
 from render import render_marker
+import tissue_direction as tdir
 
 # To prevent rerunning things if they already ran once
 _QUAD = None
@@ -404,16 +405,25 @@ def vox_to_world(pts_xyz, shape, spacing):
     return (np.asarray(pts_xyz, float)
             - np.array([(nx - 1) / 2, (ny - 1) / 2, (nz - 1) / 2])) * np.array([sx, sy, sz])
 
-def cell_geometry(base, ttape, i, tg):
-    """This cell's own geometry: the base shape plus its frozen size / orientation draws.
+def cell_geometry(base, ttape, i, tg, n_dir=None, S=0.0, align=0.0):
+    """This cell's own geometry: the type's shape plus its frozen size / orientation draws.
     """
     r = float(np.clip(base.RADIUS.v * np.exp(tg.SIZE_SIGMA.v * ttape["z_size"][i]),
                       base.RADIUS.lo, base.RADIUS.hi))
     nf = float(np.clip(base.NUC_FRAC.v * np.exp(tg.NUC_FRAC_SIGMA.v * ttape["z_nucfrac"][i]),
                        base.NUC_FRAC.lo, base.NUC_FRAC.hi))
     o = ttape["u_orient3"][i]
-    return dataclasses.replace(base, RADIUS=r, NUC_FRAC=nf, POLAR_DEG=float(180.0 * o[0]),
-                               AZIM_DEG=float(360.0 * o[1]), ROLL_DEG=float(360.0 * o[2]))
+    
+    polar, azim = 180.0 * o[0], 360.0 * o[1]
+    a = float(align) * float(S)
+    if n_dir is not None and a > 0.0:
+        p, z = np.deg2rad(polar), np.deg2rad(azim)
+        d = np.array([np.sin(p) * np.cos(z), np.sin(p) * np.sin(z), np.cos(p)])
+        d = tdir.slerp_axis(d, n_dir, a)
+        polar = float(np.rad2deg(np.arccos(np.clip(d[2], -1.0, 1.0))))
+        azim = float(np.rad2deg(np.arctan2(d[1], d[0])) % 360.0)
+    return dataclasses.replace(base, RADIUS=r, NUC_FRAC=nf, POLAR_DEG=float(polar),
+                               AZIM_DEG=float(azim), ROLL_DEG=float(360.0 * o[2]))
 
 def thin(pts, order, min_dist):
     keep = np.ones(len(pts), bool)
@@ -422,11 +432,15 @@ def thin(pts, order, min_dist):
     return np.flatnonzero(keep)
 
 
-def support_mask(w, XY_scale_vox=40.0, Z_scale_vox=40.0, cover=0.75):
-    """Smooth the frozen field, then threshold at a quantile so `cover` IS the realised fraction."""
+def _smooth_z(w, XY_scale_vox=40.0, Z_scale_vox=40.0):
+    """Smooth the frozen field and z-score it. The primitive psi and support_mask share."""
     z = gaussian_filter(w.astype(np.float32),
                         (float(Z_scale_vox), float(XY_scale_vox), float(XY_scale_vox)), truncate=3.0)
-    z = (z - z.mean()) / (z.std() + 1e-12)
+    return (z - z.mean()) / (z.std() + 1e-12)
+
+def support_mask(w, XY_scale_vox=40.0, Z_scale_vox=40.0, cover=0.75, psi = None):
+    """Smooth the frozen field, then threshold at a quantile so `cover` IS the realised fraction."""
+    z = _smooth_z(w, XY_scale_vox, Z_scale_vox) if psi is None else np.asarray(psi, np.float32)
     return z >= np.quantile(z, 1.0 - float(np.clip(cover, 0.0, 1.0)))
 
 
@@ -434,14 +448,30 @@ def assign_types(info, tape, CellTypes, fractions, rule=None):
     """Decide each cell's type
     """
     type_names = list(CellTypes)
-    cuts = np.cumsum(np.asarray(fractions, float) / np.sum(fractions))
+    f = np.asarray(fractions, float)
+    flat = np.cumsum(f / np.sum(f))
+    field = info.get("field")
+    fmap = info.get("feat")
+    lw = info.get("log_weights")
+    S_ref, ring_ref = info.get("S_ref", 0.0), info.get("ring_ref", 0.0)
     types = {}
     for n in info["labels_present"]:
         i = info["cand_idx"][n]
+        feat = {}
+        if field is None or fmap is None:
+            cuts = flat
+        else:
+            feat = fmap[n]
+            S, rg = feat["S"], feat["ring"]
+            tilt = feat["m"] @ lw if lw is not None and len(lw) else 0.0
+            q = f * np.exp(tilt
+                           + np.array([float(CellTypes[t].W_S.v) * (S - S_ref)
+                                       + float(CellTypes[t].W_RING.v) * (rg - ring_ref)
+                                       for t in type_names]))
+            cuts = np.cumsum(q / q.sum())
         base = type_names[int(np.searchsorted(cuts, tape["u_type"][i]))]
         ctx = CellContext(label=n, index=i, centre=info["centres_vox"][n],
-                          geom=info["geoms"][n], neigh_labels=info["neighbours"][n],
-                          types=types)
+                          neigh_labels=info["neighbours"][n], types=types, feat=feat)
         types[int(n)] = base if rule is None else rule(ctx, base)
     return types
 
@@ -517,6 +547,167 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Panel, CellTypes, Fraction
     
     types = assign_types(info, tape, CellTypes, Fractions, rule=rule)
     
+    names = list(Panel.Markers)
+    out = {m: np.zeros(shape, np.float32) for m in names}
+
+    for n in info["labels_present"]:
+        ctype = CellTypes[types[n]]
+        g, sl = info["geoms"][n], info["slices"][n]
+        win = labels[sl] == n
+        if not win.any():
+            continue
+        # the packed body, so a marker fills the claimed territory, not just the free shape
+        f = stamp_cell(tape, info["cand_idx"][n], g, grid, sl, info["centres_w"][n],
+                          grow=TG.GROW.v, L=L, l_min=l_min)
+        ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
+                         gate_noise=tape["gate_noise"][(slice(None),) + sl])
+        off = 0
+        for name, marker in Panel.Markers.items():
+            lvl = ctype.level(name)
+            if lvl > 0.0:
+                img = render_marker(tape=ptape, marker=marker, cell=f, spacing=spacing, geom=g,
+                                    um_per_vox=um_per_vox, edge_softness=0.0, pool_offset=off,
+                                    pool_bank=pool_bank)
+                # the level multiplies the rendered volume, which is exactly scaling amp
+                if lvl != 1.0:
+                    img = img * np.float32(lvl)
+                out[name][sl] = np.where(win, img, out[name][sl])
+            off += len(marker.noise_components)
+    
+    return out, labels, nuc_labels, tau_img, types, info
+
+
+def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes, Fractions,
+                 um_per_vox, L=4, l_min=2, rule=None, pool_bank=None):
+    """Tissue in three phases: TYPE ASSIGNMENT, then geometry, then appearance."""
+    import tissue_structures as ts
+    
+    sup, field, report = ts.build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox,
+                                                   L=L, l_min=l_min)
+    psi, thr = field["psi"], field["thr"]
+    
+    keep = thin(tape["xyz"], tape["order"], TG.MIN_DIST.v)
+    cx, cy, cz = tape["xyz"][keep].T
+    nz, ny, nx = shape
+    keep = keep[sup[np.clip(cz.astype(int), 0, nz - 1),
+                    np.clip(cy.astype(int), 0, ny - 1),
+                    np.clip(cx.astype(int), 0, nx - 1)]]
+    
+    # ---- read the field at every centre, then type against it -------------------------
+    cvox_all = tape["xyz"][keep]
+    tree_all = cKDTree(cvox_all)
+    lbl_all = list(range(1, len(keep) + 1))
+    neigh_all = {n: [j + 1 for j in tree_all.query_ball_point(cvox_all[n - 1], TG.NEIGH_RADIUS.v)
+                     if j + 1 != n] for n in lbl_all}
+    pre = dict(labels_present=lbl_all, cand_idx={n: int(keep[n - 1]) for n in lbl_all},
+               centres_vox={n: cvox_all[n - 1] for n in lbl_all}, neighbours=neigh_all,
+               field=field)
+    feat = None
+    if field is not None and len(keep):
+        # ONE vectorised read for every cell centre, shared by typing and the geometry pass. A
+        # 3-D Q needs six interpolations per cell plus one per structure, so sampling per cell in
+        # two separate places would be thousands of tiny map_coordinates calls at the cell counts
+        # a small MIN_DIST produces.
+        fc = tdir.sample_field(field, cvox_all[:, 0], cvox_all[:, 1], cvox_all[:, 2])
+        feat = {n: {"n": fc["n"][:, n - 1], "S": float(fc["S"][n - 1]),
+                    "ring": float(fc["ring"][n - 1]), "theta": float(fc["theta"][n - 1]),
+                    "m": fc["m"][:, n - 1]} for n in lbl_all}
+        pre["feat"] = feat
+        pre["log_weights"] = np.stack([st.log_weights(list(CellTypes))
+                                       for st in ARCH.Structures]) if ARCH.Structures else None
+        # centre the two FIELD features against the population actually being typed, so a weight
+        # moves cells between compartments instead of changing how many of that type there are.
+        # The profile term is deliberately not centred -- see assign_types.
+        pre["S_ref"] = float(fc["S"].mean())
+        pre["ring_ref"] = float(fc["ring"].mean())
+    # every thinned candidate is typed; the return value is filtered to the survivors below
+    types_all = assign_types(pre, tape, CellTypes, Fractions, rule=rule)
+
+    # how much the local architecture wants cells to follow the director at all: 1 outside every
+    # structure (the flow is simply what it is), each structure's own ALIGN inside it. ALIGN
+    # defaults to 1.0, so this is exactly 1 everywhere until someone turns one down.
+    s_align = None
+    if feat is not None and ARCH.Structures:
+        av = np.array([1.0 - float(st.ALIGN.v) for st in ARCH.Structures])
+
+        def s_align(fn):
+            return float(np.clip(1.0 - float(fn["m"] @ av), 0.0, 1.0))
+
+    grid = centred_grid_3d(shape, spacing)
+    best = np.full(shape, np.inf, np.float32)
+    labels = np.zeros(shape, np.int32)
+    nuc_labels = np.zeros(shape, np.int32)
+    tau_img = np.zeros(shape, np.float32)
+    geoms, slices, centres_w = {}, {}, {}
+    g_align = float(ARCH.ALIGN.v) if ARCH is not None else 0.0
+
+    for n, i in enumerate(keep, start=1):
+        # a type owns its biology; base_geom is the fallback for a type that carries none
+        ct = CellTypes[types_all[n]]
+        tgeom = ct.Geometry if getattr(ct, "Geometry", None) is not None else base_geom
+        if tgeom is None:
+            raise ValueError(
+                f"cell type {types_all[n]!r} has no Geometry and no base_geom was given. "
+                f"A type owns its own shape now -- give it one, or pass base_geom as a fallback.")
+        fn = feat[n] if feat is not None else None
+        g = cell_geometry(tgeom, tape, i, TG,
+                          n_dir=(fn["n"] if fn is not None else None),
+                          S=(fn["S"] if fn is not None else 0.0),
+                          align=g_align * float(tgeom.ALIGN.v)
+                          * (s_align(fn) if s_align is not None else 1.0))
+        sl = patch_grid(tape["xyz"][i],
+                         reach_px(R=g.RADIUS.v, rough=g.ROUGH.v, elong=g.ELONG.v, grow=TG.GROW.v), 
+                         shape)
+        if any(s.stop - s.start <= 0 for s in sl):
+            continue
+        cw = vox_to_world(tape["xyz"][i], shape, spacing)
+        f = stamp_cell(tape, i, g, grid, sl, cw, L = L, l_min = l_min, grow=1.0)
+
+        # tesselation to decide which cell is closest to each pixel 
+        win = (f["d"] < best[sl]) & (f["d"] <= TG.GROW.v) & sup[sl]
+        best[sl] = np.where(win, f["d"], best[sl])
+        labels[sl] = np.where(win, n, labels[sl])
+        tau_img[sl] = np.where(win, f["tau"], tau_img[sl])
+        nuc_labels[sl] = np.where(win, f["nuc"] * n, nuc_labels[sl])
+        geoms[n], slices[n], centres_w[n] = g, sl, cw
+        
+    # keep only the piece holding the seed; a two-piece "cell" is a wrong annotation
+    orphan = 0
+    for n, slc in enumerate(ndi.find_objects(labels), start=1):
+        if slc is None:
+            continue
+        m = labels[slc] == n
+        cc, k = ndi.label(m)
+        if k > 1:
+            main = 1 + int(np.argmax(np.bincount(cc.ravel())[1:]))
+            drop = m & (cc != main)
+            labels[slc][drop] = 0
+            nuc_labels[slc][drop] = 0
+            tau_img[slc][drop] = 0.0
+            orphan += int(drop.sum())
+    
+    present = sorted(set(np.unique(labels)) - {0})
+    cvox = tape["xyz"][keep]
+    tree = cKDTree(cvox)
+    neigh = {n: [j + 1 for j in tree.query_ball_point(cvox[n - 1], TG.NEIGH_RADIUS.v)
+                 if j + 1 != n] for n in present}
+    neigh = {n: [j for j in v if j in neigh] for n, v in neigh.items()}
+
+    info = dict(labels_present=present, cand_idx={n: int(keep[n - 1]) for n in present},
+        geoms=geoms, slices=slices, centres_w=centres_w,
+        centres_vox={n: cvox[n - 1] for n in present},
+        neighbours=neigh, support=sup, orphan_vox=orphan,
+        packing=float((labels > 0).sum() / max(sup.sum(), 1)),
+        # the field, the potential behind it, and the ledger's realised fractions, so a caller
+        # can plot or report them. info["support"] already excludes every lumen, and that is what
+        # artifacts consume, so debris and detachment avoid the lumina with no artifact-side
+        # change at all.
+        field=field, psi=psi, psi_bar=psi.mean(0), thr=thr, report=report, arch=ARCH)
+
+    # typed before the geometry pass; filtered to the survivors here so the returned dict
+    # still means "the type of every cell in the label image", exactly as it always did
+    types = {n: types_all[n] for n in present}
+
     names = list(Panel.Markers)
     out = {m: np.zeros(shape, np.float32) for m in names}
 

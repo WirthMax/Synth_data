@@ -103,6 +103,47 @@ class Tape(object):
         # 2D map of tissue detachment frozen field
         self.detach_field = self.rng.standard_normal((ny, nx), dtype=np.float32)
         
+        
+    def drawTissueDir(self, shape=(128, 128, 3), n_cand=1500, n_lm = 21, Pool = 3,
+                   n_struct = 4, n_inst = 96):
+        nz, ny, nx = shape
+        v = self.rng.standard_normal((n_cand, 3))
+        # centres, (x,y,z) in voxels
+        self.xyz=self.rng.random((n_cand, 3)) * np.array([nx, ny, nz])
+        # hard-core priority
+        self.order=self.rng.random(n_cand)
+        # tissue support field
+        self.support3=self.rng.standard_normal(shape, dtype=np.float32)
+        # polar / azim / roll
+        self.u_orient3=self.rng.random((n_cand, 3))
+        # which cell type
+        self.u_type=self.rng.random(n_cand)
+        self.z_size=self.rng.standard_normal(n_cand)
+        self.z_nucfrac=self.rng.standard_normal(n_cand)
+        # a DIRECTION needs three numbers -- one scalar normalises to 1.0 and every nucleus
+        # then displaces along the same body-frame diagonal
+        self.u_offdir=v / np.linalg.norm(v, axis=1, keepdims=True)
+        self.u_offmag=self.rng.random(n_cand)
+        self.sh=self.rng.standard_normal((n_cand, n_lm))
+        self.sh2=self.rng.standard_normal((n_cand, n_lm))
+        self.texture_noise=self.rng.standard_normal((Pool, *shape), dtype=np.float32)
+        self.gate_noise=self.rng.standard_normal((Pool, *shape), dtype=np.float32)
+        
+        self.dir_a=self.rng.standard_normal(shape, dtype=np.float32)
+        self.dir_b=self.rng.standard_normal(shape, dtype=np.float32)
+        self.dir_c=self.rng.standard_normal(shape, dtype=np.float32)
+        self.dir_d=self.rng.standard_normal(shape, dtype=np.float32)
+        self.dir_e=self.rng.standard_normal(shape, dtype=np.float32)
+        
+        # Structure seeds as fixed blocks per structure
+        self.struct_seed=self.rng.random((n_struct, n_inst, 3))
+        # per-structure roughness field. It perturbs the DISTANCE field rather than the pressure,
+        # so ROUGH scales it smoothly and the structure's volume still comes out exact.
+        self.struct_noise=self.rng.standard_normal((n_struct, *shape), dtype=np.float32)
+        # the tissue outline's own noise, smeared along the flow at carve time
+        self.carve_noise=self.rng.standard_normal(shape, dtype=np.float32)
+        
+        
     def drawTissue(self, shape=(128, 128, 3), n_cand=1500, n_lm = 21, Pool = 3):
         nz, ny, nx = shape
         v = self.rng.standard_normal((n_cand, 3))

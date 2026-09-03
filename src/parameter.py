@@ -202,7 +202,7 @@ class CellGeometry(ParamHolder):
     )
     ELONG: P = P(
         0.3,
-        3.0,
+        15.0,
         0.05,
         1.6,
         "elong",
@@ -272,6 +272,16 @@ class CellGeometry(ParamHolder):
     AZIM_DEG: P = P(0.0, 360.0, 5.0, 25.0, "azim_deg", note="azim")
     ROLL_DEG: P = P(0.0, 360.0, 5.0, 0.0, "roll_deg", note="roll")
 
+    ALIGN: P = P(
+        0.0,
+        1.0,
+        0.05,
+        0.0,
+        "align",
+        note="align",
+        comment="how strongly this cell type turns to follow the director, 0 = ignores it \
+        entirely, 1 = follows it as far as the field's local coherence allows.",
+    )
 
 @dataclass
 class BaseNoise(ParamHolder):
@@ -499,6 +509,31 @@ class CellType(ParamHolder):
     Color: str = "black"
     Geometry: CellGeometry = field(default_factory=CellGeometry)
     Expression: dict[str, P] = field(default_factory=dict)
+
+    # UPDATE: THESE ARE STRUCTURE + CELL TYPE SPECIFIC, SO FOR A NEW STRUCTURE WE ALSO NEED THE AFFINITY
+    # MAYBE A BIT COMPLICATED SOLUTION, IDEALLY ADDING A NEW STRUCTURE SHOULD ONLY BE A CHANGE IN ONE PLACE
+    W_S: P = P(
+        -4.0,
+        4.0,
+        0.1,
+        0.0,
+        "w coherence",
+        note="w S",
+        comment="preference for coherently-oriented tissue: positive puts this type where the "
+        "director is well ordered (a duct wall, an aligned stroma).",
+    )
+    W_RING: P = P(
+        -4.0,
+        4.0,
+        0.1,
+        0.0,
+        "w ring",
+        note="w ring",
+        comment="preference for the lumen wall: positive lines this type up around the lumina "
+        "(the epithelial case), negative excludes it from them. The ring feature hugs "
+        "the TRUE irregular boundary, so this follows a wrinkled wall rather than a "
+        "circle drawn around the anchor.",
+    )
 
     def level(self, marker_name):
         p = self.Expression.get(marker_name)
@@ -1100,20 +1135,423 @@ class TissueGeometry(ParamHolder):
     )
 
 
+A_ABSENT = -6.0
+PROFILE_P = P(
+    -6.0,
+    6.0,
+    0.5,
+    0.0,
+    "profile",
+    note="profile",
+    comment="log-weight for one cell type inside this structure. 0 leaves the global "
+    "Fractions alone, +2 is a 7x enrichment, -6 is effectively excluded. It is "
+    "a TILT, not an override: the weight is multiplied in by the structure's "
+    "soft membership, so it fades out across the boundary instead of stepping.",
+)
+
+
+@dataclass
+class BaseStructure(ParamHolder):
+    """One kind of organised tissue placed into the random background.
+
+    A structure owns everything about itself: how much of the tissue it is, how many instances,
+    what shape they are, which way they point, how hard its cells follow that, and which cell
+    types live in it. An ordered bundle of muscle and a vessel with an epithelial wall are two
+    subclasses of this, and a new kind is a new subclass.
+
+    An instance's long axis is its director. The axis is drawn frozen,
+    slerped toward (DIR_DEG, TILT_DEG) by SIMILARITY, and the body is then elongated along it.
+
+    Size is declared and count is derived, (we know how big a vessel is, not how many fit in a tile).
+    """
+
+    kind: str = "base"
+    name: str = "structure"
+
+    FRAC: P = P(
+        0.0,
+        1.0,
+        0.01,
+        0.10,
+        "frac",
+        note="frac",
+        comment="this structure's share of the Tissue. \
+            At COVER 0.90, FRAC 0.10 is 9% of the image.",
+    )
+    SIZE_UM: P = P(
+        1.0,
+        60.0,
+        0.5,
+        8.0,
+        "size um",
+        tf="log",
+        note="size um",
+        comment="equivalent-sphere radius of one instance in microns.",
+    )
+    N_MAX: P = P(
+        1.0,
+        32.0,
+        1.0,
+        24.0,
+        "n max",
+        note="n max",
+        comment="a CAP on the instance count, not a target.",
+    )
+    FLOW: str = "field"
+    """Which metric this structure grows along.
+
+    "field" -- the geodesic under the shared prior director, so the structure snakes with the
+               tissue grain. Costs a Dijkstra solve (~0.7 s, downsampled).
+    "axis"  -- a uniform metric along this structure's own (DIR_DEG, TILT_DEG).
+    """
+
+    ASPECT: P = P(
+        1.0, 8.0, 0.1, 1.0, "aspect", note="aspect",
+        comment="anisotropy of this structure's growth metric, and so the axis ratio of the shape \
+            it settles into. Growth is cheap along the local director and expensive across \
+            it, so the equilibrium shape is the Wulff shape of that metric: an ellipsoid of \
+            exactly this ratio under a uniform field, and a body that snakes along the \
+            streamlines under a curved one.",
+    )
+
+    ROUGH: P = P(
+        0.0, 0.6, 0.01, 0.25, "rough", note="rough",
+        comment="boundary raggedness as a fraction of the structure's own radius, so the knob is \
+            size invariant: 0.3 looks equally ragged on a small structure and a large one.",
+    )
+
+    BUMP_SCALE_UM: P = P(
+        1.0, 12.0, 0.5, 3.0, "bump scale", note="bump um",
+        comment="correlation length of the roughness field in microns -- how big the boundary's \
+            wobbles are, where ROUGH is how deep.",
+    )
+
+    SIZE_SIGMA: P = P(
+        0.0,
+        0.6,
+        0.01,
+        0.15,
+        "size sigma",
+        note="size sd",
+        comment="lognormal spread of size BETWEEN instances.",
+    )
+    SPREAD: P = P(
+        0.0,
+        2.5,
+        0.05,
+        1.10,
+        "spread",
+        note="spread",
+        comment="how far instance seeds scatter from the frame centre, as a fraction of \
+            the frame. 0 stacks every instance on one spot; 1 spreads them over \
+            the frame; ABOVE 1 seeds land outside it, so the tile shows only part \
+            of a structure",
+    )
+    EDGE_UM: P = P(
+        0.1, 6.0, 0.1, 1.0, "edge um", note="edge um",
+        comment="softness of the membership boundary in microns.",
+    )
+
+    W: P = P(
+        0.0,
+        5.0,
+        0.1,
+        1.5,
+        "w",
+        note="w",
+        comment="weight of this structure's director term, on the same scale as NOISE_W.",
+    )
+    ALIGN: P = P(
+        0.0,
+        1.0,
+        0.05,
+        1.0,
+        "align",
+        note="align",
+        comment="how strongly cells turn to follow the director. The effective \
+            pull is this x TissueArchitecture.ALIGN x the type's own \
+            CellGeometry.ALIGN x the local coherence S.",
+    )
+    SIMILARITY: P = P(
+        0.0, 1.0, 0.05, 0.80, "similarity", note="similar",
+        comment="how strongly this structure follows its DECLARED direction rather than the \
+            prior flow, as a blend between them. Only relevant for FLOW='field'.",
+    )
+
+
+    DIR_DEG: P = P(
+        -90.0,
+        90.0,
+        5.0,
+        0.0,
+        "dir deg",
+        note="dir",
+        comment="the structure's declared direction, measured +x toward +y \
+            (the same convention as render.direction and CellGeometry.AZIM_DEG).",
+    )
+    TILT_DEG: P = P(
+        0.0,
+        90.0,
+        5.0,
+        90.0,
+        "tilt deg",
+        note="tilt",
+        comment="the polar angle of that direction: 90 lies in the section plane, 0 \
+            runs straight through it.",
+    )
+    Profile: dict[str, P] = field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.Profile = {
+            k: _as_p(PROFILE_P, v, f"{type(self).__name__}.Profile.{k}")
+            for k, v in (self.Profile or {}).items()
+        }
+
+    def log_weights(self, type_names):
+        """This structure's log-weight per type, in the caller's order."""
+        if not self.Profile:
+            return np.zeros(len(type_names))
+        return np.array(
+            [
+                float(self.Profile[t].v) if t in self.Profile else A_ABSENT
+                for t in type_names
+            ],
+            float,
+        )
+
+    def director(self, ctx):
+        raise NotImplementedError(f"{type(self).__name__} defines no director")
+
+
+@dataclass
+class Ordered(BaseStructure):
+    """An aligned bundle: cardiomyocytes, smooth muscle, a fibrous stroma running one way.
+
+    Cells point along the instance's own long axis. With SIMILARITY at 1 and N above 1 this is
+    several parallel bundles; at 0 it is several bundles each going its own way.
+    """
+
+    kind: str = "ordered"
+    name: str = "ordered"
+    SIZE_UM: P = P(
+        3.0,
+        600.0,
+        0.5,
+        13.0,
+        "size um",
+        tf="log",
+        note="size um",
+        comment="equivalent-sphere radius of one bundle in microns",
+    )
+    ASPECT: P = P(
+        1.0, 8.0, 0.1, 3.0, "aspect", note="aspect",
+        comment="a fibre bundle is a rod, so the default here is elongated",
+    )
+    # a bundle follows the tissue grain
+    FLOW: str = "field"          
+
+    def director(self, ctx):
+        from tissue_structures import _director_ordered
+
+        return _director_ordered(self, ctx["inst"], ctx["b"], ctx["um_per_vox"])
+
+
+@dataclass
+class Vasculature(BaseStructure):
+    """A vessel or duct: a lumen with a wall of cells around it.
+    The center of the lumen is a void, so the wall is the only tissue. 
+    The wall's cells point along it.
+    """
+
+    kind: str = "vessel"
+    name: str = "vessel"
+    SIZE_UM: P = P(
+        1.5,
+        35.0,
+        0.5,
+        6.0,
+        "size um",
+        tf="log",
+        note="size um",
+        comment="equivalent-sphere radius of one vessel in microns.",
+    )
+    ASPECT: P = P(
+        1.0, 8.0, 0.1, 4.0, "aspect", note="aspect",
+        comment="a vessel is a tube, so this wants to be well above 1.",
+    )
+    
+    # a duct runs straight; also the free, exact case
+    FLOW: str = "axis"           
+
+    WALL_IN: P = P(
+        0.1,
+        0.9,
+        0.05,
+        0.55,
+        "wall in",
+        note="wall in",
+        comment="inner radius of the wall as a fraction of the territory's, so the \
+        wall is the shell between it and 1.",
+    )
+    PHASE_DEG: P = P(
+        0.0,
+        90.0,
+        5.0,
+        90.0,
+        "phase deg",
+        note="phase",
+        comment="how cells sit against the wall: 0 = radial (pointing at the \
+        lumen), 90 = tangential (lining it, the epithelial case).",
+    )
+    PHASE_TILT_DEG: P = P(
+        0.0,
+        90.0,
+        5.0,
+        0.0,
+        "phase tilt",
+        note="phase tilt",
+        comment="the second half of the phase pair: having picked radial vs \
+        circumferential in the wall plane, this tilts that axis \
+        toward the duct's own axis. ",
+    )
+
+    def director(self, ctx):
+        from tissue_structures import _director_vessel
+
+        return _director_vessel(self, ctx["inst"], ctx["rho"], ctx["spacing"])
+
+
+@dataclass
+class TissueArchitecture(ParamHolder):
+    """How the tissue is organised: a random background flow, with structures placed on top.
+    """
+
+    ALIGN: P = P(
+        0.0,
+        1.0,
+        0.05,
+        1.0,
+        "align",
+        note="align",
+        comment="Global master gain on the orientation coupling.",
+    )
+    NOISE_W: P = P(
+        0.0,
+        3.0,
+        0.1,
+        1.0,
+        "noise w",
+        note="noise w",
+        comment="weight of the random background flow.",
+    )
+    SCALE_UM: P = P(
+        3.0,
+        18.0,
+        0.5,
+        8.0,
+        "scale um",
+        note="scale",
+        comment="lateral correlation length of that flow in microns.",
+    )
+    SCALE_Z_UM: P = P(
+        1.0,
+        18.0,
+        0.5,
+        6.0,
+        "scale z um",
+        note="scale z",
+        comment="axial correlation length of the flow, separately",
+    )
+    TANGENCY: P = P(
+        0.0,
+        4.0,
+        0.1,
+        0.0,
+        "tangency",
+        note="tangency",
+        comment="weight of the outer margin term, which lines cells up along the "
+        "loose tissue's own outline.",
+    )
+    TANGENCY_Z_DEG: P = P(
+        0.0,
+        90.0,
+        5.0,
+        0.0,
+        "tangency z",
+        note="tang z",
+        comment="tilts the margin axis out of the section plane. 0 lies along "
+        "the edge in the plane; 90 runs up it.",
+    )
+    BAND: P = P(
+        0.2,
+        2.0,
+        0.05,
+        0.6,
+        "band",
+        note="band",
+        comment="how far the margin term reaches, in units of the potential's own "
+        "realised SD.",
+    )
+    CURV: P = P(
+        -3.0, 3.0, 0.1, 0.0, "curv", note="curv",
+        comment="how fast the prior fields grain turns, degrees per micron.",
+    )
+    COMPACT: P = P(
+        0.0, 3.0, 0.1, 0.0, "compact", note="compact",
+        comment="how much the loose tissue coalesces into one block rather than scattering.",
+    )
+    MARGIN_UM: P = P(
+        0.0, 4.0, 0.1, 1.0, "margin um", note="margin",
+        comment="the guaranteed stromal collar in microns",
+    )
+    EDGE_NOISE: P = P(
+        0.0, 12.0, 0.5, 5.0, "edge noise", note="edge noise",
+        comment="how far the tissue outline deviates from a plain distance offset in voxels.",
+    )
+    EDGE_SCALE_UM: P = P(
+        1.0, 16.0, 0.5, 4.0, "edge scale", note="edge um",
+        comment="correlation length of that edge noise, microns.",
+    )
+    LIC_STRETCH: P = P(
+        0.0, 8.0, 0.5, 3.0, "lic stretch", note="lic",
+        comment="how far the edge noise is smeared along the flow, in units of its own scale.",
+    )
+    MIN_ISLAND: P = P(
+        0.0, 0.01, 0.0005, 0.002, "min island", note="min isle",
+        comment="dissolve tissue islands below this fraction of the frame and regrow the same \
+            number of voxels onto the surviving tissue, so coverage stays exact.",
+    )
+
+    Structures: list = field(default_factory=list)
+
+    def __post_init__(self):
+        super().__post_init__()
+        for s in self.Structures:
+            assert isinstance(s, BaseStructure), (
+                f"{type(s)} is not a tissue structure -- subclass BaseStructure."
+            )
+
+
+
+
 @dataclass
 class CellContext:
-    """What a rule may look at when deciding one cell's expression."""
+    """What a rule may look at when deciding one cell's type.
+    """
 
     label: int
     # candidate index in the tape
     index: int
     # voxel coords
     centre: np.ndarray
-    geom: CellGeometry
     # labels within NEIGH_RADIUS
     neigh_labels: list
     # label -> type name, for cells already assigned
     types: dict
+    # field readings at `centre`: n, S, ring, theta, and m (membership per structure).
+    # Empty when the tissue has no architecture.
+    feat: dict = field(default_factory=dict)
 
     def n_neighbours(self):
         return len(self.neigh_labels)
