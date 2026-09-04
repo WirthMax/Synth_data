@@ -445,15 +445,16 @@ def support_mask(w, XY_scale_vox=40.0, Z_scale_vox=40.0, cover=0.75, psi = None)
 
 
 def assign_types(info, tape, CellTypes, fractions, rule=None):
-    """Decide each cell's type
-    """
+    """Decide each cell's type: the global Fractions, tilted by the structure Profile it sits in
+    and by its cell type's Affinity for each named tissue feature."""
     type_names = list(CellTypes)
     f = np.asarray(fractions, float)
     flat = np.cumsum(f / np.sum(f))
     field = info.get("field")
     fmap = info.get("feat")
     lw = info.get("log_weights")
-    S_ref, ring_ref = info.get("S_ref", 0.0), info.get("ring_ref", 0.0)
+    refs = info.get("feat_refs", {})
+    feat_names = list((field or {}).get("features", {})) if field is not None else []
     types = {}
     for n in info["labels_present"]:
         i = info["cand_idx"][n]
@@ -462,12 +463,12 @@ def assign_types(info, tape, CellTypes, fractions, rule=None):
             cuts = flat
         else:
             feat = fmap[n]
-            S, rg = feat["S"], feat["ring"]
             tilt = feat["m"] @ lw if lw is not None and len(lw) else 0.0
-            q = f * np.exp(tilt
-                           + np.array([float(CellTypes[t].W_S.v) * (S - S_ref)
-                                       + float(CellTypes[t].W_RING.v) * (rg - ring_ref)
-                                       for t in type_names]))
+            aff = np.array([
+                sum(CellTypes[t].affinity(nm) * (float(feat[nm]) - refs.get(nm, 0.0))
+                    for nm in feat_names)
+                for t in type_names])
+            q = f * np.exp(tilt + aff)
             cuts = np.cumsum(q / q.sum())
         base = type_names[int(np.searchsorted(cuts, tape["u_type"][i]))]
         ctx = CellContext(label=n, index=i, centre=info["centres_vox"][n],
@@ -609,17 +610,18 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
         # two separate places would be thousands of tiny map_coordinates calls at the cell counts
         # a small MIN_DIST produces.
         fc = tdir.sample_field(field, cvox_all[:, 0], cvox_all[:, 1], cvox_all[:, 2])
-        feat = {n: {"n": fc["n"][:, n - 1], "S": float(fc["S"][n - 1]),
-                    "ring": float(fc["ring"][n - 1]), "theta": float(fc["theta"][n - 1]),
-                    "m": fc["m"][:, n - 1]} for n in lbl_all}
+        feat_names = list(field.get("features", {}))          # e.g. ["S", "ring"]
+        feat = {n: {"n": fc["n"][:, n - 1], "theta": float(fc["theta"][n - 1]),
+                    "m": fc["m"][:, n - 1],
+                    **{k: float(fc[k][n - 1]) for k in feat_names}}
+                for n in lbl_all}
         pre["feat"] = feat
         pre["log_weights"] = np.stack([st.log_weights(list(CellTypes))
                                        for st in ARCH.Structures]) if ARCH.Structures else None
-        # centre the two FIELD features against the population actually being typed, so a weight
+        # centre every FIELD feature against the population actually being typed, so a weight
         # moves cells between compartments instead of changing how many of that type there are.
         # The profile term is deliberately not centred -- see assign_types.
-        pre["S_ref"] = float(fc["S"].mean())
-        pre["ring_ref"] = float(fc["ring"].mean())
+        pre["feat_refs"] = {k: float(fc[k].mean()) for k in feat_names}
     # every thinned candidate is typed; the return value is filtered to the survivors below
     types_all = assign_types(pre, tape, CellTypes, Fractions, rule=rule)
 

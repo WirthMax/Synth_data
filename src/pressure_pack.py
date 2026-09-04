@@ -105,18 +105,6 @@ def distance_field(shape, seeds, aspect, director=None, axis=None, downsample=2,
     return (up * float(f)).astype(np.float32)
 
 
-def stencil(ndim, aspect):
-    """Neighbour offsets for the geodesic graph"""
-    r = 3 if (ndim == 2 and aspect >= 1.6) else 2
-    out = []
-    for d in np.ndindex(*(2 * r + 1,) * ndim):
-        v = tuple(int(x) - r for x in d)
-        if all(x == 0 for x in v):
-            continue
-        if reduce(gcd, [abs(x) for x in v]) == 1:      # primitive only
-            out.append(v)
-    return out
-
 def place_seeds(shape, counts, draws, spread=1.0):
     """Best-candidate ("Mitchell") sampling: each new seed is the FARTHEST of a batch of
     frozen candidates from every seed already placed. 

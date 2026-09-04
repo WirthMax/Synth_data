@@ -79,12 +79,21 @@ def slerp_axis(d, n, a):
     return (d * np.cos(t) + np.cross(k, d) * np.sin(t) + k * float(k @ d) * (1.0 - np.cos(t)))
 
 def sample_field(field, xs, ys, zs):
-    """The field at many cell centres at once."""
+    """The field at many cell centres at once: the director from the interpolated Q, plus every
+    named scalar feature the builder attached under field["features"].
+
+    Note: a feature named "S" (the builder always supplies one) is returned by INTERPOLATING the
+    coherence volume, not by decomposing the per-cell interpolated Q -- the two agree to within
+    trilinear-interpolation error.
+    """
     c = np.stack([np.asarray(zs, float), np.asarray(ys, float), np.asarray(xs, float)])
     q = np.stack([ndi.map_coordinates(field["Q6"][k], c, order=1, mode="nearest")
                   for k in range(6)])
     n, gap = decompose(q)
     m = np.stack([ndi.map_coordinates(mk, c, order=1, mode="nearest") for mk in field["m"]]) \
         if len(field["m"]) else np.zeros((0, c.shape[1]))
-    return {"n": n, "S": coherence(gap), "theta": np.arctan2(n[1], n[0]),
-            "ring": ndi.map_coordinates(field["ring"], c, order=1, mode="nearest"), "m": m}
+    out = {"n": n, "theta": np.arctan2(n[1], n[0]), "m": m}
+    for name, vol in field.get("features", {}).items():
+        out[name] = ndi.map_coordinates(vol, c, order=1, mode="nearest")
+    out.setdefault("S", coherence(gap))          # fallback for a bare field with no features
+    return out

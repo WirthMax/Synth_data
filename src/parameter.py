@@ -495,6 +495,21 @@ class MarkerPanel:
         return sum(len(m.noise_components) for m in self.Markers.values())
 
 
+AFFINITY_P = P(
+    -4.0,
+    4.0,
+    0.1,
+    0.0,
+    "affinity",
+    note="affinity",
+    comment="log-weight for this cell type's preference for a named tissue feature, keyed by \
+        FEATURE NAME: \n\
+            'S' is orientation coherence (a duct wall, an aligned stroma), \n\
+            'ring' is the lumen wall an epithelium lines. \n\
+            +2 is a 7x enrichment where the feature is high, -4 effectively excludes it.",
+)
+
+
 @dataclass
 class CellType(ParamHolder):
     """A cell type is its shape plus HOW MUCH of each panel marker it expresses.
@@ -509,31 +524,16 @@ class CellType(ParamHolder):
     Color: str = "black"
     Geometry: CellGeometry = field(default_factory=CellGeometry)
     Expression: dict[str, P] = field(default_factory=dict)
+    # preference for named tissue features, keyed by FEATURE NAME ("S", "ring", ...). A structure
+    # publishes features through BaseStructure.features; adding one is a change in ONE place.
+    Affinity: dict[str, P] = field(default_factory=dict)
 
-    # UPDATE: THESE ARE STRUCTURE + CELL TYPE SPECIFIC, SO FOR A NEW STRUCTURE WE ALSO NEED THE AFFINITY
-    # MAYBE A BIT COMPLICATED SOLUTION, IDEALLY ADDING A NEW STRUCTURE SHOULD ONLY BE A CHANGE IN ONE PLACE
-    W_S: P = P(
-        -4.0,
-        4.0,
-        0.1,
-        0.0,
-        "w coherence",
-        note="w S",
-        comment="preference for coherently-oriented tissue: positive puts this type where the "
-        "director is well ordered (a duct wall, an aligned stroma).",
-    )
-    W_RING: P = P(
-        -4.0,
-        4.0,
-        0.1,
-        0.0,
-        "w ring",
-        note="w ring",
-        comment="preference for the lumen wall: positive lines this type up around the lumina "
-        "(the epithelial case), negative excludes it from them. The ring feature hugs "
-        "the TRUE irregular boundary, so this follows a wrinkled wall rather than a "
-        "circle drawn around the anchor.",
-    )
+    def __post_init__(self):
+        super().__post_init__()
+        self.Affinity = {
+            k: _as_p(AFFINITY_P, v, f"{type(self).__name__}.Affinity.{k}")
+            for k, v in (self.Affinity or {}).items()
+        }
 
     def level(self, marker_name):
         p = self.Expression.get(marker_name)
@@ -541,6 +541,11 @@ class CellType(ParamHolder):
 
     def expressed(self, thresh=1e-3):
         return [k for k in self.Expression if self.level(k) > thresh]
+
+    def affinity(self, feature_name):
+        """This type's log-weight preference for a named tissue feature; 0.0 if unset."""
+        p = self.Affinity.get(feature_name)
+        return 0.0 if p is None else float(p.v)
 
 
 @dataclass
@@ -1320,8 +1325,37 @@ class BaseStructure(ParamHolder):
             float,
         )
 
+    def distance(self, ctx):
+        """This structure's growth metric: the field whose level sets are the shapes it can
+        settle into. """
+        import tissue_structures as ts
+
+        return ts._structure_distance(self, ctx)
+
+    def wall_fraction(self):
+        """Fraction of the territory that is claimed (nothing leaks in), but is NOT tissue and
+        does not spend the coverage budget (for example inside of a Vessel).
+        """
+        return 0.0
+
+    def interior(self, ctx):
+        """A voxel mask of territory that is claimed but is not tissue, or None. 
+        """
+        return None
+
     def director(self, ctx):
-        raise NotImplementedError(f"{type(self).__name__} defines no director")
+        """The director this structure prescribes for its cells, as (x, y, z) components over the
+        (z, y, x) volume. The default points along the metric the body actually grew under.
+        """
+        import tissue_structures as ts
+
+        return ts._director_ordered(self, ctx)
+
+    def features(self, ctx):
+        """Named scalar fields this structure publishes for cell typing (keyed on by
+        CellType.Affinity) and for plotting.
+        """
+        return {}
 
 
 @dataclass
@@ -1348,13 +1382,8 @@ class Ordered(BaseStructure):
         1.0, 8.0, 0.1, 3.0, "aspect", note="aspect",
         comment="a fibre bundle is a rod, so the default here is elongated",
     )
-    # a bundle follows the tissue grain
-    FLOW: str = "field"          
-
-    def director(self, ctx):
-        from tissue_structures import _director_ordered
-
-        return _director_ordered(self, ctx["inst"], ctx["b"], ctx["um_per_vox"])
+    # a bundle follows the tissue grain, and points along it -- the BaseStructure default
+    FLOW: str = "field"
 
 
 @dataclass
@@ -1416,10 +1445,27 @@ class Vasculature(BaseStructure):
         toward the duct's own axis. ",
     )
 
-    def director(self, ctx):
-        from tissue_structures import _director_vessel
+    # ring-feature width, as a fraction of the wall's own thickness
+    _RING_W = 0.5
 
-        return _director_vessel(self, ctx["inst"], ctx["rho"], ctx["spacing"])
+    def wall_fraction(self):
+        return float(self.WALL_IN.v)
+
+    def interior(self, ctx):
+        """The lumen: the core of the territory, inside the wall.
+        """
+        ctx.require("dist_raw", "level", "territory")
+        return ctx.territory & (ctx.dist_raw <= float(self.WALL_IN.v) * ctx.level)
+
+    def director(self, ctx):
+        import tissue_structures as ts
+
+        return ts._director_vessel(self, ctx)
+
+    def features(self, ctx):
+        import tissue_structures as ts
+
+        return {"ring": ts._lumen_ring(self, ctx)}
 
 
 @dataclass
