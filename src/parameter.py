@@ -238,6 +238,15 @@ class CellGeometry(ParamHolder):
         note="nuc beta",
         comment="nuclear spectral tilt. Large -> a few fat lobes; small -> finer crenulation.",
     )
+    NUC_ELONG: P = P(
+        0.3,
+        5.0,
+        0.05,
+        1.6,
+        "nuc_elong",
+        note="nuc elong",
+        comment="volume-preserving aspect ratio of the Nuclei's OWN body frame.",
+    )
     NUC_CORR: P = P(
         0.0,
         1.0,
@@ -1219,6 +1228,16 @@ class BaseStructure(ParamHolder):
             streamlines under a curved one.",
     )
 
+    STIFF: P = P(
+        0.2, 5.0, 0.1, 1.0, "stiff", note="stiff",
+        comment="how hard this structure resists being dented, relative to the others.",
+    )
+
+    ANISO: P = P(
+        0.2, 5.0, 0.1, 1.0, "aniso", note="aniso",
+        comment="how much stiffer this structure is across its own grain than along it.",
+    )
+
     ROUGH: P = P(
         0.0, 0.6, 0.01, 0.25, "rough", note="rough",
         comment="boundary raggedness as a fraction of the structure's own radius, so the knob is \
@@ -1249,19 +1268,24 @@ class BaseStructure(ParamHolder):
         note="spread",
         comment="how far instance seeds scatter from the frame centre, as a fraction of \
             the frame. 0 stacks every instance on one spot; 1 spreads them over \
-            the frame; ABOVE 1 seeds land outside it, so the tile shows only part \
+            the frame; above 1 seeds land outside it, so the tile shows only part \
             of a structure",
     )
     EDGE_UM: P = P(
         0.1, 6.0, 0.1, 1.0, "edge um", note="edge um",
         comment="softness of the membership boundary in microns.",
     )
+    DENSITY: P = P(
+        0.1, 10.0, 0.1, 1.0, "density", tf="log", note="density",
+        comment="how tightly this structure's own cells are packed, relative to the tissue's  \
+            uniform average if the whole tissue were built at TissueGeometry.MIN_DIST.",
+    )
 
     W: P = P(
         0.0,
-        5.0,
+        10.0,
         0.1,
-        1.5,
+        4.5,
         "w",
         note="w",
         comment="weight of this structure's director term, on the same scale as NOISE_W.",
@@ -1381,6 +1405,12 @@ class Ordered(BaseStructure):
     ASPECT: P = P(
         1.0, 8.0, 0.1, 3.0, "aspect", note="aspect",
         comment="a fibre bundle is a rod, so the default here is elongated",
+    )
+    ANISO: P = P(
+        0.2, 5.0, 0.1, 3.0, "aniso", note="aniso",
+        comment="a bundle of rods is the case the anisotropy was written for, so unlike the \
+            BaseStructure default this one is not 1: a vessel pushing on the bundle's flank has \
+            to splay the fibres and meets twice the resistance it would meet at the bundle's end.",
     )
     # a bundle follows the tissue grain, and points along it -- the BaseStructure default
     FLOW: str = "field"
@@ -1567,6 +1597,11 @@ class TissueArchitecture(ParamHolder):
         0.0, 0.01, 0.0005, 0.002, "min island", note="min isle",
         comment="dissolve tissue islands below this fraction of the frame and regrow the same \
             number of voxels onto the surviving tissue, so coverage stays exact.",
+    )
+    CONTACT: P = P(
+        0.0, 1.0, 0.05, 1.0, "contact", note="contact",
+        comment="how two structures share the patch where they touch, blending the additively \
+            weighted (Apollonius) rule at 0 into the power (Laguerre) rule at 1.",
     )
 
     Structures: list = field(default_factory=list)

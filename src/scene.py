@@ -287,15 +287,17 @@ def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, gr
     return out
 
 
-def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius, 
-                      rough, beta, rot, elong, rim, nuc_offset, off_dir, off_mag, grow, 
+def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
+                      rough, beta, rot, elong, rim, nuc_offset, off_dir, off_mag, grow,
                       centre = (0.0, 0.0, 0.0), rough_nuc = None, beta_nuc=None,
-                      euclid_rim=True, nuc_fit_floor=None):
+                      euclid_rim=True, nuc_fit_floor=None, nuc_elong=None):
     """Shared core: both wrappers do exactly this, only the grid differs.
 
     body_grow scales the cell contour (not the nucleus); see cell_fields. Default 1.0 = the
     free shape used everywhere for the mask; > 1 gives the packed body for marker rendering.
     """
+    if nuc_elong is None:
+        nuc_elong = elong
     cn = mix_harmonics(c_cell, c_nuc, nuc_corr)
     r_cell_fn = make_boundary(coeff = c_cell, R = radius, kappa = rough, 
                               beta = beta, L = L, l_min = l_min)
@@ -323,7 +325,7 @@ def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
                         n_scan=33, n_bisect=25, euclid_rim=True)
     ncentre =  np.asarray(centre, float) + to_world(off * (nuc_offset * free * off_mag), rot, elong)
       
-    rho_n, phi_n = body_frame(grid, rot = rot, centre = ncentre, elong=elong)
+    rho_n, phi_n = body_frame(grid, rot = rot, centre = ncentre, elong=nuc_elong)
 
     f = cell_fields(rho_c, phi_c, r_cell_fn(phi_c), 
                     rho_n, phi_n, r_nuc_fn(phi_n), 
@@ -361,6 +363,7 @@ def generate_single_cell_3d(Tape, geom,
         beta = geom.BETA.v,
         L = L, l_min = l_min,
         elong = geom.ELONG.v,
+        nuc_elong = geom.NUC_ELONG.v,
         rim = geom.RIM.v,
         nuc_corr = geom.NUC_CORR.v,
         nuc_offset = geom.NUC_OFFSET.v,
@@ -392,7 +395,8 @@ def stamp_cell(tape, i, geom, grid, sl, centre_world, L = 4, l_min = 2,
         nuc_corr=geom.NUC_CORR.v, nuc_frac=geom.NUC_FRAC.v, radius=geom.RADIUS.v,
         rough=geom.ROUGH.v, beta=geom.BETA.v,
         rot=rotation_matrix(geom.POLAR_DEG.v, geom.AZIM_DEG.v, geom.ROLL_DEG.v),
-        elong=geom.ELONG.v, rim=geom.RIM.v, nuc_offset=geom.NUC_OFFSET.v,
+        elong=geom.ELONG.v, nuc_elong=geom.NUC_ELONG.v, rim=geom.RIM.v,
+        nuc_offset=geom.NUC_OFFSET.v,
         off_dir=tape["u_offdir"][i], off_mag=tape["u_offmag"][i],
         grow=grow, centre=centre_world,
         rough_nuc=geom.NUC_ROUGH.v, beta_nuc=geom.NUC_BETA.v)
@@ -429,6 +433,19 @@ def thin(pts, order, min_dist):
     keep = np.ones(len(pts), bool)
     for i, j in cKDTree(pts).query_pairs(float(min_dist), output_type="ndarray"):
         keep[i if order[i] > order[j] else j] = False
+    return np.flatnonzero(keep)
+
+def thin_density(pts, order, radii):
+    """Matern type-II hard-core thinning with a per-candidateexclusion radius."""
+    radii = np.asarray(radii, float)
+    keep = np.ones(len(pts), bool)
+    pairs = cKDTree(pts).query_pairs(float(radii.max()) if len(radii) else 0.0,
+                                      output_type="ndarray")
+    if len(pairs):
+        i, j = pairs[:, 0], pairs[:, 1]
+        conflict = np.linalg.norm(pts[i] - pts[j], axis=1) <= 0.5 * (radii[i] + radii[j])
+        i, j = i[conflict], j[conflict]
+        keep[np.where(order[i] > order[j], i, j)] = False
     return np.flatnonzero(keep)
 
 
@@ -586,16 +603,41 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
     sup, field, report = ts.build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox,
                                                    L=L, l_min=l_min)
     psi, thr = field["psi"], field["thr"]
-    
-    keep = thin(tape["xyz"], tape["order"], TG.MIN_DIST.v)
-    cx, cy, cz = tape["xyz"][keep].T
     nz, ny, nx = shape
+
+    fc_all = None
+    if field is not None and ARCH.Structures:
+        fc_all = tdir.sample_field(field, tape["xyz"][:, 0], tape["xyz"][:, 1], tape["xyz"][:, 2])
+    if fc_all is not None:
+        log_dens = np.array([np.log(max(float(st.DENSITY.v), 1e-6)) for st in ARCH.Structures])
+        tilt = log_dens @ fc_all["m"]                            # (n_cand,), background = 0
+        radii = TG.MIN_DIST.v * np.exp(-(1.0 / 3.0) * tilt)
+        keep = thin_density(tape["xyz"], tape["order"], radii)
+    else:
+        keep = thin(tape["xyz"], tape["order"], TG.MIN_DIST.v)
+    cx, cy, cz = tape["xyz"][keep].T
     keep = keep[sup[np.clip(cz.astype(int), 0, nz - 1),
                     np.clip(cy.astype(int), 0, ny - 1),
                     np.clip(cx.astype(int), 0, nx - 1)]]
-    
-    # ---- read the field at every centre, then type against it -------------------------
+
     cvox_all = tape["xyz"][keep]
+
+    if field is not None and ARCH.Structures and len(keep):
+        cxs, cys, czs = cvox_all.T
+        surv_lbl = field["labels"][np.clip(czs.astype(int), 0, nz - 1),
+                                    np.clip(cys.astype(int), 0, ny - 1),
+                                    np.clip(cxs.astype(int), 0, nx - 1)]
+        for i, name in enumerate(field["struct_names"]):
+            d = report["density"][name]
+            pts_i = cvox_all[surv_lbl == i]
+            d["survivors"] = int(len(pts_i))
+            if len(pts_i) >= 2:
+                d["nn_mean_vox"] = float(cKDTree(pts_i).query(pts_i, k=2)[0][:, 1].mean())
+            else:
+                d["nn_mean_vox"] = None
+            d["starved"] = bool(d["requested"] > 1.0 and d["raw_in_territory"] > 0
+                                 and d["survivors"] / d["raw_in_territory"] > 0.9)
+
     tree_all = cKDTree(cvox_all)
     lbl_all = list(range(1, len(keep) + 1))
     neigh_all = {n: [j + 1 for j in tree_all.query_ball_point(cvox_all[n - 1], TG.NEIGH_RADIUS.v)
@@ -609,7 +651,8 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
         # 3-D Q needs six interpolations per cell plus one per structure, so sampling per cell in
         # two separate places would be thousands of tiny map_coordinates calls at the cell counts
         # a small MIN_DIST produces.
-        fc = tdir.sample_field(field, cvox_all[:, 0], cvox_all[:, 1], cvox_all[:, 2])
+        fc = ({k: v[..., keep] for k, v in fc_all.items()} if fc_all is not None
+              else tdir.sample_field(field, cvox_all[:, 0], cvox_all[:, 1], cvox_all[:, 2]))
         feat_names = list(field.get("features", {}))          # e.g. ["S", "ring"]
         feat = {n: {"n": fc["n"][:, n - 1], "theta": float(fc["theta"][n - 1]),
                     "m": fc["m"][:, n - 1],

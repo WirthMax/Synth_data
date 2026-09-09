@@ -90,6 +90,34 @@ def _roughen(d, st, noise_i, k_i, cover, n_tot, um_per_vox):
     return (d + np.float32(r * 0.55 * rad) * xi).astype(np.float32)
 
 
+def _grow_axis(st, ctx):
+    """This structure's mechanical axis, in array order (z, y, x) -- the director of the metric it
+    actually grew under, which is what decides which way it is hard to squash.
+    """
+    if ctx.grow_dir is not None:
+        return np.asarray(ctx.grow_dir, np.float32)
+    a = _axis_of(st).astype(np.float32)
+    return np.broadcast_to(a[:, None, None, None], (3,) + tuple(ctx.shape))
+
+
+def _compliance(st, ctx, d):
+    """How far this structure's own boundary yields, per voxel and per direction.
+
+    The contact normal m = grad(d) / |grad(d)| is where the boundary would move; the mechanical
+    axis n is the grain the body grew along. A bundle of rods gives easily when pushed along the
+    rods and hardly at all when pushed across them, so the compliance runs from 1 fully along the
+    grain to 1 / ANISO fully across it:
+
+        c(x) = cos2 + (1 - cos2) / ANISO,    cos2 = (n . m)^2
+
+    """
+    g = np.stack(np.gradient(np.asarray(d, np.float32), *ctx.spacing))   # (z, y, x), as grad_dir
+    m = g / np.maximum(np.linalg.norm(g, axis=0, keepdims=True), 1e-12)
+    cos2 = np.einsum("i...,i...->...", _grow_axis(st, ctx), m) ** 2
+    aniso = max(float(st.ANISO.v), 1e-6)
+    return (cos2 + (1.0 - cos2) / aniso).astype(np.float32)
+
+
 def _director_ordered(st, ctx):
     """An ordered bundle points along the metric it actually grew under: the declared axis if it
     grew uniformly, the blended grain if it grew under the field.
@@ -160,14 +188,17 @@ def prior_field(tape, ARCH, shape, um_per_vox):
     return np.stack([n[2], n[1], n[0]]).astype(np.float32)      # -> array order (z, y, x)
 
 def seed_counts(structs, cover, n_tot, um_per_vox):
-    """Decide how many separate structures (seeds) each structure is foing to spawn
+    """Decide how many (and what size) separate structures (seeds) each structure is foing to spawn
     """
-    out = []
+    out, rad = [], []
     for st in structs:
         a = float(st.FRAC.v) * cover * n_tot
         v = 4.0 / 3.0 * np.pi * (float(st.SIZE_UM.v) / float(um_per_vox)) ** 3
-        out.append(int(np.clip(round(a / max(v, 1.0)), 1, int(round(float(st.N_MAX.v))))))
-    return out
+        k = int(np.clip(round(a / max(v, 1.0)), 1, int(round(float(st.N_MAX.v)))))
+        out.append(k)
+        rad.append(max(float(st.SIZE_UM.v) / float(um_per_vox),
+                       (a / max(k, 1) * 3.0 / (4.0 * np.pi)) ** (1.0 / 3.0)))
+    return out, rad
 
 
 def blend_axis(u, axis, s):
@@ -210,7 +241,8 @@ def build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox, L=4, l_min=2)
             f"must leave room for the interstitium. Lower some, or raise TG.COVER.")
 
     report = {"targets": {}, "realised": {}, "levels": {}, "territory": {},
-              "count": {}, "size_um": {}, "body_kept": {}}
+              "count": {}, "asked": {}, "size_um": {}, "body_kept": {}, "split": {},
+              "density": {}}
     names = [getattr(s, "name", None) or f"structure{i}" for i, s in enumerate(structs)]
 
     # 1) the prior director, over the whole volume
@@ -219,28 +251,52 @@ def build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox, L=4, l_min=2)
     u = prior_field(tape, ARCH, shape, um_per_vox)
 
     # 2) seeds: best-candidate selection over the frozen pool
-    ks = seed_counts(structs, cover, n_tot, um_per_vox)
-    seeds = []
-    for i, st in enumerate(structs):
-        seeds += pp.place_seeds(shape, [ks[i]], np.asarray(tape["struct_seed"][i], float),
-                                 spread=float(np.clip(st.SPREAD.v, 0.05, 1.0)))
+    ks, radii = seed_counts(structs, cover, n_tot, um_per_vox)
+    pool = np.asarray(tape["struct_seed"], float)
+    if len(structs) > pool.shape[0]:
+        raise ValueError(
+            f"{len(structs)} structures but the seed tape holds {pool.shape[0]} blocks. "
+            f"Re-run tape.drawTissueDir(shape={tuple(int(v) for v in shape)}, "
+            f"n_struct={len(structs)}).")
+    seeds = pp.place_seeds(shape, ks, pool,
+                           spread=[float(np.clip(st.SPREAD.v, st.SPREAD.lo, st.SPREAD.hi))
+                                   for st in structs],
+                           radii=radii)
 
     ctxs = [StructureCtx(shape=shape, spacing=spacing, um_per_vox=um_per_vox,
                          u=u, seeds=seeds[i]) for i in range(len(structs))]
 
     # 3) distance fields: each structure names its own metric, then a generic size-invariant
     # roughening that keeps the volume exact
-    dists = []
+    contact = float(ARCH.CONTACT.v)
+    cs = np.array([1.0 / max(float(st.STIFF.v), 1e-6) for st in structs])
+    cs = cs / float(np.exp(np.mean(np.log(np.maximum(cs, 1e-12)))))
+    use_c = (contact > 0.0) and (len(structs) > 1) and (
+        float(np.ptp(cs)) > 0.0 or any(float(st.ANISO.v) != 1.0 for st in structs))
+
+    dists, comp = [], []
     for i, st in enumerate(structs):
         d = st.distance(ctxs[i])
+        # the compliance reads the SMOOTH boundary normal on purpose
+        if use_c:
+            comp.append(cs[i] * _compliance(st, ctxs[i], d))
         d = _roughen(d, st, tape["struct_noise"][i], ks[i], cover, n_tot, um_per_vox)
         dists.append(d.astype(np.float32))
+    Cs = (np.clip(np.stack(comp), 1.0 / pp._C_CLAMP, pp._C_CLAMP).astype(np.float32)
+          if use_c else None)
 
     # 4) the pressure solve: exact volumes.
     walls = np.array([float(st.wall_fraction()) for st in structs])
     targets = np.array([float(st.FRAC.v) * cover * n_tot for st in structs])
     labels, w_i, vols, iters, converged = pp.pressure_pack(shape, seeds, targets, dists,
-                                                            holes=walls)
+                                                            holes=walls, contact=contact,
+                                                            compliance=Cs)
+    if not converged and (contact > 0.0 or Cs is not None):
+        lo, hi = (1.0, 1.0) if Cs is None else (float(Cs.min()), float(Cs.max()))
+        raise ValueError(
+            f"the pressure solve did not converge in {iters} iterations at CONTACT={contact:g} "
+            f"with compliance ratios {lo:.2f}..{hi:.2f}. Lower CONTACT, bring the structures' "
+            f"STIFF values closer together, or lower pressure_pack's damping from 0.9.")
 
     for i, c in enumerate(ctxs):
         c.dist_raw, c.level, c.territory = dists[i], float(w_i[i]), (labels == i)
@@ -281,9 +337,9 @@ def build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox, L=4, l_min=2)
     # 7) membership: a softmin, a partition of unity by construction
     # No sequential discount. That existed only to repair the declaration-order overlap of
     # the old claim rule, and the pressure balance does not create any.
-    keys = np.stack([(dists[i] - w_i[i])
-                     / max(float(structs[i].EDGE_UM.v) / float(um_per_vox), 1e-3)
-                     for i in range(len(structs))])
+    keys = pp.contact_key(np.stack(dists), w_i, contact=contact, compliance=Cs) / np.array(
+        [max(float(st.EDGE_UM.v) / float(um_per_vox), 1e-3) for st in structs],
+        np.float32).reshape((-1,) + (1,) * len(shape))
     ex = np.exp(-np.clip(keys, -60.0, 60.0))
     m = (ex / (1.0 + ex.sum(0, keepdims=True))).astype(np.float32)
 
@@ -331,6 +387,13 @@ def build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox, L=4, l_min=2)
             vol = np.asarray(vol, np.float32)
             features[fname] = vol if fname not in features else np.maximum(features[fname], vol)
 
+    # Density's ceiling: how many raw candidates (before any thinning) fell in each structure's
+    # territory at all.
+    cxr, cyr, czr = np.asarray(tape["xyz"], float).T
+    raw_lbl = labels[np.clip(czr.astype(int), 0, nz - 1),
+                      np.clip(cyr.astype(int), 0, ny - 1),
+                      np.clip(cxr.astype(int), 0, nx - 1)]
+
     # the ledger, as realised
     tissue_i = []
     for i, st in enumerate(structs):
@@ -341,18 +404,45 @@ def build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox, L=4, l_min=2)
         report["realised"][names[i]] = float(tis.sum()) / n_tot
         report["territory"][names[i]] = float(terr.sum()) / n_tot
         report["levels"][names[i]] = float(w_i[i])
-        report["count"][names[i]] = ks[i]
+        report["count"][names[i]] = len(seeds[i])
+        report["asked"][names[i]] = ks[i]
+        # how badly a structure came apart: how many pieces, and the smallest against the largest.
+        cc, ncc = ndi.label(terr, structure=ndi.generate_binary_structure(len(shape), 1))
+        sz = np.bincount(cc.ravel())[1:]
+        report["split"][names[i]] = ((int(ncc), float(sz.min() / sz.max()), int(sz.min()))
+                                     if ncc > 0 else (0, 0.0, 0))
         rad = (float(terr.sum()) / max(ks[i], 1) * 3.0 / (4.0 * np.pi)) ** (1 / 3)
         report["size_um"][names[i]] = (float(st.SIZE_UM.v), rad * float(um_per_vox))
-        # nothing bites a structure any more: the pressure balance shares an interface
-        # instead of carving, so this is 1.0 in BOTH declaration orders
         report["body_kept"][names[i]] = 1.0
+        report["density"][names[i]] = {
+            "requested": float(st.DENSITY.v),
+            "r_pred_vox": float(TG.MIN_DIST.v * max(float(st.DENSITY.v), 1e-6) ** (-1.0 / 3.0)),
+            "raw_in_territory": int((raw_lbl == i).sum()),
+        }
     report["realised"]["lumen"] = float(interior.sum()) / n_tot
     bg = support & ~(labels >= 0)
     report["realised"]["background"] = float(bg.sum()) / n_tot
     report["targets"]["background"] = cover * max(1.0 - frac_sum, 0.0)
     report["cover"] = float(support.sum()) / n_tot
     report["iters"], report["converged"] = int(iters), bool(converged)
+    report["contact"] = {"key": contact,
+                         "stiff": {names[i]: float(st.STIFF.v) for i, st in enumerate(structs)},
+                         "aniso": {names[i]: float(st.ANISO.v) for i, st in enumerate(structs)},
+                         "c_lo": 1.0 if Cs is None else float(Cs.min()),
+                         "c_hi": 1.0 if Cs is None else float(Cs.max()),
+                         # if much of the compliance is pinned at the clamp, STIFF and ANISO are
+                         # past their useful range and the extra is doing nothing
+                         "clamped": 0.0 if Cs is None else float(
+                             ((Cs <= 1.0 / pp._C_CLAMP) | (Cs >= pp._C_CLAMP)).mean())}
+
+    allp = np.array([sd for per in seeds for sd in per], float)
+    allr = np.array([radii[i] for i in range(len(structs)) for _ in seeds[i]], float)
+    if len(allp) > 1:
+        gap = np.linalg.norm(allp[:, None] - allp[None], axis=-1) / (allr[:, None] + allr[None])
+        np.fill_diagonal(gap, np.inf)
+        report["seed_clear"] = float(gap.min())
+    else:
+        report["seed_clear"] = float("inf")
 
     R = np.stack(resp)
     field = {
@@ -361,8 +451,10 @@ def build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox, L=4, l_min=2)
              "resp": (R / (R.sum(0, keepdims=True) + 1e-12)).astype(np.float32),
              "dist": np.stack([np.where(labels == i, dists[i] - w_i[i], np.float32(1e3))
                                for i in range(len(structs))]).astype(np.float32),
+             "levels": np.zeros(len(structs), np.float32),
              "terr": np.stack([labels == i for i in range(len(structs))]),
              "walls": np.array([-(1.0 - walls[i]) * w_i[i] for i in range(len(structs))]),
+             "compliance": Cs, "contact": contact,
              "features": features, "psi": dist_bg.astype(np.float32), "thr": float(margin),
              "labels": labels, "score": score, "lumen": interior,
              "term_names": ["flow", "margin"] + names,

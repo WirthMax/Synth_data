@@ -97,3 +97,31 @@ def sample_field(field, xs, ys, zs):
         out[name] = ndi.map_coordinates(vol, c, order=1, mode="nearest")
     out.setdefault("S", coherence(gap))          # fallback for a bare field with no features
     return out
+
+
+def field_plane(field, z):
+    """One lateral plane, decomposed into exactly the 2-D arrays the plot views expect.
+    """
+    z = int(np.clip(z, 0, field["Q6"].shape[1] - 1))
+    n, gap = decompose(field["Q6"][:, z])
+    th = np.arctan2(n[1], n[0])
+    inp = np.hypot(n[0], n[1])
+    n_st = len(field["dist"])
+    comp = field.get("compliance")
+    return {"n": n.astype(np.float32),
+            "T": (inp * np.stack([np.cos(2 * th), np.sin(2 * th)])).astype(np.float32),
+            "theta": th.astype(np.float32),
+            "tilt": np.abs(n[2]).astype(np.float32),
+            "S": coherence(gap).astype(np.float32),
+            "features": {k: np.asarray(v)[z] for k, v in field.get("features", {}).items()},
+            "resp": field["resp"][:, z],
+            "dist": field["dist"][:, z] if n_st else np.zeros((0,) + th.shape, np.float32),
+            "terr": field["terr"][:, z] if n_st else np.zeros((0,) + th.shape, bool),
+            "lumen": field["lumen"][z] if "lumen" in field else np.zeros(th.shape, bool),
+            "levels": field["levels"], "walls": field["walls"],
+            "compliance": (comp[:, z] if comp is not None
+                           else np.ones((n_st,) + th.shape, np.float32)),
+            "contact": float(field.get("contact", 0.0)),
+            "psi": field["psi"][z], "thr": field["thr"],
+            "m": field["m"][:, z] if len(field["m"]) else np.zeros((0,) + th.shape, np.float32),
+            "term_names": field["term_names"], "z": z}

@@ -2,12 +2,12 @@
 # microns per LATERAL voxel -- the conversion, not a resolution knob
 UM_PER_VOX = 0.325
 # axial voxel this many times COARSER than lateral
-Z_RATIO = 1.0
+Z_RATIO = 4.0
 # (sz, sy, sx) voxel size per axis, in lateral units
 SPACING = (Z_RATIO, 1.0, 1.0)
 
 CELL_VOL = (128, 128, 128)  # single-cell sandbox
-TISSUE_VOL = (40, 160, 160)  # tissue block: 13 x 52 x 52 um at 0.325 um/vox
+TISSUE_VOL = (6, 160, 160)  # tissue block: 13 x 52 x 52 um at 0.325 um/vox
 
 # shape basis
 # lowest SH degree: 0 is pure size (absorbed by the volume normalisation), 1 shifts the centroid

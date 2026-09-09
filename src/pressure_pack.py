@@ -7,6 +7,10 @@ import scipy.ndimage as ndi
 import heapq
 
 
+# how far apart two structures' realised compliances may get.
+_C_CLAMP = 5.0
+
+
 def metric_axes(aspect, ndim):
     """Determinant-normalised half-axes, so vol{d <= w} is the same at any aspect."""
     n = float(ndim)
@@ -105,30 +109,42 @@ def distance_field(shape, seeds, aspect, director=None, axis=None, downsample=2,
     return (up * float(f)).astype(np.float32)
 
 
-def place_seeds(shape, counts, draws, spread=1.0):
-    """Best-candidate ("Mitchell") sampling: each new seed is the FARTHEST of a batch of
-    frozen candidates from every seed already placed. 
-    This is a selction from frozen draws"""
+def place_seeds(shape, counts, draws, spread=1.0, radii=None):
+    """Best-candidate ("Mitchell") selection from frozen draws, for all structures at once.
+    """
     shape = np.asarray(shape, float)
     ndim = len(shape)
-    cand = (0.5 + (np.asarray(draws, float)[:, :ndim] - 0.5) * float(spread)) * shape
-    cand = np.clip(np.rint(cand), 0, shape - 1).astype(int)
-    out, placed, cur = [], [], 0
-    for k in counts:
-        per = []
-        for _ in range(int(k)):
-            batch = cand[cur:cur + 16]
-            cur += 16
-            if batch.size == 0:
+    counts = [int(k) for k in counts]
+    n = len(counts)
+    draws = np.asarray(draws, float)
+    # one structure's block, passed on its own
+    if draws.ndim == 2:
+        draws = draws[None]
+    spread = np.broadcast_to(np.asarray(spread, float).ravel(), (n,))
+    radii = (np.ones(n) if radii is None
+             else np.maximum(np.asarray(radii, float).ravel(), 1.0))
+    # out of frame candidates clamp onto the faces: _prune_to_seeds indexes with these and a
+    # negative index would wrap silently onto the opposite face
+    cand = [np.clip(np.rint((0.5 + (draws[i][:, :ndim] - 0.5) * spread[i]) * shape),
+                    0, shape - 1).astype(int) for i in range(n)]
+    out = [[] for _ in range(n)]
+    pts, prad = [], []
+    for i in np.argsort(-radii, kind="stable"):
+        used = np.zeros(len(cand[i]), bool)
+        for _ in range(counts[i]):
+            free = np.flatnonzero(~used)
+            if free.size == 0:
                 break
-            if placed:
-                d2 = ((batch[:, None, :] - np.asarray(placed)[None]) ** 2).sum(-1).min(1)
-                p = batch[int(np.argmax(d2))]
+            if pts:
+                gap = np.linalg.norm(cand[i][free][:, None, :] - np.asarray(pts)[None], axis=-1)
+                gap = gap / (radii[i] + np.asarray(prad))[None]
+                j = free[int(np.argmax(gap.min(1)))]
             else:
-                p = batch[0]
-            placed.append(tuple(p))
-            per.append(tuple(int(v) for v in p))
-        out.append(per)
+                j = free[0]
+            used[j] = True
+            pts.append(cand[i][j])
+            prad.append(radii[i])
+            out[i].append(tuple(int(v) for v in cand[i][j]))
     return out
 
 def _prune_to_seeds(labels, seeds, conn):
@@ -156,19 +172,43 @@ def _shell_volumes(labels, stack, w, holes, k):
         return float(m.sum())
     return float((m & (stack[k] > holes[k] * w[k])).sum())
 
-def _assign(stack, w, seeds, conn, mask, holes=None):
-    val = stack - w.reshape((-1,) + (1,) * (stack.ndim - 1)).astype(np.float32)
+def contact_key(stack, w, contact=0.0, compliance=None, w0=None):
+    """What each structure bids with at every voxel: negative inside its own free shape, positive
+    outside it, and the smallest bid owns the voxel.
+    """
+    ww = w.reshape((-1,) + (1,) * (stack.ndim - 1)).astype(np.float32)
+    if float(contact) <= 0.0 and compliance is None:
+        return (stack - ww).astype(np.float32)
+    c = float(np.clip(contact, 0.0, 1.0))
+    k = stack - ww
+    if c > 0.0:
+        w0 = float(np.exp(np.mean(np.log(np.maximum(w, 1e-6))))) if w0 is None else float(w0)
+        pw = (stack * stack - ww * ww) / np.float32(2.0 * max(w0, 1e-6))
+        k = np.float32(1.0 - c) * k + np.float32(c) * pw
+    if compliance is not None:
+        k = k / np.maximum(np.asarray(compliance, np.float32), np.float32(1e-6))
+    return k.astype(np.float32)
+
+
+def _assign(stack, w, seeds, conn, mask, holes=None, contact=0.0, compliance=None, w0=None):
+    val = contact_key(stack, w, contact=contact, compliance=compliance, w0=w0)
     arg = np.argmin(val, axis=0).astype(np.int16)
     best = np.take_along_axis(val, arg[None], axis=0)[0]
     labels = np.where(best < 0, arg, np.int16(-1)).astype(np.int16)
     if mask is not None:
         labels[~mask] = -1
-    _prune_to_seeds(labels, seeds, conn)          # the LUMEN stays part of the body
+    _prune_to_seeds(labels, seeds, conn)
+    if contact > 0.0 or compliance is not None:
+        for i, sd in enumerate(seeds):
+            if not (labels == i).any():
+                for sp in sd:
+                    if mask is None or mask[sp]:
+                        labels[sp] = np.int16(i)
     vols = np.array([_shell_volumes(labels, stack, w, holes, k) for k in range(len(seeds))])
     return labels, vols
 
 
-def _grow_to_targets(labels, vols, stack, w, targets, conn, mask):
+def _grow_to_targets(labels, vols, key, targets, conn, mask):
     """Greedy priority growth until every structure hits its target.
     Prune Voxels that got separated from their seed structure"""
     need = {i: int(round(targets[i] - vols[i])) for i in range(len(targets))
@@ -184,8 +224,8 @@ def _grow_to_targets(labels, vols, stack, w, targets, conn, mask):
         if mask is not None:
             fr &= mask
         p = np.flatnonzero(fr.ravel())
-        key = (stack[i].ravel()[p] - w[i]).astype(float)
-        heap.extend(zip(key.tolist(), [i] * p.size, p.tolist()))
+        pri = key[i].ravel()[p].astype(float)
+        heap.extend(zip(pri.tolist(), [i] * p.size, p.tolist()))
     heapq.heapify(heap)
     steps = [int(np.prod(shape[a + 1:])) for a in range(len(shape))]
     while heap and need:
@@ -206,7 +246,7 @@ def _grow_to_targets(labels, vols, stack, w, targets, conn, mask):
                     continue
                 q = p + d * s
                 if flat[q] == -1 and (mask is None or mask.reshape(-1)[q]):
-                    heapq.heappush(heap, (float(stack[i].reshape(-1)[q] - w[i]), i, int(q)))
+                    heapq.heappush(heap, (float(key[i].reshape(-1)[q]), i, int(q)))
     return labels, vols
 
 def lic_smooth(field, director, half_len, step=1.0):
@@ -277,8 +317,8 @@ def carve_to_coverage(labels, coverage, score_extra=None, margin=2.0, hole=None)
     return tissue.reshape(shape), dist, score
 
 
-def pressure_pack(shape, seeds, targets, distances, mask=None, holes=None, damping=0.9,
-                  tol=2e-3, max_iter=250, stall_patience=30):
+def pressure_pack(shape, seeds, targets, distances, mask=None, holes=None, contact=0.0,
+                  compliance=None, damping=0.9, tol=2e-3, max_iter=250, stall_patience=30):
     """Inflate each structure until it occupies exactly `targets[i]` voxels.
 
     Returns (labels, weights, volumes, iterations, converged)."""
@@ -298,12 +338,15 @@ def pressure_pack(shape, seeds, targets, distances, mask=None, holes=None, dampi
     best, last, it, converged = np.inf, 0, 0, False
 
     for it in range(1, max_iter + 1):
-        labels, vols = _assign(stack, w, seeds, conn, mask, holes)
+        # shared by every structure, so the power term's bisector is a plane and not a sphere
+        w0 = float(np.exp(np.mean(np.log(np.maximum(w, 1e-6)))))
+        labels, vols = _assign(stack, w, seeds, conn, mask, holes, contact, compliance, w0)
         err = float(np.abs(targets - vols).max())
         if err / n_tot < tol:
             converged = True
             break
-        # dV/dw is the interface AREA, so dividing the volume error by it turns the error
+        lost = bool(np.any((vols <= 0.0) & (targets > 0.0)))
+        # dV/dw is the interface area, so dividing the volume error by it turns the error
         # into a step in RADIUS units
         surf = np.maximum(ndim * ball ** (1.0 / ndim)
                           * np.maximum(vols, 1.0) ** ((ndim - 1.0) / ndim)
@@ -311,6 +354,8 @@ def pressure_pack(shape, seeds, targets, distances, mask=None, holes=None, dampi
         w += np.clip(damping * (targets - vols) / surf, -cap, cap)
         if err < best - 5e-4 * n_tot:
             best, last = err, it
+        elif lost:
+            last = it
         elif it - last > stall_patience:
             break
     for _ in range(40):
@@ -318,9 +363,12 @@ def pressure_pack(shape, seeds, targets, distances, mask=None, holes=None, dampi
         if not over.any():
             break
         w[over] -= np.maximum(0.35, 0.015 * w[over])
-        labels, vols = _assign(stack, w, seeds, conn, mask, holes)
+        w0 = float(np.exp(np.mean(np.log(np.maximum(w, 1e-6)))))
+        labels, vols = _assign(stack, w, seeds, conn, mask, holes, contact, compliance, w0)
 
-    labels, vols = _grow_to_targets(labels, vols, stack, w, targets, conn, mask)
+    w0 = float(np.exp(np.mean(np.log(np.maximum(w, 1e-6)))))
+    key = contact_key(stack, w, contact=contact, compliance=compliance, w0=w0)
+    labels, vols = _grow_to_targets(labels, vols, key, targets, conn, mask)
     return labels, w, vols, it, converged
 
 

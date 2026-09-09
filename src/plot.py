@@ -3,7 +3,17 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from pathlib import Path
 from scene import _stretch, rotation_matrix
+from scipy import ndimage as _ndi
+from matplotlib.colors import LinearSegmentedColormap as _LSC
 
+TERM_RGB = np.array([[118, 129, 150],      # flow -- the unorganised background
+                     [199, 125, 171],      # margin
+                     [224, 164, 60],       # structures, in declaration order
+                     [69, 191, 174],
+                     [206, 92, 74],
+                     [126, 178, 109],
+                     [162, 140, 214],
+                     [214, 176, 120]]) / 255.0
 
 def NormalizeData(stack, pct=99.5):
     return np.clip(stack / (np.percentile(stack, pct) + 1e-12), 0.0, 1.0)
@@ -355,6 +365,104 @@ def ortho(vol, idx = None, cmap="viridis", vmin=None, vmax=None, title="", mask=
     if title:
         fig.suptitle(title, fontsize=12)
     return fig, axes
+
+
+def palette(n):
+    """`n` term colours, cycling once the table runs out."""
+    return TERM_RGB[np.arange(int(n)) % len(TERM_RGB)]
+
+
+def zone_palette(n):
+    """The same hues, darkened -- zones are a hard label and should not shout over the soft view."""
+    return palette(n) * 0.78
+COH_CMAP = _LSC.from_list(
+    "coh", [np.array([15, 21, 29]) / 255, np.array([39, 95, 92]) / 255,
+            np.array([232, 176, 74]) / 255])
+
+
+def _bil(a, py, px):
+    return _ndi.map_coordinates(a, [py, px], order=1, mode="nearest")
+
+
+def field_lic(T, tex, L=14, step=0.9):
+    """Line-integral convolution: smear frozen noise ALONG the nematic axis.
+    """
+    ny, nx = tex.shape
+    Y, X = np.mgrid[0:ny, 0:nx].astype(float)
+    acc = _bil(tex, Y, X).copy()
+    w = np.ones_like(acc)
+    a0 = 0.5 * np.arctan2(_bil(T[1], Y, X), _bil(T[0], Y, X))
+    for sgn in (1.0, -1.0):
+        px, py = X + 0.5, Y + 0.5
+        dx, dy = sgn * np.cos(a0), sgn * np.sin(a0)
+        alive = np.ones(tex.shape, bool)
+        for _ in range(L):
+            px, py = px + dx * step, py + dy * step
+            alive &= (px >= 0) & (py >= 0) & (px <= nx - 1) & (py <= ny - 1)
+            if not alive.any():
+                break
+            cp, cq = np.clip(py, 0, ny - 1), np.clip(px, 0, nx - 1)
+            acc += np.where(alive, _bil(tex, cp, cq), 0.0)
+            w += alive
+            a = 0.5 * np.arctan2(_bil(T[1], cp, cq), _bil(T[0], cp, cq))
+            cx, cy = np.cos(a), np.sin(a)
+            flip = (cx * dx + cy * dy) < 0          # keep walking the same way round the axis
+            dx, dy = np.where(flip, -cx, cx), np.where(flip, -cy, cy)
+    out = acc / w
+    return np.clip(0.5 + (out - out.mean()) / (3.2 * (out.std() or 1.0)), 0, 1)
+
+
+def tilt_rgb(tilt, support):
+    """How far OUT of the section plane the director points: 0 = lying in it, 1 = through it.
+
+    Worth its own panel because the glyph view cannot show this. A director pointing at the
+    camera has almost no in-plane projection, so it draws as a stub -- indistinguishable from a
+    well-ordered but weak region unless you can see the tilt separately.
+    """
+    rgb = _LSC.from_list("tilt", [np.array([24, 31, 41]) / 255,
+                                  np.array([69, 191, 174]) / 255,
+                                  np.array([232, 176, 74]) / 255])(np.clip(tilt, 0, 1))[..., :3]
+    return np.where(support[..., None], rgb, np.array([10, 14, 20]) / 255.0)
+
+
+def psi_rgb(psi_bar, thr, span=2.5):
+    """Diverging about the threshold: below is cold and dark, above warms to tissue."""
+    t = psi_bar - thr
+    u = np.clip(np.abs(t) / span, 0, 1)[..., None]
+    cold = (np.array([40, 54, 78]) - u * np.array([30, 38, 50])) / 255.0
+    warm = (np.array([46, 60, 76]) + u * np.array([184, 140, 54])) / 255.0
+    return np.where((t < 0)[..., None], cold, warm)
+
+
+def comp_rgb(resp, support):
+    """Soft responsibilities blended as colour -- the typing features, NOT a hard label."""
+    rgb = np.tensordot(resp.transpose(1, 2, 0), palette(resp.shape[0]), axes=(2, 0))
+    return rgb * np.where(support, 1.0, 0.28)[..., None]
+
+
+def zones(resp, support):
+    """Hard argmax of the responsibilities. MAP-READING ONLY -- typing uses the soft values.
+    """
+    z = resp.argmax(0)
+    rgb = np.where(support[..., None], zone_palette(resp.shape[0])[z],
+                   np.array([10, 14, 20]) / 255.0)
+    tot = max(int(support.sum()), 1)
+    frac = [float((support & (z == k)).sum()) / tot for k in range(resp.shape[0])]
+    return z, rgb, frac
+
+
+def zone_edges(z, support):
+    """Boundaries between zones, for overlaying on any other view."""
+    e = np.zeros(z.shape, bool)
+    e[:, :-1] |= (z[:, :-1] != z[:, 1:]) & support[:, :-1] & support[:, 1:]
+    e[:-1, :] |= (z[:-1, :] != z[1:, :]) & support[:-1, :] & support[1:, :]
+    return e
+
+
+def outline(ax, dist, level, color="#e7e3d8", lw=1.0):
+    """Draw one structure's REALISED boundary in a plane, as a contour of d - w.
+    """
+    ax.contour(np.asarray(dist), [float(level)], colors=[color], linewidths=lw)
 
 
 def ortho_rgb(rgb, idx=None, title="", figsize=(13, 4.4)):
