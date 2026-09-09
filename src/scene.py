@@ -1,10 +1,13 @@
+from collections import namedtuple
+
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from parameter import CellContext
 from render import render_marker
 import tissue_direction as tdir
-from sh_numba import sh_eval_numba
+from sh_numba import sh_eval_numba, budget_worst_numba
+from frame_numba import body_frame_numba
 
 # To prevent rerunning things if they already ran once
 _QUAD = None
@@ -185,13 +188,15 @@ def _stretch(elong):
 def body_frame(grid, rot, centre = (0.0, 0.0, 0.0), elong=1.0):
     """Image coordinates -> (rho, phi) in the cell's rotated, un-stretched frame.
     Do this to prevent having to expensively re-derive the cells shape parameters """
-    # 1 Center to the cells coordinate systen
+    stretch = _stretch(elong)
+    if body_frame_numba is not None:
+        rot = np.eye(3) if rot is None else rot
+        return body_frame_numba(grid, rot, centre, stretch)
+    # numpy fallback: 1 centre, 2 rotate so the long axis is body-z, 3 unstretch ellipsoid
     d = (grid - np.asarray(centre, np.float32)).astype(np.float32, copy=False)
-    # 2 Rotate so the long axis in in body-z
     if rot is not None:
         d = d @ np.asarray(rot, np.float32)
-    # 3 Unstretch ellipsoid
-    d = d / _stretch(elong).astype(np.float32)
+    d = d / stretch.astype(np.float32)
     rho = np.sqrt((d * d).sum(-1))
     return rho, d / np.maximum(rho, 1e-6)[..., None]
     
@@ -275,6 +280,16 @@ def nuc_offset_budget(r_cell_fn, r_nuc_fn, off_hat, rim=1.5,
 
     def worst(deltas):
         """Worst-direction residual for each offset in `deltas` (M,) -> (M,), one batched eval."""
+        if budget_worst_numba is not None:
+            re = rim_eff if np.ndim(rim_eff) else np.full(base.shape[0], float(rim_eff))
+            # off_hat may be scalar (the sandbox tape's 2-D u_offdir): numpy broadcasts it across
+            # all three axes, so expand to (3,) to match -- [s,s,s] == delta*s added per coord.
+            off3 = np.broadcast_to(np.asarray(off_hat, np.float64), (3,))
+            return budget_worst_numba(np.ascontiguousarray(deltas, np.float64),
+                                      np.ascontiguousarray(off3, np.float64),
+                                      np.ascontiguousarray(base, np.float64),
+                                      np.ascontiguousarray(re, np.float64),
+                                      r_cell_fn.c, float(r_cell_fn.scale))
         p = deltas[:, None, None] * off_hat + base                                # (M, n, 3)
         rho = np.linalg.norm(p, axis=-1)
         rcp = r_cell_fn(p / np.maximum(rho, 1e-30)[..., None])                     # (M, n)
@@ -338,31 +353,28 @@ def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, gr
     return out
 
 
-def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
-                      rough, beta, rot, elong, rim, nuc_offset, off_dir, off_mag, grow,
-                      centre = (0.0, 0.0, 0.0), rough_nuc = None, beta_nuc=None,
-                      euclid_rim=True, nuc_fit_floor=None, nuc_elong=None):
-    """Shared core: both wrappers do exactly this, only the grid differs.
+# The grow-independent per-cell fit: boundaries, the offset direction, the nucleus centre and its
+# room budget. Identical for the packing pass (grow=1) and the render pass (grow=GROW), so it is
+# computed once and reused -- only the final cell_fields depends on grow.
+Fit = namedtuple("Fit", "r_cell_fn r_nuc_fn off ncentre free s0 delta")
 
-    body_grow scales the cell contour (not the nucleus); see cell_fields. Default 1.0 = the
-    free shape used everywhere for the mask; > 1 gives the packed body for marker rendering.
-    """
-    if nuc_elong is None:
-        nuc_elong = elong
+
+def _cell_fit(c_cell, c_nuc, L, l_min, nuc_corr, nuc_frac, radius, rough, beta, rot, elong,
+              rim, nuc_offset, off_dir, off_mag, centre, rough_nuc, beta_nuc, euclid_rim,
+              nuc_fit_floor):
+    """The expensive grow-independent work: build both boundaries, fit the nucleus offset."""
     cn = mix_harmonics(c_cell, c_nuc, nuc_corr)
-    r_cell_fn = make_boundary(coeff = c_cell, R = radius, kappa = rough, 
+    r_cell_fn = make_boundary(coeff = c_cell, R = radius, kappa = rough,
                               beta = beta, L = L, l_min = l_min)
     if rough_nuc is None:
         rough_nuc = rough * 0.6
     if rough_nuc is None:
         beta_nuc = beta
-    r_nuc_fn = make_boundary(coeff = cn, R = radius * nuc_frac, kappa = rough_nuc, 
+    r_nuc_fn = make_boundary(coeff = cn, R = radius * nuc_frac, kappa = rough_nuc,
                              beta = beta_nuc, L=L, l_min = l_min)
-    rho_c, phi_c = body_frame(grid = grid, rot = rot, centre = centre, elong=elong)
-    
     off = np.asarray(off_dir, float)
     off = off / (np.linalg.norm(off) + 1e-30)
-    
+
     s0 = nuc_fit_scale(r_cell_fn, r_nuc_fn, rim, euclid_rim=euclid_rim)
     if nuc_fit_floor is not None and s0 < 1.0:
         # Opt-in rescue: shrink the nucleus uniformly. Smooth and isotropic, whereas the clip in
@@ -376,23 +388,50 @@ def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
     # Compute freespace to membrane with rim space
     free = nuc_offset_budget(r_cell_fn, r_nuc_fn, off, rim=rim,
                         n_scan=33, n_fine=129, euclid_rim=True)
-    ncentre =  np.asarray(centre, float) + to_world(off * (nuc_offset * free * off_mag), rot, elong)
-      
-    rho_n, phi_n = body_frame(grid, rot = rot, centre = ncentre, elong=nuc_elong)
+    delta = nuc_offset * free * off_mag
+    ncentre = np.asarray(centre, float) + to_world(off * delta, rot, elong)
+    return Fit(r_cell_fn, r_nuc_fn, off, ncentre, float(free), float(s0), float(delta))
 
-    f = cell_fields(rho_c, phi_c, r_cell_fn(phi_c), 
-                    rho_n, phi_n, r_nuc_fn(phi_n), 
+
+def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
+                      rough, beta, rot, elong, rim, nuc_offset, off_dir, off_mag, grow,
+                      centre = (0.0, 0.0, 0.0), rough_nuc = None, beta_nuc=None,
+                      euclid_rim=True, nuc_fit_floor=None, nuc_elong=None, fit=None):
+    """Shared core: both wrappers do exactly this, only the grid and grow differ.
+
+    body_grow scales the cell contour (not the nucleus); see cell_fields. Default 1.0 = the
+    free shape used everywhere for the mask; > 1 gives the packed body for marker rendering.
+
+    `fit` is the grow-independent bundle from `_cell_fit`. Pass the one stored by the packing
+    pass to skip re-fitting the nucleus (make_boundary/nuc_fit_scale/nuc_offset_budget) on the
+    render pass -- the boundaries and centre are identical, only cell_fields(grow) changes.
+    """
+    if nuc_elong is None:
+        nuc_elong = elong
+    reused = fit is not None
+    if not reused:
+        fit = _cell_fit(c_cell, c_nuc, L, l_min, nuc_corr, nuc_frac, radius, rough, beta, rot,
+                        elong, rim, nuc_offset, off_dir, off_mag, centre, rough_nuc, beta_nuc,
+                        euclid_rim, nuc_fit_floor)
+    r_cell_fn, r_nuc_fn = fit.r_cell_fn, fit.r_nuc_fn
+
+    rho_c, phi_c = body_frame(grid = grid, rot = rot, centre = centre, elong=elong)
+    rho_n, phi_n = body_frame(grid, rot = rot, centre = fit.ncentre, elong=nuc_elong)
+
+    f = cell_fields(rho_c, phi_c, r_cell_fn(phi_c),
+                    rho_n, phi_n, r_nuc_fn(phi_n),
                     rim, grow=grow)
-    h = containment_residual(r_cell_fn, r_nuc_fn, off, nuc_offset * free * off_mag, rim,
-                             dirs=_quad()[0], euclid_rim=euclid_rim)
-    f["nuc_centre"] = ncentre
+    f["nuc_centre"] = fit.ncentre
     f["r_cell_fn"], f["r_nuc_fn"] = r_cell_fn, r_nuc_fn
-    f["nuc_room"] = float(free)
-    f["nuc_fit_scale"] = float(s0)
-    f["nuc_shaved_frac"] = float((h > 0.0).mean())
-    f["nuc_shaved_max"] = float(h.max())
-    return f
-
+    f["nuc_room"] = fit.free
+    f["nuc_fit_scale"] = fit.s0
+    f["fit"] = fit
+    if not reused:
+        # diagnostics only (nuc_shaved_*); the render pass reuses the fit and never reads them
+        h = containment_residual(r_cell_fn, r_nuc_fn, fit.off, fit.delta, rim,
+                                 dirs=_quad()[0], euclid_rim=euclid_rim)
+        f["nuc_shaved_frac"] = float((h > 0.0).mean())
+        f["nuc_shaved_max"] = float(h.max())
     return f
 
 
@@ -437,11 +476,12 @@ import dataclasses
 
 
 def stamp_cell(tape, i, geom, grid, sl, centre_world, L = 4, l_min = 2,
-               grow=1.0):
+               grow=1.0, fit=None):
     """Tissue: candidate i stamped at (cy, cx, cz) on a local patch.
 
     `grow` sizes the cell contour only; `body_grow` scales the rendered cell contour (see
     cell_fields). They are set together (body_grow=grow) to render markers on the packed body.
+    `fit` reuses the packing pass's nucleus fit (see `_cell_and_nucleus`).
     """
     return _cell_and_nucleus(
         c_cell=tape["sh"][i], c_nuc=tape["sh2"][i], grid=grid[sl], L=L, l_min=l_min,
@@ -452,7 +492,7 @@ def stamp_cell(tape, i, geom, grid, sl, centre_world, L = 4, l_min = 2,
         nuc_offset=geom.NUC_OFFSET.v,
         off_dir=tape["u_offdir"][i], off_mag=tape["u_offmag"][i],
         grow=grow, centre=centre_world,
-        rough_nuc=geom.NUC_ROUGH.v, beta_nuc=geom.NUC_BETA.v)
+        rough_nuc=geom.NUC_ROUGH.v, beta_nuc=geom.NUC_BETA.v, fit=fit)
 
 
 def vox_to_world(pts_xyz, shape, spacing):
@@ -568,7 +608,7 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Panel, CellTypes, Fraction
     labels = np.zeros(shape, np.int32)
     nuc_labels = np.zeros(shape, np.int32)
     tau_img = np.zeros(shape, np.float32)
-    geoms, slices, centres_w = {}, {}, {}
+    geoms, slices, centres_w, fits = {}, {}, {}, {}
 
     for n, i in enumerate(keep, start=1):
         g = cell_geometry(base_geom, tape, i, TG)
@@ -586,7 +626,7 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Panel, CellTypes, Fraction
         labels[sl] = np.where(win, n, labels[sl])
         tau_img[sl] = np.where(win, f["tau"], tau_img[sl])
         nuc_labels[sl] = np.where(win, f["nuc"] * n, nuc_labels[sl])
-        geoms[n], slices[n], centres_w[n] = g, sl, cw
+        geoms[n], slices[n], centres_w[n], fits[n] = g, sl, cw, f["fit"]
         
     # keep only the piece holding the seed; a two-piece "cell" is a wrong annotation
     orphan = 0
@@ -611,7 +651,7 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Panel, CellTypes, Fraction
     neigh = {n: [j for j in v if j in neigh] for n, v in neigh.items()}
 
     info = dict(labels_present=present, cand_idx={n: int(keep[n - 1]) for n in present},
-        geoms=geoms, slices=slices, centres_w=centres_w,
+        geoms=geoms, slices=slices, centres_w=centres_w, fits=fits,
         centres_vox={n: cvox[n - 1] for n in present},
         neighbours=neigh, support=sup, orphan_vox=orphan,
         packing=float((labels > 0).sum() / max(sup.sum(), 1)))
@@ -629,7 +669,7 @@ def build_tissue(tape, TG, shape, base_geom, spacing, Panel, CellTypes, Fraction
             continue
         # the packed body, so a marker fills the claimed territory, not just the free shape
         f = stamp_cell(tape, info["cand_idx"][n], g, grid, sl, info["centres_w"][n],
-                          grow=TG.GROW.v, L=L, l_min=l_min)
+                          grow=TG.GROW.v, L=L, l_min=l_min, fit=info["fits"][n])
         ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
                          gate_noise=tape["gate_noise"][(slice(None),) + sl])
         off = 0
@@ -736,7 +776,7 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
     labels = np.zeros(shape, np.int32)
     nuc_labels = np.zeros(shape, np.int32)
     tau_img = np.zeros(shape, np.float32)
-    geoms, slices, centres_w = {}, {}, {}
+    geoms, slices, centres_w, fits = {}, {}, {}, {}
     g_align = float(ARCH.ALIGN.v) if ARCH is not None else 0.0
 
     for n, i in enumerate(keep, start=1):
@@ -767,7 +807,7 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
         labels[sl] = np.where(win, n, labels[sl])
         tau_img[sl] = np.where(win, f["tau"], tau_img[sl])
         nuc_labels[sl] = np.where(win, f["nuc"] * n, nuc_labels[sl])
-        geoms[n], slices[n], centres_w[n] = g, sl, cw
+        geoms[n], slices[n], centres_w[n], fits[n] = g, sl, cw, f["fit"]
         
     # keep only the piece holding the seed; a two-piece "cell" is a wrong annotation
     orphan = 0
@@ -792,7 +832,7 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
     neigh = {n: [j for j in v if j in neigh] for n, v in neigh.items()}
 
     info = dict(labels_present=present, cand_idx={n: int(keep[n - 1]) for n in present},
-        geoms=geoms, slices=slices, centres_w=centres_w,
+        geoms=geoms, slices=slices, centres_w=centres_w, fits=fits,
         centres_vox={n: cvox[n - 1] for n in present},
         neighbours=neigh, support=sup, orphan_vox=orphan,
         packing=float((labels > 0).sum() / max(sup.sum(), 1)),
@@ -817,7 +857,7 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
             continue
         # the packed body, so a marker fills the claimed territory, not just the free shape
         f = stamp_cell(tape, info["cand_idx"][n], g, grid, sl, info["centres_w"][n],
-                          grow=TG.GROW.v, L=L, l_min=l_min)
+                          grow=TG.GROW.v, L=L, l_min=l_min, fit=info["fits"][n])
         ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
                          gate_noise=tape["gate_noise"][(slice(None),) + sl])
         off = 0
