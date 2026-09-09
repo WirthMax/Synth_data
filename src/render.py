@@ -1,5 +1,8 @@
 from dataclasses import dataclass
 import numpy as np
+import scipy.fft as sfft
+
+from render_numba import localization_numba
 
 
 POOL_NAMES = ["diffuse", "fibrillar", "punctate"]
@@ -7,6 +10,8 @@ N_POOLS = 3
 
 
 def localization_function(x, mu=0.0, width=0.5, sharp=4.0, floor=0.0):
+    if localization_numba is not None:
+        return localization_numba(x, mu, width, sharp, floor)
     f = np.exp(-(np.abs((x - mu) / width) ** sharp))
     return (1.0 - floor) * f + floor
 
@@ -33,8 +38,10 @@ def _freq(shape, spacing=1.0, polar_deg=0.0, azim_deg=0.0):
 
 
 def _filtered(noise, H):
-    """Frozen noise through a transfer function, standardised to zero mean / unit variance."""
-    z = np.fft.irfftn(np.fft.rfftn(noise) * H, s=noise.shape, axes=(0, 1, 2))
+    """Frozen noise through a transfer function, standardised to zero mean / unit variance.
+    scipy's FFT runs multithreaded (workers=-1); these transforms are otherwise the render's
+    dominant cost."""
+    z = sfft.irfftn(sfft.rfftn(noise, workers=-1) * H, s=noise.shape, axes=(0, 1, 2), workers=-1)
     z = z - z.mean()
     return (z / (z.std() + 1e-12)).astype(np.float32)
 

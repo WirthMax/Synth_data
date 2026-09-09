@@ -4,6 +4,7 @@ from scipy.spatial.transform import Rotation as R
 from parameter import CellContext
 from render import render_marker
 import tissue_direction as tdir
+from sh_numba import sh_eval_numba
 
 # To prevent rerunning things if they already ran once
 _QUAD = None
@@ -96,33 +97,78 @@ def sphere_quadrature(n_theta=48, n_phi=96):
     w = np.repeat(wct[:, None], n_phi, 1).ravel() * (2.0 * np.pi / n_phi)
     return u, w
 
+# finite-difference step shared by _rim_scale and its cached basis
+_RIM_EPS = 1e-4
+
+
+def _sh_eval(u, c, L=4, l_min=2):
+    """General SH eval: fused numba kernel for the standard l=2..4 basis, numpy fallback else."""
+    if sh_eval_numba is not None and (L, l_min) == (4, 2):
+        return sh_eval_numba(u, c)
+    return sh_eval(u, c, L, l_min)
+
+
+class Boundary:
+    """Support function r(u) = scale * exp(sum_j c_j Y_j(u)) of one contour.
+    """
+    __slots__ = ("c", "scale", "L", "l_min")
+
+    def __init__(self, c, scale, L=4, l_min=2):
+        self.c = np.ascontiguousarray(c, np.float64)
+        self.scale = float(scale)
+        self.L, self.l_min = L, l_min
+
+    def __call__(self, u):
+        return self.scale * np.exp(_sh_eval(u, self.c, self.L, self.l_min))
+
+    def on_basis(self, B):
+        return self.scale * np.exp(B @ self.c)
+
+
+# Basis matrices on the fixed containment/quadrature directions are identical for every cell, so
+# build each once and reuse. Keyed by the direction array's identity (the dir sets are themselves
+# cached module globals, so their ids are stable).
+_BASIS_BY_ID = {}
+
+
+def _basis_for(dirs, L, l_min):
+    """(B, B_pert) for a cached direction set: B on `dirs`, B_pert on its +/-eps perturbations."""
+    key = (id(dirs), L, l_min)
+    hit = _BASIS_BY_ID.get(key)
+    if hit is None:
+        e = np.eye(3) * _RIM_EPS
+        p = np.concatenate([dirs[None] + e[:, None, :], dirs[None] - e[:, None, :]])   # (6, n, 3)
+        p /= np.linalg.norm(p, axis=-1, keepdims=True)
+        hit = _BASIS_BY_ID[key] = (sh_basis(dirs, L, l_min), sh_basis(p, L, l_min))
+    return hit
+
+
 def make_boundary(coeff, R, kappa, beta, L = 4, l_min = 2):
     """Return r(phi): the support function of one contour, volume normalised to (4/3)pi R^3.
-Coeff holds all the randomness — one frozen row per cell. 
-In 2D the boundary is a Fourier series in the angle φ; in 3D it's the same idea with spherical harmonics over directions on the sphere. 
+Coeff holds all the randomness — one frozen row per cell.
+In 2D the boundary is a Fourier series in the angle φ; in 3D it's the same idea with spherical harmonics over directions on the sphere.
 The coefficients are amplitudes of global patterns, not points: each one perturbs the radius everywhere at once, at its own angular frequency.
-w is a spectral envelope. beta tilts it (how much coarse vs fine detail), and it's then 
+w is a spectral envelope. beta tilts it (how much coarse vs fine detail), and it's then
 renormalised so the total is 4πκ² — which makes rough mean exactly "SD of log-radius", independent of beta and L.
 Multiplying coeff * w realises one specific cell's amplitudes: to be always positive, defined continuously in every direction.
-The only thing left is the size. A quadrature over the sphere measures this shape's volume at scale = 1, 
+The only thing left is the size. A quadrature over the sphere measures this shape's volume at scale = 1,
 and scale is then set so the volume equals (4/3)πR³. So radius is the equivalent-sphere radius, whatever the roughness.
     """
-    # compute w with the spherical harmonics
-    
     # compute the weight for each degree, such that all weights of a degree are equal
     w = sh_degrees(L, l_min).astype(float) ** -float(beta)
     # renormalization factor to ensure the area is correct
     # With this, changing beta only changes the kind of roughness, not the overall size of the cell.
     w = w * (kappa * np.sqrt(4.0 * np.pi) / np.sqrt((w ** 2).sum() + 1e-30))
-    c = w*coeff
-    
-    # Compute quadrate to pinpount size and then scale accordingly
+    c = w * coeff
+
+    # Compute quadrature to pinpoint size and then scale accordingly
     uq, wq = _quad()
-    gq = sh_basis(uq, L, l_min) @ c
+    B_quad, _ = _basis_for(uq, L, l_min)
+    gq = B_quad @ c
     # volume at scale = 1
-    vol = float((np.exp(3.0 * gq) * wq).sum() / 3.0)          
+    vol = float((np.exp(3.0 * gq) * wq).sum() / 3.0)
     scale = R * ((4.0 * np.pi / 3.0) / max(vol, 1e-30)) ** (1.0 / 3.0)
-    return lambda u: scale * np.exp(sh_eval(u, c, L, l_min))
+    return Boundary(c, scale, L, l_min)
 
 def rotation_matrix(polar_deg=0.0, azim_deg=0.0, roll_deg=0.0):
     return R.from_euler('ZYZ', [azim_deg, polar_deg, roll_deg], degrees=True).as_matrix()
@@ -199,50 +245,54 @@ def containment_residual(r_cell_fn, r_nuc_fn, off_hat, delta, rim=1.5, dirs=None
                          euclid_rim=True, rim_eff=None, base=None):
     dirs = fit_directions() if dirs is None else dirs
     if base is None:
-        base = r_nuc_fn(dirs)[:, None] * dirs
+        B, _ = _basis_for(dirs, r_cell_fn.L, r_cell_fn.l_min)
+        base = r_nuc_fn.on_basis(B)[:, None] * dirs
     if rim_eff is None:
         rim_eff = rim * _rim_scale(r_cell_fn, dirs) if euclid_rim else rim
-    p = np.asarray(delta, float) * np.asarray(off_hat, float) + base
+    p = float(delta) * np.asarray(off_hat, float) + base
     rho = np.linalg.norm(p, axis=-1)
     return rho - r_cell_fn(p / np.maximum(rho, 1e-30)[..., None]) + rim_eff
-    
-def _rim_scale(r_cell_fn, dirs, eps=1e-4):
-    e = np.eye(3) * eps
-    p = np.concatenate([dirs[None] + e[:, None, :], dirs[None] - e[:, None, :]])   # (6, n, 3)
-    p /= np.linalg.norm(p, axis=-1, keepdims=True)
-    lg = np.log(np.maximum(r_cell_fn(p), 1e-30))                                   # (6, n)
-    d = (lg[:3] - lg[3:]) / (2 * eps)
+
+def _rim_scale(r_cell_fn, dirs):
+    _, B_pert = _basis_for(dirs, r_cell_fn.L, r_cell_fn.l_min)
+    lg = np.log(np.maximum(r_cell_fn.on_basis(B_pert), 1e-30))                     # (6, n)
+    d = (lg[:3] - lg[3:]) / (2 * _RIM_EPS)
     return np.sqrt(1.0 + (d * d).sum(axis=0))
 
 def nuc_offset_budget(r_cell_fn, r_nuc_fn, off_hat, rim=1.5,
-                      n_scan=33, n_bisect=25, euclid_rim=True):
-    """
+                      n_scan=33, n_fine=129, euclid_rim=True):
+    """Largest offset delta (along off_hat) at which the nucleus still fits inside the cell with
+    the rim clearance. The worst-direction residual is monotone increasing in delta (pushing the
+    nucleus out can only worsen containment), so one batched coarse scan brackets the zero
+    crossing and one batched fine scan locates it.
     """
     dirs = fit_directions(n_theta=24, n_phi=48)
+    B, _ = _basis_for(dirs, r_cell_fn.L, r_cell_fn.l_min)
     off_hat = np.asarray(off_hat, float)
-    base = r_nuc_fn(dirs)[:, None] * dirs
+    base = r_nuc_fn.on_basis(B)[:, None] * dirs                                    # (n, 3)
     rim_eff = rim * _rim_scale(r_cell_fn, dirs) if euclid_rim else rim
+    rc = r_cell_fn.on_basis(B)
 
-    def worst(delta):
-        return containment_residual(r_cell_fn, r_nuc_fn, off_hat, delta, rim, dirs,
-                                    rim_eff=rim_eff, base=base).max()
+    def worst(deltas):
+        """Worst-direction residual for each offset in `deltas` (M,) -> (M,), one batched eval."""
+        p = deltas[:, None, None] * off_hat + base                                # (M, n, 3)
+        rho = np.linalg.norm(p, axis=-1)
+        rcp = r_cell_fn(p / np.maximum(rho, 1e-30)[..., None])                     # (M, n)
+        return (rho - rcp + rim_eff).max(axis=1)
 
-    hi = max(float(np.max(r_cell_fn(dirs))) - float(np.min(np.atleast_1d(rim_eff))), 0.0)
+    hi = max(float(np.max(rc)) - float(np.min(np.atleast_1d(rim_eff))), 0.0)
     if hi <= 0.0:
         return 0.0
     grid = np.linspace(0.0, hi, n_scan)
-    vals = np.array([worst(d) for d in grid])
-    over = np.flatnonzero(vals > 0.0)
+    over = np.flatnonzero(worst(grid) > 0.0)
     if over.size == 0:
         return float(hi)                      # fits at any offset (near-spherical cell)
     k = int(over[0])
     if k == 0:
         return 0.0                            # s0 < 1: infeasible even centred
-    lo, up = float(grid[k - 1]), float(grid[k])
-    for _ in range(n_bisect):
-        mid = 0.5 * (lo + up)
-        lo, up = (lo, mid) if worst(mid) > 0.0 else (mid, up)
-    return lo
+    fine = np.linspace(grid[k - 1], grid[k], n_fine)
+    fover = np.flatnonzero(worst(fine) > 0.0)
+    return float(fine[fover[0] - 1]) if fover.size and fover[0] > 0 else float(fine[0])
 
 
 def nuc_fit_scale(r_cell_fn, r_nuc_fn, rim=1.5, dirs=None, euclid_rim=True):
@@ -256,8 +306,9 @@ def nuc_fit_scale(r_cell_fn, r_nuc_fn, rim=1.5, dirs=None, euclid_rim=True):
     nuc_frac = 0.45, but 0% for nuc_frac <= 0.30.
     """
     dirs = fit_directions() if dirs is None else dirs
+    B, _ = _basis_for(dirs, r_cell_fn.L, r_cell_fn.l_min)
     rim_eff = rim * _rim_scale(r_cell_fn, dirs) if euclid_rim else rim
-    return float(np.min((r_cell_fn(dirs) - rim_eff) / np.maximum(r_nuc_fn(dirs), 1e-30)))
+    return float(np.min((r_cell_fn.on_basis(B) - rim_eff) / np.maximum(r_nuc_fn.on_basis(B), 1e-30)))
 
 
 def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, grow=1.0):
@@ -317,12 +368,14 @@ def _cell_and_nucleus(c_cell, c_nuc, grid, L, l_min, nuc_corr, nuc_frac, radius,
         # Opt-in rescue: shrink the nucleus uniformly. Smooth and isotropic, whereas the clip in
         # `cell_fields_3d` would instead cut a flat facet. Off by default because silently
         # shrinking nuclei would break what `nuc_frac` means.
-        _r_nuc_raw, _s = r_nuc_fn, max(float(s0), float(nuc_fit_floor))
-        r_nuc_fn = (lambda u, _f=_r_nuc_raw, _k=_s: _k * _f(u))
-        
+        # A uniform scale k factors straight through: k * scale * exp(...) is just a Boundary with
+        # scale*k, so the on_basis fast path keeps working.
+        _k = max(float(s0), float(nuc_fit_floor))
+        r_nuc_fn = Boundary(r_nuc_fn.c, r_nuc_fn.scale * _k, r_nuc_fn.L, r_nuc_fn.l_min)
+
     # Compute freespace to membrane with rim space
     free = nuc_offset_budget(r_cell_fn, r_nuc_fn, off, rim=rim,
-                        n_scan=33, n_bisect=25, euclid_rim=True)
+                        n_scan=33, n_fine=129, euclid_rim=True)
     ncentre =  np.asarray(centre, float) + to_world(off * (nuc_offset * free * off_mag), rot, elong)
       
     rho_n, phi_n = body_frame(grid, rot = rot, centre = ncentre, elong=nuc_elong)
