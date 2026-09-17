@@ -94,7 +94,7 @@ PIN_DEGENERATE = (r"noise_components\[0\]\.w$",)
 PIN_GROUNDED = (r"^DET\.",)
 PIN_ARTIFACT = (r"^AR\.",)
 PIN = PIN_DEGENERATE + PIN_GROUNDED + PIN_ARTIFACT
-KEEP = [r"\.scale$", r"\.clust$", r"\.fill$", r"\.s$", r"\.amp$"]
+KEEP = [r"\.scale$", r"\.clust$", r"\.fill$", r"\.s$", r"\.amp$", r"^AR\.", r"^ARCH\."]
 
 
 ARTIFACTS = dict(n_cand=256, n_mode=16)

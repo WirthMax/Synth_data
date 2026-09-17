@@ -3,6 +3,7 @@ from collections import namedtuple
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+import config as cfg
 from parameter import CellContext
 from render import render_marker
 import tissue_direction as tdir
@@ -590,104 +591,6 @@ class TapeDict(dict):
     """dict that also allows attribute access, so it works wherever a Tape does."""
     __getattr__ = dict.__getitem__
 
-def build_tissue(tape, TG, shape, base_geom, spacing, Panel, CellTypes, Fractions,
-                 um_per_vox, L=4, l_min=2, rule=None, pool_bank=None):
-    """Tissue in three phases: geometry, then type assignment, then appearance."""
-    sup = support_mask(w = tape["support3"], XY_scale_vox = TG.SUPPORT_SCALE.v, 
-                    Z_scale_vox = TG.SUPPORT_SCALE_Z.v,
-                    cover = TG.COVER.v)
-    keep = thin(tape["xyz"], tape["order"], TG.MIN_DIST.v)
-    cx, cy, cz = tape["xyz"][keep].T
-    nz, ny, nx = shape
-    keep = keep[sup[np.clip(cz.astype(int), 0, nz - 1),
-                    np.clip(cy.astype(int), 0, ny - 1),
-                    np.clip(cx.astype(int), 0, nx - 1)]]
-    
-    grid = centred_grid_3d(shape, spacing)
-    best = np.full(shape, np.inf, np.float32)
-    labels = np.zeros(shape, np.int32)
-    nuc_labels = np.zeros(shape, np.int32)
-    tau_img = np.zeros(shape, np.float32)
-    geoms, slices, centres_w, fits = {}, {}, {}, {}
-
-    for n, i in enumerate(keep, start=1):
-        g = cell_geometry(base_geom, tape, i, TG)
-        sl = patch_grid(tape["xyz"][i],
-                         reach_px(R=g.RADIUS.v, rough=g.ROUGH.v, elong=g.ELONG.v, grow=TG.GROW.v), 
-                         shape)
-        if any(s.stop - s.start <= 0 for s in sl):
-            continue
-        cw = vox_to_world(tape["xyz"][i], shape, spacing)
-        f = stamp_cell(tape, i, g, grid, sl, cw, L = L, l_min = l_min, grow=1.0)
-
-        # tesselation to decide which cell is closest to each pixel 
-        win = (f["d"] < best[sl]) & (f["d"] <= TG.GROW.v) & sup[sl]
-        best[sl] = np.where(win, f["d"], best[sl])
-        labels[sl] = np.where(win, n, labels[sl])
-        tau_img[sl] = np.where(win, f["tau"], tau_img[sl])
-        nuc_labels[sl] = np.where(win, f["nuc"] * n, nuc_labels[sl])
-        geoms[n], slices[n], centres_w[n], fits[n] = g, sl, cw, f["fit"]
-        
-    # keep only the piece holding the seed; a two-piece "cell" is a wrong annotation
-    orphan = 0
-    for n, slc in enumerate(ndi.find_objects(labels), start=1):
-        if slc is None:
-            continue
-        m = labels[slc] == n
-        cc, k = ndi.label(m)
-        if k > 1:
-            main = 1 + int(np.argmax(np.bincount(cc.ravel())[1:]))
-            drop = m & (cc != main)
-            labels[slc][drop] = 0
-            nuc_labels[slc][drop] = 0
-            tau_img[slc][drop] = 0.0
-            orphan += int(drop.sum())
-    
-    present = sorted(set(np.unique(labels)) - {0})
-    cvox = tape["xyz"][keep]
-    tree = cKDTree(cvox)
-    neigh = {n: [j + 1 for j in tree.query_ball_point(cvox[n - 1], TG.NEIGH_RADIUS.v)
-                 if j + 1 != n] for n in present}
-    neigh = {n: [j for j in v if j in neigh] for n, v in neigh.items()}
-
-    info = dict(labels_present=present, cand_idx={n: int(keep[n - 1]) for n in present},
-        geoms=geoms, slices=slices, centres_w=centres_w, fits=fits,
-        centres_vox={n: cvox[n - 1] for n in present},
-        neighbours=neigh, support=sup, orphan_vox=orphan,
-        packing=float((labels > 0).sum() / max(sup.sum(), 1)))
-    
-    types = assign_types(info, tape, CellTypes, Fractions, rule=rule)
-    
-    names = list(Panel.Markers)
-    out = {m: np.zeros(shape, np.float32) for m in names}
-
-    for n in info["labels_present"]:
-        ctype = CellTypes[types[n]]
-        g, sl = info["geoms"][n], info["slices"][n]
-        win = labels[sl] == n
-        if not win.any():
-            continue
-        # the packed body, so a marker fills the claimed territory, not just the free shape
-        f = stamp_cell(tape, info["cand_idx"][n], g, grid, sl, info["centres_w"][n],
-                          grow=TG.GROW.v, L=L, l_min=l_min, fit=info["fits"][n])
-        ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
-                         gate_noise=tape["gate_noise"][(slice(None),) + sl])
-        off = 0
-        for name, marker in Panel.Markers.items():
-            lvl = ctype.level(name)
-            if lvl > 0.0:
-                img = render_marker(tape=ptape, marker=marker, cell=f, spacing=spacing, geom=g,
-                                    um_per_vox=um_per_vox, edge_softness=0.0, pool_offset=off,
-                                    pool_bank=pool_bank)
-                # the level multiplies the rendered volume, which is exactly scaling amp
-                if lvl != 1.0:
-                    img = img * np.float32(lvl)
-                out[name][sl] = np.where(win, img, out[name][sl])
-            off += len(marker.noise_components)
-    
-    return out, labels, nuc_labels, tau_img, types, info
-
-
 def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes, Fractions,
                  um_per_vox, L=4, l_min=2, rule=None, pool_bank=None):
     """Tissue in three phases: TYPE ASSIGNMENT, then geometry, then appearance."""
@@ -872,6 +775,34 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
                     img = img * np.float32(lvl)
                 out[name][sl] = np.where(win, img, out[name][sl])
             off += len(marker.noise_components)
-    
+
     return out, labels, nuc_labels, tau_img, types, info
+
+
+def artifact_priority(cell2d, art2d):
+    """Artifacts occlude whatever cell sits underneath them."""
+    out = cell2d.copy()
+    out[art2d > 0] = art2d[art2d > 0]
+    return out
+
+
+def build_training_mask(combined2d, detach_gate, detach_threshold=0.5, whole_cell_frac=0.5,
+                         min_area=50):
+    """Cellpose-ready cell-only raster from a combined (cell+artifact, disjoint ids) 2D
+    collapse: a cell is dropped -- as a WHOLE object, never partially erased -- if more than
+    `whole_cell_frac` of its footprint is covered by an artifact or a sufficiently detached/
+    lifted region, or if its area is under `min_area` pixels. Partial erasure was considered and
+    rejected: it can split a single cell into two disconnected pieces under one id, which is
+    worse training data than dropping it entirely.
+    """
+    cell2d_only = np.where(combined2d < cfg.ARTIFACT_ID0, combined2d, 0)
+    exclude = (combined2d >= cfg.ARTIFACT_ID0) | (detach_gate > detach_threshold)
+    out = cell2d_only.copy()
+    for cid in np.unique(cell2d_only):
+        if cid == 0:
+            continue
+        m = cell2d_only == cid
+        if float(exclude[m].mean()) > whole_cell_frac or int(m.sum()) < min_area:
+            out[m] = 0
+    return out
 
