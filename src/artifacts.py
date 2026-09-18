@@ -265,6 +265,7 @@ def build_artifacts(vols, tape, AR, opt, shape, panel, um_per_vox, spacing, geom
         ptape = TapeDict(
             texture_noise=tape["texture_noise"][(slice(None),) + sl],
             gate_noise=tape["gate_noise"][(slice(None),) + sl],
+            seed=tape.seed,
         )
         off = 0
         for name in names:
@@ -302,7 +303,7 @@ def build_artifacts(vols, tape, AR, opt, shape, panel, um_per_vox, spacing, geom
         gain = float(G.GAIN.v) * np.exp(float(G.GAIN_SIGMA.v) * tape["z_art_gain"][int(j)])
         sl, gm = ag["sl"], ag["geom"]
         ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
-                         gate_noise=tape["gate_noise"][(slice(None),) + sl])
+                         gate_noise=tape["gate_noise"][(slice(None),) + sl], seed=tape.seed)
         off = 0
         for name in names:
             m = panel.Markers[name]

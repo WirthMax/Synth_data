@@ -8,6 +8,12 @@ from render_numba import localization_numba
 POOL_NAMES = ["diffuse", "fibrillar", "punctate"]
 N_POOLS = 3
 
+# scipy.fft thread count for the spectral noise-filtering step below -- -1 (all cores) by
+# default, matching historic behaviour. A round-generation worker process that needs to stay
+# single-threaded (OMP_NUM_THREADS=1 etc. alone does not bind scipy.fft, which takes its own
+# explicit `workers` argument) sets `render.FFT_WORKERS = 1` once at process start.
+FFT_WORKERS = -1
+
 
 def localization_function(x, mu=0.0, width=0.5, sharp=4.0, floor=0.0):
     if localization_numba is not None:
@@ -39,9 +45,10 @@ def _freq(shape, spacing=1.0, polar_deg=0.0, azim_deg=0.0):
 
 def _filtered(noise, H):
     """Frozen noise through a transfer function, standardised to zero mean / unit variance.
-    scipy's FFT runs multithreaded (workers=-1); these transforms are otherwise the render's
-    dominant cost."""
-    z = sfft.irfftn(sfft.rfftn(noise, workers=-1) * H, s=noise.shape, axes=(0, 1, 2), workers=-1)
+    scipy's FFT thread count follows module-level `FFT_WORKERS` (-1, all cores, by default);
+    these transforms are otherwise the render's dominant cost."""
+    z = sfft.irfftn(sfft.rfftn(noise, workers=FFT_WORKERS) * H, s=noise.shape, axes=(0, 1, 2),
+                    workers=FFT_WORKERS)
     z = z - z.mean()
     return (z / (z.std() + 1e-12)).astype(np.float32)
 
@@ -95,14 +102,21 @@ def _pool_field(bank_field, j, n_bank, shift_seed):
 
 def render_marker(
     tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0, pool_offset=0,
-    pool_bank=None, shift_seed=0
+    pool_bank=None, shift_seed=None
 ):
     """amp * normalise( sum_k w_k * normalise(loc_k x tex_k) x polarity x env(d) ).
 
     Normalise INSIDE each pool (a pool is a product), ADD across pools (means add), apply
     polarity, then multiply by the SMOOTH boundary envelope and rescale once so the marker's
     mean intensity over the interior AREA is exactly amp.
+
+    `shift_seed=None` (the default) resolves to the tape's OWN seed, so which pool-bank fields
+    get rolled at a wrap is diversified per frame like everything else on the tape, rather than
+    shared across every frame via a fixed literal. Pass an explicit int only to reproduce old
+    (pre-diversification) renders.
     """
+    if shift_seed is None:
+        shift_seed = int(tape.seed)
     mask, tau, phi, d = cell["cell"], cell["tau"], cell["phi"], cell["d"]
     comps = marker.noise_components
     n_pool = tape["texture_noise"].shape[0]
@@ -146,7 +160,7 @@ def render_marker(
     return (marker.amp.v * out / (denom + 1e-12)).astype(np.float32)
 
 def render_image(tape, panel, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0,
-                 expression=None, pool_offset=0, pool_bank=None, shift_seed=0):
+                 expression=None, pool_offset=0, pool_bank=None, shift_seed=None):
     """Render every marker of a CellProfile on one cell. Returns {marker name: volume}."""
     out, offset = {}, pool_offset
     for name, m in panel.Markers.items():

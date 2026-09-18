@@ -1725,6 +1725,30 @@ def set_p(root, path, newp):
         seq[idx] = newp
 
 
+_ROLE_IDX = re.compile(r"^[A-Za-z_]+\d+$")
+
+
+def path_role(path):
+    """Strip the per-instance identifier (marker/cell-type/structure index) from a theta path,
+    so statistics keyed on the result accumulate across different panels/populations instead of
+    one literal composition: `PANEL.Markers.M25.noise_components[2].scale` becomes
+    `PANEL.Markers.*.noise_components[*].scale`.
+
+    A path segment only gets replaced when it is letters followed by digits with nothing else
+    (`M25`, `T012`, `s1`) -- a name with no trailing digits (`DAPI`, `ARCH`, `NUC_OFFSET`) is a
+    fixed identity, not an arbitrary index (DAPI's prior is narrowed and it behaves differently
+    from a generic antibody marker, so it must stay its own role). List indices (`[2]`) always
+    become `[*]`, since they enumerate noise components within one marker, not instances.
+    """
+    out = []
+    for part in path.split("."):
+        name, idx = _split(part)
+        if _ROLE_IDX.match(name):
+            name = "*"
+        out.append(f"{name}[*]" if idx is not None else name)
+    return ".".join(out)
+
+
 def fitted_paths(root, pin=DEFAULT_PIN, keep=None):
     """Sorted, deterministic list of the paths that go into theta."""
     paths = sorted(get_all_parameters(root))

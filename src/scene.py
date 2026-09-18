@@ -762,7 +762,7 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
         f = stamp_cell(tape, info["cand_idx"][n], g, grid, sl, info["centres_w"][n],
                           grow=TG.GROW.v, L=L, l_min=l_min, fit=info["fits"][n])
         ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
-                         gate_noise=tape["gate_noise"][(slice(None),) + sl])
+                         gate_noise=tape["gate_noise"][(slice(None),) + sl], seed=tape.seed)
         off = 0
         for name, marker in Panel.Markers.items():
             lvl = ctype.level(name)

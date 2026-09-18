@@ -113,13 +113,17 @@ class MMAPView(torch.utils.data.Dataset):
     """A view onto the dataset. `idx` selects this split without copying any pixels -- the
     images may be a memmap, and fancy-indexing it would pull the whole split into RAM."""
 
-    def __init__(self, images, theta, idx, augment=False):
+    def __init__(self, images, theta, idx, augment=False, augment_seed=0):
         # (N, H, W, C) uint16, possibly a memmap
         self.x = images
         # (N, d) in [0, 1]
         self.y = theta.astype(np.float32)
         self.idx = np.asarray(idx)
         self.augment = augment
+        # a fresh RNG seeded from (augment_seed, sample index) per __getitem__ call, not one
+        # RNG advanced call-to-call -- so augmentation is a pure function of which sample is
+        # asked for, independent of shuffle order, epoch, or DataLoader worker count.
+        self.augment_seed = augment_seed
 
     def __len__(self):
         return len(self.idx)
@@ -128,14 +132,14 @@ class MMAPView(torch.utils.data.Dataset):
         i = int(self.idx[k])
         a = np.asarray(self.x[i])
         if self.augment:
-            # ToDo: Update with more advanced Augmentation
-            if np.random.rand() < 0.5:
+            rng = np.random.default_rng(self.augment_seed + i)
+            if rng.random() < 0.5:
                 a = a[::-1]
-            if np.random.rand() < 0.5:
+            if rng.random() < 0.5:
                 a = a[:, ::-1]
-            k = np.random.randint(4)
-            if k:
-                a = np.rot90(a, k, axes=(0, 1))
+            r = int(rng.integers(4))
+            if r:
+                a = np.rot90(a, r, axes=(0, 1))
             a = np.ascontiguousarray(a)
         return torch.from_numpy(to_input(a)).permute(2, 0, 1), torch.from_numpy(
             self.y[i]
@@ -161,7 +165,7 @@ def load(path, val_frac=0.2, seed=0):
     va, tr = idx[:n_val], idx[n_val:]
     # index lists, not fancy-indexed copies
     return (
-        MMAPView(images, theta, tr, augment=True),
+        MMAPView(images, theta, tr, augment=True, augment_seed=seed),
         MMAPView(images, theta, va, augment=False),
         paths,
         lo,

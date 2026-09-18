@@ -328,16 +328,20 @@ def worker_samples(n, seed, keep, run_cfg, workers):
         _init_worker(seed, keep, run_cfg)
         yield from map(draw_one, range(n))
         
+# STIFF/ANISO/CONTACT govern tissue_structures' pressure-pack solve, which can fail to converge
+# or blow up under independently-sampled structures (divergent compliance ratios) -- pin them out
+# of theta so every structure stays uniformly stiff/isotropic and CONTACT's compliance-blend path
+# (which only engages when compliance actually varies) never activates. Module-level (not just a
+# make_dataset local) so rounds/composition.py can build an equivalent ParamSpace without
+# duplicating this regex tuple.
+ARCH_PIN = (r"\.STIFF$", r"\.ANISO$", r"^ARCH\.CONTACT$")
+
+
 def make_dataset(a, seed, pool_bank=POOL_BANK):
     struct = panel_structure(a.n_markers, a.n_types, a.expr_frac, struct_seed=seed)
-    ref = generate_world(struct, rng=np.random.default_rng(0), with_artifacts=a.with_artifacts,
+    ref = generate_world(struct, rng=np.random.default_rng(seed), with_artifacts=a.with_artifacts,
                          max_aggregates=a.max_aggregates, max_fussels=a.max_fussels,
                          max_detach_cover=a.max_detach_cover)
-    # STIFF/ANISO/CONTACT govern tissue_structures' pressure-pack solve, which can fail to
-    # converge or blow up under independently-sampled structures (divergent compliance ratios) --
-    # pin them out of theta so every structure stays uniformly stiff/isotropic and CONTACT's
-    # compliance-blend path (which only engages when compliance actually varies) never activates.
-    ARCH_PIN = (r"\.STIFF$", r"\.ANISO$", r"^ARCH\.CONTACT$")
     paths = fitted_paths(ref, pin=DEFAULT_PIN + ARCH_PIN, keep=a.keep)
     lo, hi = bounds(ref, paths)
     run_cfg = dict(struct=struct, pool_bank=pool_bank, paths=paths, with_artifacts=a.with_artifacts,
