@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import yaml
 
-from model import ParamNet, _load_ckpt
+from model import ParamNet, build_model, _load_ckpt
 from data import ShardedThetaImageDataset
 from param_space import ParamSpace
 from composition import CompositionConfig
@@ -80,6 +80,40 @@ def _load_json_if_exists(path):
     return None
 
 
+def _arch_kwargs_equal(a, b):
+    """Dict equality that's array-aware -- `set_transformer`'s arch_kwargs carry numpy index
+    arrays (marker_scatter/global_path_idx), which `!=` can't compare directly."""
+    if set(a.keys()) != set(b.keys()):
+        return False
+    for k in a:
+        va, vb = a[k], b[k]
+        if isinstance(va, np.ndarray) or isinstance(vb, np.ndarray):
+            if not np.array_equal(np.asarray(va), np.asarray(vb)):
+                return False
+        elif va != vb:
+            return False
+    return True
+
+
+def _resolve_arch(train_cfg, ps, in_ch, image_size):
+    """(arch, arch_kwargs) for building a fresh model. `train.width`/`train.depth` stay the
+    top-level knobs for `arch: cnn` (unchanged from before this existed); `arch: set_transformer`
+    reads its hyperparameters from the new `train.arch_kwargs` sub-dict, plus the
+    marker/global reassembly tables derived once from `ps` here."""
+    arch = train_cfg.get("arch", "cnn")
+    if arch == "cnn":
+        return arch, dict(width=int(train_cfg.get("width", 32)),
+                          depth=int(train_cfg.get("depth", 4)))
+    if arch == "set_transformer":
+        mfm = ps.marker_field_map(in_ch)
+        kwargs = dict(train_cfg.get("arch_kwargs", {}))
+        kwargs.setdefault("img_size", image_size)
+        kwargs["marker_scatter"] = mfm["marker_scatter"]
+        kwargs["global_path_idx"] = mfm["global_path_idx"]
+        return arch, kwargs
+    raise ValueError(f"unknown train.arch {arch!r} (expected 'cnn' or 'set_transformer')")
+
+
 def train_round(run_dir, cfg_dict, upto_round, from_scratch=False, device=None, repo_dir=None):
     train_cfg = cfg_dict["train"]
     comp = CompositionConfig.from_dict(cfg_dict["phase1"]["composition"])
@@ -107,20 +141,23 @@ def train_round(run_dir, cfg_dict, upto_round, from_scratch=False, device=None, 
     dl_va = torch.utils.data.DataLoader(val_ds, batch_size=batch)
 
     in_ch, n_out = comp.n_markers, len(ps)
-    width = int(train_cfg.get("width", 32))
-    depth = int(train_cfg.get("depth", 4))
-    model = ParamNet(in_ch, n_out, width=width, depth=depth).to(device)
+    arch, arch_kwargs = _resolve_arch(train_cfg, ps, in_ch, train_ds.image_size)
+    model = build_model(arch, in_ch, n_out, **arch_kwargs).to(device)
 
     warm_started_from = None
     prev_path = checkpoint_path(run_dir, upto_round - 1)
     if not from_scratch and upto_round > 0 and os.path.exists(prev_path):
         ck = _load_ckpt(prev_path, device)
-        if (ck["in_ch"], ck["n_out"], ck["width"], ck["depth"]) != (in_ch, n_out, width, depth):
+        prev_arch = ck.get("arch", "cnn")
+        prev_kwargs = ck.get("arch_kwargs", dict(width=ck.get("width"), depth=ck.get("depth")))
+        if ((ck["in_ch"], ck["n_out"], prev_arch) != (in_ch, n_out, arch)
+                or not _arch_kwargs_equal(prev_kwargs, arch_kwargs)):
             raise RuntimeError(
                 f"cannot warm-start round {upto_round} from {prev_path}: architecture mismatch "
-                f"(in_ch/n_out/width/depth {ck['in_ch']}/{ck['n_out']}/{ck['width']}/"
-                f"{ck['depth']} -> {in_ch}/{n_out}/{width}/{depth}) -- composition and "
-                f"train.width/train.depth must not change within a run"
+                f"(in_ch/n_out/arch {ck['in_ch']}/{ck['n_out']}/{prev_arch} -> "
+                f"{in_ch}/{n_out}/{arch}, arch_kwargs {prev_kwargs} -> {arch_kwargs}) -- "
+                f"composition and train.arch/train.width/train.depth/train.arch_kwargs must not "
+                f"change within a run"
             )
         model.load_state_dict(ck["model"])
         warm_started_from = upto_round - 1
@@ -214,8 +251,8 @@ def train_round(run_dir, cfg_dict, upto_round, from_scratch=False, device=None, 
         config_hash=config_hash(cfg_dict),
         git_commit=git_commit(repo_dir or os.path.dirname(os.path.abspath(__file__))),
         proposal=proposal_used, saturation_state=saturation_state,
-        in_ch=in_ch, n_out=n_out, width=width, depth=depth, paths=ps.paths, lo=ps.lo, hi=ps.hi,
-        best_val_nll=best_val_nll, warm_started_from=warm_started_from,
+        in_ch=in_ch, n_out=n_out, arch=arch, arch_kwargs=arch_kwargs, paths=ps.paths,
+        lo=ps.lo, hi=ps.hi, best_val_nll=best_val_nll, warm_started_from=warm_started_from,
     )
     os.makedirs(os.path.dirname(checkpoint_path(run_dir, upto_round)), exist_ok=True)
     tmp = checkpoint_path(run_dir, upto_round) + ".tmp"

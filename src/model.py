@@ -98,6 +98,225 @@ class ParamNet(nn.Module):
         return (0.5 * (logvar + (z - mu) ** 2 * torch.exp(-logvar))).mean()
 
 
+class _MLP(nn.Module):
+    def __init__(self, d_in, d_hidden, d_out):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, d_hidden), nn.GELU(), nn.Linear(d_hidden, d_out)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _TransformerBlock(nn.Module):
+    """Pre-LN self-attention + MLP, the standard ViT/Transformer encoder layer. Used both inside
+    the per-marker encoder (over spatial patches, WITH a positional embedding) and across markers
+    (over the marker axis, deliberately WITHOUT one -- see `CrossMarkerExchange`)."""
+
+    def __init__(self, d_model, n_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = _MLP(d_model, int(d_model * mlp_ratio), d_model)
+
+    def forward(self, x):
+        h = self.ln1(x)
+        a, _ = self.attn(h, h, h, need_weights=False)
+        x = x + a
+        return x + self.mlp(self.ln2(x))
+
+
+class MarkerEncoder(nn.Module):
+    """Per-marker encoder: a small conv stem (keeps a local inductive bias for the
+    high-frequency noise texture that a large-stride patch embedding would blur past) followed by
+    a ViT-Tiny-scale transformer. Runs on `(N, 1, H, W)` where `N = B * n_markers` -- the marker
+    axis is folded into the batch dimension before this module ever sees the data, so it
+    structurally cannot condition on marker order or count. Every marker channel of every
+    training image is processed by these same weights, which is what makes a ViT-scale encoder
+    reasonable here despite ViTs' usual data hunger: one rendered frame yields `n_markers`
+    independent training examples for this module alone, and synthetic data is unlimited.
+    """
+
+    def __init__(self, img_size, patch_size=16, d_model=128, depth=4, n_heads=4,
+                stem_channels=(16, 32)):
+        super().__init__()
+        c_in = 1
+        stem = []
+        for c_out in stem_channels:
+            stem += [nn.Conv2d(c_in, c_out, 3, stride=2, padding=1),
+                    nn.GroupNorm(math.gcd(8, c_out), c_out), nn.GELU()]
+            c_in = c_out
+        self.stem = nn.Sequential(*stem)
+        stem_stride = 2 ** len(stem_channels)
+        stem_size = img_size // stem_stride
+        pstride = max(1, patch_size // stem_stride)
+        self.patch = nn.Conv2d(c_in, d_model, kernel_size=pstride, stride=pstride)
+        n_side = stem_size // pstride
+        n_patches = n_side * n_side
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.cls, std=0.02)
+        self.blocks = nn.ModuleList(_TransformerBlock(d_model, n_heads) for _ in range(depth))
+        self.ln_out = nn.LayerNorm(d_model)
+        self.d_model = d_model
+
+    def forward(self, x):
+        # x: (N, 1, H, W), N = B * n_markers
+        h = self.patch(self.stem(x))            # (N, d_model, n_side, n_side)
+        h = h.flatten(2).transpose(1, 2)         # (N, n_patches, d_model)
+        h = h + self.pos_embed
+        h = torch.cat([self.cls.expand(h.shape[0], -1, -1), h], dim=1)
+        for blk in self.blocks:
+            h = blk(h)
+        return self.ln_out(h)[:, 0]              # (N, d_model), the CLS summary token
+
+
+class CrossMarkerExchange(nn.Module):
+    """Self-attention over the marker axis, with NO positional encoding -- the one
+    non-negotiable design choice that makes this equivariant to marker order: permuting the input
+    token set permutes the output token set identically, since attention weights are recomputed
+    from token content alone. `n_markers` is small (10-40 in practice) so plain O(n^2) attention
+    is cheap; no inducing-point approximation is needed."""
+
+    def __init__(self, d_model, n_heads, depth=3, mlp_ratio=4.0):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            _TransformerBlock(d_model, n_heads, mlp_ratio) for _ in range(depth)
+        )
+
+    def forward(self, tok):
+        for blk in self.blocks:
+            tok = blk(tok)
+        return tok
+
+
+class PMAPool(nn.Module):
+    """Pooling by Multihead Attention (Set Transformer, Lee et al. 2019): `n_queries` learned
+    query vectors -- independent of marker count/order -- cross-attend over the (unordered)
+    marker tokens as keys/values, giving `n_queries` pooled summary vectors that can each
+    specialise on a different tissue-level aspect. This is the richer, still permutation-invariant
+    replacement for mean pooling: no positional encoding is used here either, so the output is
+    identical regardless of the order the marker tokens arrive in."""
+
+    def __init__(self, d_model, n_heads, n_queries=8):
+        super().__init__()
+        self.queries = nn.Parameter(torch.zeros(1, n_queries, d_model))
+        nn.init.trunc_normal_(self.queries, std=0.02)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ln = nn.LayerNorm(d_model)
+        self.n_queries = n_queries
+
+    def forward(self, tok):
+        q = self.queries.expand(tok.shape[0], -1, -1)
+        pooled, _ = self.attn(q, tok, tok, need_weights=False)
+        return self.ln(pooled)  # (B, n_queries, d_model)
+
+
+class SetParamNet(nn.Module):
+    """Permutation-invariant/equivariant replacement for `ParamNet`: a weight-shared per-marker
+    ViT encoder (`MarkerEncoder`), a cross-marker self-attention exchange with no positional
+    encoding (`CrossMarkerExchange`), a shared per-marker MLP head, and a multi-query
+    attention-pooling global head (`PMAPool`). See `rounds/tests/test_set_paramnet.py
+    ::test_shuffle_invariance` for the executable proof of the invariance claim.
+
+    `marker_scatter`: `(n_markers_total, n_field)` int array/tensor, giving the absolute
+    ParamSpace path index for each (canonical marker slot, per-marker field) pair, or -1 where
+    that field doesn't apply to that marker. `global_path_idx`: `(n_global,)`, the absolute path
+    index for each non-marker-specific parameter. Both are precomputed once from a `ParamSpace`
+    via `ParamSpace.marker_field_map` (see `rounds/param_space.py`) -- this module only ever sees
+    plain index tensors, not `ParamSpace` itself, so `model.py` stays independent of `rounds/`.
+
+    `forward(x, marker_slot=None)`: `marker_slot[c]` is the canonical marker-slot id that input
+    channel `c` actually represents (default: identity, i.e. channel order already matches the
+    canonical/training order). This is what lets the SAME model be probed with a shuffled channel
+    order for the invariance test -- reassembly and the per-marker identity embedding both route
+    through `marker_slot`, not through raw channel position.
+    """
+
+    EPS = ParamNet.EPS
+    to_logit = staticmethod(ParamNet.to_logit)
+    point_estimate = staticmethod(ParamNet.point_estimate)
+    nll = ParamNet.nll
+
+    def __init__(self, in_ch, n_out, marker_scatter, global_path_idx, img_size=160,
+                patch_size=16, d_model=128, enc_depth=4, enc_heads=4, cross_depth=3,
+                cross_heads=4, n_pma_queries=8):
+        super().__init__()
+        marker_scatter = torch.as_tensor(marker_scatter, dtype=torch.long)
+        global_path_idx = torch.as_tensor(global_path_idx, dtype=torch.long)
+        n_markers_total, n_field = marker_scatter.shape
+        n_global = global_path_idx.numel()
+        if in_ch != n_markers_total:
+            raise ValueError(
+                f"in_ch={in_ch} but marker_scatter has {n_markers_total} marker slots -- "
+                f"SetParamNet must be built for the same n_markers the ParamSpace/composition uses"
+            )
+        n_marker_paths = int((marker_scatter >= 0).sum())
+        if n_global + n_marker_paths != n_out:
+            raise ValueError(
+                f"marker_scatter/global_path_idx account for {n_global + n_marker_paths} of "
+                f"{n_out} output paths -- they must exactly partition the full ParamSpace "
+                f"(every path is either global or PANEL.Markers.<name>.*, never both/neither)"
+            )
+        self.register_buffer("marker_scatter", marker_scatter)
+        self.register_buffer("global_path_idx", global_path_idx)
+        self.n_out, self.n_field, self.n_global = n_out, n_field, n_global
+
+        self.marker_id_embed = nn.Embedding(n_markers_total, d_model)
+        self.encoder = MarkerEncoder(img_size, patch_size=patch_size, d_model=d_model,
+                                     depth=enc_depth, n_heads=enc_heads)
+        self.cross_marker = CrossMarkerExchange(d_model, cross_heads, depth=cross_depth)
+        self.marker_head = _MLP(d_model, d_model, 2 * n_field)
+        self.pma = PMAPool(d_model, cross_heads, n_queries=n_pma_queries)
+        self.global_head = _MLP(n_pma_queries * d_model, d_model, 2 * n_global)
+
+    def forward(self, x, marker_slot=None):
+        B, C, H, W = x.shape
+        device = x.device
+        marker_slot = (torch.arange(C, device=device) if marker_slot is None
+                      else marker_slot.to(device=device, dtype=torch.long))
+
+        cls = self.encoder(x.reshape(B * C, 1, H, W)).reshape(B, C, -1)
+        cls = cls + self.marker_id_embed(marker_slot).unsqueeze(0)  # content-based conditioning
+
+        tok = self.cross_marker(cls)  # (B, C, d_model)
+
+        n_field = self.n_field
+        marker_pred = self.marker_head(tok).reshape(B, C, n_field, 2)
+        pooled = self.pma(tok).reshape(B, -1)
+        global_pred = self.global_head(pooled).reshape(B, self.n_global, 2)
+
+        scatter_c = self.marker_scatter[marker_slot]  # (C, n_field) -> path idx or -1
+        valid = scatter_c >= 0
+        combined = torch.cat(
+            [global_pred, marker_pred.reshape(B, C * n_field, 2)], dim=1
+        )
+        gather_idx = torch.empty(self.n_out, dtype=torch.long, device=device)
+        gather_idx[self.global_path_idx] = torch.arange(self.n_global, device=device)
+        flat_pos = self.n_global + torch.arange(C * n_field, device=device).reshape(C, n_field)
+        gather_idx[scatter_c[valid]] = flat_pos[valid]
+
+        out = combined[:, gather_idx, :]
+        mu, raw = out[..., 0], out[..., 1]
+        mid = (LOGVAR_MAX + LOGVAR_MIN) / 2
+        half = (LOGVAR_MAX - LOGVAR_MIN) / 2
+        return mu, mid + half * torch.tanh(raw / half)
+
+
+def build_model(arch, in_ch, n_out, **kwargs):
+    """Dispatch to the requested architecture. `kwargs` holds architecture-specific hyperparams
+    (see checkpoints' `arch_kwargs`); unrecognised keys for the chosen arch surface as a plain
+    TypeError from the constructor, not a silent no-op."""
+    if arch == "cnn":
+        return ParamNet(in_ch, n_out, **kwargs)
+    if arch == "set_transformer":
+        return SetParamNet(in_ch, n_out, **kwargs)
+    raise ValueError(f"unknown model arch {arch!r} (expected 'cnn' or 'set_transformer')")
+
+
 def to_input(adu):
     """uint16 ADU -> network input.
     float32 explicitly: dividing by a numpy float64 scalar would silently upcast, and torch

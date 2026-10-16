@@ -137,6 +137,59 @@ class ParamSpace:
 
     # -- validity (Phase 1: trivially all-True; Phase 2 will give this a real body) -----------
 
+    def marker_field_map(self, n_markers):
+        """Precomputed reassembly table for `model.SetParamNet`: for the fixed canonical channel
+        order `panel_structure` always uses -- `[DAPI, M00, M01, ...]`, a pure function of
+        `n_markers` alone, independent of struct_seed (only the DYE/noise-kind draws are
+        seed-dependent, never the marker NAMES/order) -- which absolute path index each (marker
+        slot, per-marker field) pair maps to, and which absolute path indices are global
+        (non-marker-specific).
+
+        Returns a dict with `marker_scatter` (`(n_markers, n_field)` int array, -1 where that
+        field doesn't apply to that marker), `global_path_idx` (`(n_global,)` int array), and
+        `field_vocab` (the field-identity strings, for debugging/logging).
+
+        NOTE: unlike `self.groups` (`path_role`), list indices are kept LITERAL here (e.g.
+        `noise_components[0].scale` and `noise_components[1].scale` are different vocabulary
+        entries) -- a marker can have up to `comps[1]` (see `panel_structure`) independently
+        parameterised noise components, so collapsing the index the way `path_role` does for
+        cross-marker reporting would silently collide several distinct real paths onto the same
+        output slot and drop the rest.
+        """
+        from config import DAPI_NAME
+        marker_order = [DAPI_NAME] + [f"M{i:02d}" for i in range(n_markers - 1)]
+        marker_slot = {name: c for c, name in enumerate(marker_order)}
+
+        field_vocab = {}
+        marker_path_idx = {}
+        global_path_idx = []
+        for i, path in enumerate(self.paths):
+            parts = path.split(".")
+            if len(parts) >= 3 and parts[0] == "PANEL" and parts[1] == "Markers":
+                name = parts[2]
+                if name not in marker_slot:
+                    raise ValueError(
+                        f"path {path!r} references marker {name!r}, not in the canonical "
+                        f"marker order for n_markers={n_markers}: {marker_order}"
+                    )
+                field_parts = list(parts)
+                field_parts[2] = "*"  # unify the field vocabulary across every marker (incl. DAPI)
+                role = ".".join(field_parts)
+                k = field_vocab.setdefault(role, len(field_vocab))
+                marker_path_idx[(marker_slot[name], k)] = i
+            else:
+                global_path_idx.append(i)
+
+        n_field = len(field_vocab)
+        marker_scatter = -np.ones((len(marker_order), n_field), dtype=np.int64)
+        for (c, k), i in marker_path_idx.items():
+            marker_scatter[c, k] = i
+        return dict(marker_scatter=marker_scatter,
+                    global_path_idx=np.array(global_path_idx, dtype=np.int64),
+                    field_vocab=list(field_vocab.keys()))
+
+    # -- validity (Phase 1: trivially all-True; Phase 2 will give this a real body) -----------
+
     def validity_mask(self, composition=None):
         """Which of `self.paths` are valid theta entries for `composition`.
 

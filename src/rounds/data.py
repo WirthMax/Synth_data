@@ -52,6 +52,10 @@ class ShardedThetaImageDataset(torch.utils.data.Dataset):
     def in_channels(self):
         return self._shards[0].shape[-1]
 
+    @property
+    def image_size(self):
+        return self._shards[0].shape[1]
+
     def __getitem__(self, k):
         si, pos = self._index[k]
         a = np.asarray(self._shards[si][pos])

@@ -22,7 +22,7 @@ import torch
 from data import ShardedThetaImageDataset
 from eval_paths import eval_set_dir
 from evaluate import _predict, per_parameter_stats
-from model import ParamNet, _load_ckpt
+from model import ParamNet, build_model, _load_ckpt
 from param_space import ParamSpace
 from proposal import Proposal, RoundRecord, importance_weights
 from train import _cycle, checkpoint_path, load_config, masked_nll
@@ -105,7 +105,9 @@ def finalize(run_dir, cfg_dict, mode="importance", device=None, repo_dir=None):
     dl = torch.utils.data.DataLoader(train_ds, batch_size=batch, shuffle=True)
 
     ck = _load_ckpt(checkpoint_path(run_dir, r_last), device)
-    model = ParamNet(ck["in_ch"], ck["n_out"], width=ck["width"], depth=ck["depth"]).to(device)
+    arch = ck.get("arch", "cnn")
+    arch_kwargs = ck.get("arch_kwargs", dict(width=ck.get("width"), depth=ck.get("depth")))
+    model = build_model(arch, ck["in_ch"], ck["n_out"], **arch_kwargs).to(device)
     model.load_state_dict(ck["model"])
 
     steps = int(final_cfg.get("steps", 500))
@@ -132,7 +134,7 @@ def finalize(run_dir, cfg_dict, mode="importance", device=None, repo_dir=None):
     final_ckpt_path = os.path.join(run_dir, "checkpoints", "final.pt")
     tmp = final_ckpt_path + ".tmp"
     torch.save(dict(model=model.state_dict(), in_ch=ck["in_ch"], n_out=ck["n_out"],
-                    width=ck["width"], depth=ck["depth"], mode=mode, ess=ess,
+                    arch=arch, arch_kwargs=arch_kwargs, mode=mode, ess=ess,
                     fine_tuned_from_round=r_last, steps=steps, paths=ps.paths), tmp)
     os.replace(tmp, final_ckpt_path)
 

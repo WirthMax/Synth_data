@@ -18,7 +18,7 @@ import torch  # noqa: E402
 
 from data import ShardedThetaImageDataset  # noqa: E402
 from eval_paths import eval_set_dir, require_not_test_path  # noqa: E402
-from model import ParamNet, _load_ckpt  # noqa: E402
+from model import ParamNet, build_model, _load_ckpt  # noqa: E402
 from param_space import ParamSpace  # noqa: E402
 from train import checkpoint_path, load_config  # noqa: E402
 
@@ -194,7 +194,9 @@ def evaluate_round(run_dir, cfg_dict, round_idx, set_kind="val", ckpt_round=None
 
     ckpt_round = ckpt_round if ckpt_round is not None else round_idx
     ck = _load_ckpt(checkpoint_path(run_dir, ckpt_round), device)
-    model = ParamNet(ck["in_ch"], ck["n_out"], width=ck["width"], depth=ck["depth"]).to(device)
+    arch = ck.get("arch", "cnn")
+    arch_kwargs = ck.get("arch_kwargs", dict(width=ck.get("width"), depth=ck.get("depth")))
+    model = build_model(arch, ck["in_ch"], ck["n_out"], **arch_kwargs).to(device)
     model.load_state_dict(ck["model"])
 
     mu, logvar, y = _predict(model, loader, device)
