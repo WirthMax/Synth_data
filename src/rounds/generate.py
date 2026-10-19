@@ -151,8 +151,10 @@ def _render_attempt(index, master_seed, round_idx, attempt, proposal, ps, keep):
             # its own independent seed, not the struct-seeded one ParamSpace's bounds came from.
             world = _build_world(comp, struct, np.random.default_rng(ss_world))
             ps.set_vector(world, u)
-            img, mask, _geojson, cyc = render_frame(world, seed=tape_seed,
-                                                    with_artifacts=comp.with_artifacts)
+            # frame_labels (Phase 2) is produced but not stored in shards yet -- the v3 data path
+            # (Phase 4) will consume it; the flat gen_dataset path is where it is persisted today.
+            img, mask, _geojson, cyc, _frame_labels = render_frame(
+                world, seed=tape_seed, with_artifacts=comp.with_artifacts)
     finally:
         if timeout_s and hasattr(signal, "SIGALRM"):
             signal.alarm(0)

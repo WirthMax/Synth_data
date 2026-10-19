@@ -103,6 +103,18 @@ ARTIFACTS = dict(n_cand=256, n_mode=16)
 # tile is a crop from the slide border, where a shifted cycle has no data and leaves a black band;
 # otherwise the tile is an interior crop and the edge is filled (reflected).
 CYCLE = dict(group_sizes=(1, 2, 3), ref_group_size=1, p_black_bars=0.5)
+
+# ---- Phase 2: exact label export ----
+# a cell is VISIBLE if its 2D cross-section covers at least min_area_px pixels; a type is PRESENT
+# in a tile if it has at least min_visible_cells visible cells. Invisible cells and non-present
+# types become the IGNORE label (255) in type_map, so no loss is charged where there is too little
+# evidence to learn from.
+VIS = dict(min_area_px=15, min_visible_cells=3)
+# context = where a cell sits. Context 0 is always background tissue; the structure KINDS below get
+# indices 1, 2, ... (fixed across samples so C is constant for the model). Add a kind here when a
+# new BaseStructure subclass is introduced.
+CONTEXT_KINDS = ("ordered", "vessel")
+IGNORE_LABEL = 255
 # This should be larger than the possible amount of cells that can be generated
 ARTIFACT_ID0 = 100000
 # ============================================================ amortized inversion

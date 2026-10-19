@@ -1,0 +1,108 @@
+# Default config for the round-based adaptive training loop (rounds/). Copy this file, adjust
+# phase1.composition and run.master_seed for your dataset, and pass --config <your-copy>.yaml to
+# every rounds/*.py command (or just to orchestrate.py, which drives everything else).
+#
+# Images are always stored as raw uint16 ADU counts (not a configurable image_dtype): ADU_MAX
+# (2**BIT_DEPTH - 1, see config.py) exceeds float16's exact-integer range, so storing raw counts
+# as float16 would silently quantise the brightest pixels. Normalisation to float32 happens at
+# load time (model.to_input), unchanged either way.
+
+run:
+  master_seed: 0
+  max_rounds: 12
+  max_total_frames: 30000
+  max_wall_hours: 24
+  lag: 0
+  # absolute interpreter paths -- generate.py/eval_sets.py need synmac's scipy; train.py/
+  # evaluate.py/finalize.py need synmodel's torch. Adjust if your envs live elsewhere.
+  synmac_python: /mnt/Vol_b/miniconda3/envs/synmac/bin/python
+  synmodel_python: /mnt/Vol_b/miniconda3/envs/synmodel/bin/python
+
+generation:
+  workers: 14
+  shard_size: 250
+  # measured spread for the validated 20-marker/30-type/artifacts-on composition was 6.5-50.9s/
+  # frame (single-threaded) -- 180s clears that several times over without masking a genuinely
+  # hung worker for too long. Retune if your composition's geometry solve is markedly slower.
+  render_timeout_s: 180
+  # the existing production log's infeasible-retry rate (COVER vs. lumen/collar conflicts) was
+  # ~0.5-2% at max_structures<=3 -- 0.05 is comfortable headroom, not a measured ceiling for
+  # every possible composition.
+  max_extra_attempts_frac: 0.05
+  max_retries: 5
+  store_masks: false
+
+phase1:
+  composition:
+    # reusing the one composition that already has a validated val_report.json to compare
+    # against, rather than picking a fresh untested one -- change freely for a new dataset, but
+    # note the WHOLE run is locked to one composition (Phase 1); see composition.py.
+    n_markers: 20
+    n_types: 30
+    expr_frac: 0.6
+    struct_seed: 42
+    with_artifacts: true
+    max_aggregates: null
+    max_fussels: null
+    max_detach_cover: null
+  n0: 3000
+  n_per_round: 2000
+
+eval_sets:
+  val_n: 1000
+  test_n: 1000
+  stress_n: 0
+
+proposal:
+  # prior == hard bounds (Option A, agreed in planning) -- every parameter's default draw
+  # already covers its full declared range, so alpha_prior/bins only matter once the policy
+  # starts reshaping specific parameters' marginals.
+  alpha_prior: 0.5
+  bins: 10
+  widen: false
+
+policy:
+  top_m: 3
+  nmse_floor: 0.05
+  delta_min: 0.02
+  patience: 2
+  max_ratio: 3.0
+  min_bin_count: 30
+  prior_mix: 0.3
+  ema: 0.5
+  exclude: []
+
+train:
+  # no evidence base yet (the only existing run was epoch-based, 200 epochs / batch 16, with no
+  # per-step loss curve saved) -- ship as an explicit placeholder and retune from round 0's own
+  # train_log.jsonl once it exists, not a measured recommendation.
+  steps_per_round: 4000
+  warmup_steps: 400
+  eval_every_steps: 400
+  early_stopping_patience: 3
+  beta_nll: null
+  max_bad_steps: 20
+  batch: 16
+  lr: 0.0003
+  # arch: cnn keeps the original residual-CNN ParamNet (width/depth above apply only to it, and
+  # are ignored for set_transformer). arch: set_transformer is the marker-permutation-invariant
+  # ViT + cross-marker-attention + multi-query-pooling replacement (model.SetParamNet) -- see
+  # the architecture plan for the invariance argument and rounds/tests/test_set_paramnet.py for
+  # its executable proof. Its own hyperparameters live under arch_kwargs, not here.
+  width: 32
+  depth: 4
+  arch: set_transformer
+  arch_kwargs:
+    patch_size: 16
+    d_model: 128
+    enc_depth: 4       # per-marker ViT encoder depth
+    enc_heads: 4
+    cross_depth: 3     # cross-marker exchange depth (self-attention, no positional encoding)
+    cross_heads: 4
+    n_pma_queries: 8   # learned global-pooling queries (replaces mean pooling)
+
+finalize:
+  mode: importance
+  steps: 500
+  batch: 16
+  lr: 0.0001

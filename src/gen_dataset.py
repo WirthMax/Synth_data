@@ -8,6 +8,7 @@ from plot import plot_surface_xyz_inline, plot_surface_xyz_html, plot_surface_rg
 from optics import kryostat, psf_project, mask_collapse, detector
 from artifacts import build_artifacts, detachment_map, lift_slab, extend_z, lift_project
 from geojson_export import build_frame_geojson
+from labels_export import build_frame_labels
 from parameter import (P, CellGeometry, MarkerPanel, PanelMarker, CellType, Detector,
                        BlobNoise, ClusterNoise, NetworkNoise, FibreNoise, SheetNoise,
                        Optics, TissueGeometry, Vasculature, Ordered, TissueArchitecture,
@@ -230,7 +231,7 @@ def render_frame(world, seed, pool_bank=POOL_BANK, with_artifacts=False):
     if with_artifacts:
         tape.drawArtifacts(shape=shape, **cfg.ARTIFACTS)
 
-    vols, labels, _nuc_labels, _tau_img, _types_by_id, info = build_tissue_V2(
+    vols, labels, nuc_labels3d, _tau_img, types_by_id, info = build_tissue_V2(
         tape=tape, ARCH=arch, TG=tg, shape=shape, base_geom=world["CELL"],
         spacing=SPACING, Panel=panel, CellTypes=types, Fractions=world["FRACTIONS"],
         um_per_vox=UM_PER_VOX, L=L, l_min=L_MIN, pool_bank=pool_bank)
@@ -293,7 +294,11 @@ def render_frame(world, seed, pool_bank=POOL_BANK, with_artifacts=False):
     combined2d = artifact_priority(cell2d, art2d)
     mask = build_training_mask(combined2d, detach_gate)
     geojson = json.dumps(build_frame_geojson(cell2d, art2d))
-    return img, mask.astype(np.int32), geojson, cyc
+    # exact 2D labels (Phase 2): inst/nuc/type_map/context_map + cells table, same optics as cell2d
+    frame_labels = build_frame_labels(
+        cell2d=cell2d, nuc_labels3d=nuc_labels3d, field=info.get("field"), types=types_by_id,
+        info=info, type_names=list(types), opt=opt, shift=shift, n_ext=n_ext)
+    return img, mask.astype(np.int32), geojson, cyc, frame_labels
 
 
 def draw_one(i, max_retries=5):
@@ -323,10 +328,10 @@ def draw_one(i, max_retries=5):
             rng = np.random.default_rng(_W["seed"] + i + offset)
             u = sample_prior(rng, paths)
             set_vector(world, paths, u)
-            img, mask, geojson, cyc = render_frame(
+            img, mask, geojson, cyc, frame_labels = render_frame(
                 world, seed=_W["seed"] + 10_000_000 + i + offset,
                 pool_bank=cfg["pool_bank"], with_artifacts=cfg["with_artifacts"])
-            return i, img, u.astype(np.float32), mask, geojson, cyc
+            return i, img, u.astype(np.float32), mask, geojson, cyc, frame_labels
         except ValueError as e:
             last_err = e
             print(f"  [sample {i}] attempt {attempt + 1}/{max_retries} failed ({e}); retrying "
@@ -388,9 +393,11 @@ def make_dataset(a, seed, pool_bank=POOL_BANK):
     # array), so a later reader can pull exactly the frames its current batch needs:
     # NpzFile.__getitem__ decompresses only the member asked for.
     mask_dict = {}
+    # exact 2D labels (Phase 2): per-frame keys, same NpzFile-per-member streaming as the masks.
+    labels_dict = {}
     t0 = time.time()
 
-    for k, (i, img, u, mask, geojson, cyc) in enumerate(
+    for k, (i, img, u, mask, geojson, cyc, flbl) in enumerate(
             worker_samples(a.n, seed, a.keep, run_cfg, a.workers), 1):
         images[i] = img
         theta[i] = u
@@ -399,6 +406,13 @@ def make_dataset(a, seed, pool_bank=POOL_BANK):
         edge_mode[i] = cyc["edge_mode"]
         mask_dict[f"mask_{i:06d}"] = mask
         mask_dict[f"geojson_{i:06d}"] = np.array(geojson)
+        labels_dict[f"inst_{i:06d}"] = flbl["inst"]
+        labels_dict[f"nuc_{i:06d}"] = flbl["nuc"]
+        labels_dict[f"type_map_{i:06d}"] = flbl["type_map"]
+        labels_dict[f"context_map_{i:06d}"] = flbl["context_map"]
+        labels_dict[f"cells_{i:06d}"] = flbl["cells"]
+        labels_dict[f"type_names_{i:06d}"] = np.array(flbl["type_names"])
+        labels_dict[f"present_{i:06d}"] = flbl["present"]
         sat[i] = float((img >= cfg.ADU_MAX).mean())
         if k % max(1, a.n // 20) == 0 or k == a.n:
             el = time.time() - t0
@@ -408,6 +422,8 @@ def make_dataset(a, seed, pool_bank=POOL_BANK):
     del images
     np.savez_compressed(stem + ".masks.npz", n_frames=a.n, with_artifacts=a.with_artifacts,
                         **mask_dict)
+    np.savez_compressed(stem + ".labels.npz", n_frames=a.n,
+                        context_kinds=np.array(cfg.CONTEXT_KINDS), **labels_dict)
     np.savez(stem + ".meta.npz", theta=theta, paths=np.array(paths), lo=lo, hi=hi,
              seed=seed, names=np.array(ref["PANEL"].names),
              dyes=np.array([ref["PANEL"].fluorophores[k] for k in ref["PANEL"].names]),
