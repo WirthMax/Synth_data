@@ -113,10 +113,11 @@ def render_marker(
     `shift_seed=None` (the default) resolves to the tape's OWN seed, so which pool-bank fields
     get rolled at a wrap is diversified per frame like everything else on the tape, rather than
     shared across every frame via a fixed literal. Pass an explicit int only to reproduce old
-    (pre-diversification) renders.
+    (pre-diversification) renders. When the tape itself has no integer seed (cfg.SEED=None, i.e.
+    a fresh-entropy tape), there is nothing to diversify against, so fall back to 0.
     """
     if shift_seed is None:
-        shift_seed = int(tape.seed)
+        shift_seed = int(tape.seed) if tape.seed is not None else 0
     mask, tau, phi, d = cell["cell"], cell["tau"], cell["phi"], cell["d"]
     comps = marker.noise_components
     n_pool = tape["texture_noise"].shape[0]
