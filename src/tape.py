@@ -144,6 +144,34 @@ class Tape(object):
         self.carve_noise=self.rng.standard_normal(shape, dtype=np.float32)
         
         
+    def drawCycles(self, n_ch, group_sizes=(1, 2, 3), ref_group_size=1):
+        """Imaging-cycle grouping and per-cycle offsets for AR.Cycle (cycle misregistration).
+
+        The grouping is config + tape, NOT a parameter: channel 0 (DAPI, the registration
+        reference) and the next ref_group_size-1 channels form cycle 0, which never moves; the
+        remaining channels are shuffled and cut into consecutive cycles of 1-3 markers. eps_cycle
+        is the per-cycle UNIT offset (the parameter AR.Cycle.SHIFT_PX scales it later), with cycle
+        0 pinned to zero. u_edge_mode picks, per tile, whether a shifted cycle shows a black border
+        (a crop from the slide edge) or a filled one (an interior crop)."""
+        gs = np.asarray(group_sizes)
+        cycle_of = np.zeros(n_ch, dtype=np.int64)
+        rest = self.rng.permutation(np.arange(ref_group_size, n_ch))
+        c, i = 1, 0
+        while i < rest.size:
+            k = int(self.rng.choice(gs))
+            cycle_of[rest[i:i + k]] = c
+            c += 1
+            i += k
+        self.cycle_of = cycle_of
+        self.n_cycle = c  # cycles including cycle 0
+        # one unit offset per cycle; draw the n_ch upper bound so the stream is seed-deterministic
+        # regardless of how the groups fell, then slice. Cycle 0 (the reference) is pinned to zero.
+        eps = self.rng.standard_normal((n_ch, 2), dtype=np.float32)
+        eps[0] = 0.0
+        self.eps_cycle = eps[:c]
+        # per-tile edge behaviour selector (thresholded against p_black_bars by the caller)
+        self.u_edge_mode = float(self.rng.random())
+
     # Add this method to allow bracket access
     def __getitem__(self, key):
         try:

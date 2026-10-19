@@ -145,9 +145,36 @@ def illumination(shape, illum_cv, vignette, tape):
     return np.maximum(rnd * (1.0 - vignette * rr2), 0.0).astype(np.float32)
 
 
+def apply_cycle_misregistration(adu, cycle_of, offsets, mode="reflect"):
+    """Shift each channel by its imaging cycle's residual (dy, dx), in pixels.
+
+    adu is the per-channel float frame (H, W, C); cycle_of[c] is the cycle index of channel c;
+    offsets[j] is cycle j's (dy, dx) in pixels. +dy moves content DOWN (toward larger y), +dx
+    RIGHT (toward larger x). All channels of one cycle move together; the reference cycle (index 0)
+    has offset 0 and is left untouched, as is any channel whose offset is exactly zero -- so a zero
+    shift is bit-identical, with no spline round-trip. mode is passed to ndi.shift: "constant"
+    (cval 0) leaves a black band at the trailing edges, the honest result for a tile cropped from
+    the slide border where the shifted cycle has no data; "reflect" fills the edge, standing in for
+    the neighbouring scan of an interior crop. A cubic shift can ring slightly negative against a
+    black edge; the caller clips to >= 0 afterwards."""
+    out = adu.copy()
+    for c in range(adu.shape[-1]):
+        dy, dx = offsets[cycle_of[c]]
+        if dy == 0.0 and dx == 0.0:
+            continue
+        out[..., c] = ndi.shift(adu[..., c], (float(dy), float(dx)), order=3, mode=mode, cval=0.0)
+    return out
+
+
 def detector(img_psf, profile, det, opt, tape, markers, quantise=False,
-             autofluor = AUTOFLUOR):
+             autofluor = AUTOFLUOR, cycle_of=None, cycle_offsets=None, cycle_mode="reflect"):
     """Turn a clean PSF projection (H, W, C) into a detector frame.
+
+    If cycle_of/cycle_offsets are given, cycle misregistration (AR.Cycle) is applied to the noisy
+    float frame AFTER the camera model and BEFORE clipping/quantisation -- the physical order, since
+    real registration resamples images that have already been acquired. Clipping and rounding are
+    deferred to a single pass after the shift; with no cycle args this is elementwise-identical to
+    the old per-channel clip+round.
     """
     e_per_unit  = det.E_PER_UNIT.v
     read_e      = det.READ_E.v
@@ -184,6 +211,13 @@ def detector(img_psf, profile, det, opt, tape, markers, quantise=False,
         e = np.maximum(sig_e + bg_e, 0.0)
         # shot noise scales as sqrt(signal): bright pixels are noisier
         noisy = e + np.sqrt(e) * tape["z_shot"][k] + read_e * tape["z_read"][k] + dark_e
-        a = np.clip(noisy * adu_per_e + offset_adu, 0.0, 2 ** bit_depth - 1)
-        adu[..., k] = np.rint(a) if quantise else a
+        # unclipped, unrounded ADU -- clip/round happen once, after the optional cycle shift
+        adu[..., k] = noisy * adu_per_e + offset_adu
+
+    if cycle_of is not None:
+        adu = apply_cycle_misregistration(adu, cycle_of, cycle_offsets, cycle_mode)
+
+    np.clip(adu, 0.0, 2 ** bit_depth - 1, out=adu)
+    if quantise:
+        np.rint(adu, out=adu)
     return adu

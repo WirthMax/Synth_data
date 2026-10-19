@@ -98,6 +98,11 @@ KEEP = [r"\.scale$", r"\.clust$", r"\.fill$", r"\.s$", r"\.amp$", r"^AR\.", r"^A
 
 
 ARTIFACTS = dict(n_cand=256, n_mode=16)
+# cycle misregistration (AR.Cycle). Markers are imaged in cycles of 1-3; the reference group
+# (DAPI, the registration target) is cycle 0 and never shifts. p_black_bars is the chance that the
+# tile is a crop from the slide border, where a shifted cycle has no data and leaves a black band;
+# otherwise the tile is an interior crop and the edge is filled (reflected).
+CYCLE = dict(group_sizes=(1, 2, 3), ref_group_size=1, p_black_bars=0.5)
 # This should be larger than the possible amount of cells that can be generated
 ARTIFACT_ID0 = 100000
 # ============================================================ amortized inversion

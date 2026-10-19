@@ -262,7 +262,23 @@ def render_frame(world, seed, pool_bank=POOL_BANK, with_artifacts=False):
         psf = np.stack([psf_project(v, z, opt, panel.Markers[k].fluorophore)
                         for k, (v, z) in subs.items()], -1)
     tape.drawSensor(shape=(shape[1], shape[2], len(panel.names)))
-    adu = detector(psf, panel, det, opt, tape, panel.names, quantise=True)
+    n_ch = len(panel.names)
+    if with_artifacts:
+        # cycle misregistration: group the channels into imaging cycles and shift each cycle on
+        # the already-noisy frame, before quantise. The reference cycle (DAPI) never moves.
+        tape.drawCycles(n_ch=n_ch, group_sizes=cfg.CYCLE["group_sizes"],
+                        ref_group_size=cfg.CYCLE["ref_group_size"])
+        offsets = (float(world["AR"].Cycle.SHIFT_PX.v) * tape.eps_cycle).astype(np.float32)
+        cyc_mode = "constant" if tape.u_edge_mode < cfg.CYCLE["p_black_bars"] else "reflect"
+        adu = detector(psf, panel, det, opt, tape, panel.names, quantise=True,
+                       cycle_of=tape.cycle_of, cycle_offsets=offsets, cycle_mode=cyc_mode)
+        cyc = dict(channel_offsets=offsets[tape.cycle_of].astype(np.float32),
+                   cycle_of=tape.cycle_of.astype(np.int32),
+                   edge_mode=np.int32(1 if cyc_mode == "constant" else 0))
+    else:
+        adu = detector(psf, panel, det, opt, tape, panel.names, quantise=True)
+        cyc = dict(channel_offsets=np.zeros((n_ch, 2), np.float32),
+                   cycle_of=np.zeros(n_ch, np.int32), edge_mode=np.int32(0))
     img = np.clip(adu, 0, 65535).astype(np.uint16)
 
     cell2d, _ = mask_collapse(sub, sub_z, opt, mask_pct=0.95)
@@ -277,7 +293,7 @@ def render_frame(world, seed, pool_bank=POOL_BANK, with_artifacts=False):
     combined2d = artifact_priority(cell2d, art2d)
     mask = build_training_mask(combined2d, detach_gate)
     geojson = json.dumps(build_frame_geojson(cell2d, art2d))
-    return img, mask.astype(np.int32), geojson
+    return img, mask.astype(np.int32), geojson, cyc
 
 
 def draw_one(i, max_retries=5):
@@ -307,10 +323,10 @@ def draw_one(i, max_retries=5):
             rng = np.random.default_rng(_W["seed"] + i + offset)
             u = sample_prior(rng, paths)
             set_vector(world, paths, u)
-            img, mask, geojson = render_frame(world, seed=_W["seed"] + 10_000_000 + i + offset,
-                                              pool_bank=cfg["pool_bank"],
-                                              with_artifacts=cfg["with_artifacts"])
-            return i, img, u.astype(np.float32), mask, geojson
+            img, mask, geojson, cyc = render_frame(
+                world, seed=_W["seed"] + 10_000_000 + i + offset,
+                pool_bank=cfg["pool_bank"], with_artifacts=cfg["with_artifacts"])
+            return i, img, u.astype(np.float32), mask, geojson, cyc
         except ValueError as e:
             last_err = e
             print(f"  [sample {i}] attempt {attempt + 1}/{max_retries} failed ({e}); retrying "
@@ -360,6 +376,12 @@ def make_dataset(a, seed, pool_bank=POOL_BANK):
     images = np.lib.format.open_memmap(stem + ".npy", mode="w+", dtype=np.uint16,
                                        shape=(a.n,) + frame_shape)
     theta = np.zeros((a.n, len(paths)), np.float32)
+    n_ch = frame_shape[-1]
+    # per-sample cycle-misregistration record (metadata, NOT theta): the realized per-channel
+    # (dy, dx) shift, each channel's cycle index, and whether the tile got black edges.
+    channel_offsets = np.zeros((a.n, n_ch, 2), np.float32)
+    cycle_of = np.zeros((a.n, n_ch), np.int32)
+    edge_mode = np.zeros(a.n, np.int32)
     sat = np.zeros(a.n)
     # masks/geojson are single-channel and comparatively tiny, so unlike images they're just
     # collected in RAM and written once at the end -- one key pair PER FRAME (not one big stacked
@@ -368,10 +390,13 @@ def make_dataset(a, seed, pool_bank=POOL_BANK):
     mask_dict = {}
     t0 = time.time()
 
-    for k, (i, img, u, mask, geojson) in enumerate(
+    for k, (i, img, u, mask, geojson, cyc) in enumerate(
             worker_samples(a.n, seed, a.keep, run_cfg, a.workers), 1):
         images[i] = img
         theta[i] = u
+        channel_offsets[i] = cyc["channel_offsets"]
+        cycle_of[i] = cyc["cycle_of"]
+        edge_mode[i] = cyc["edge_mode"]
         mask_dict[f"mask_{i:06d}"] = mask
         mask_dict[f"geojson_{i:06d}"] = np.array(geojson)
         sat[i] = float((img >= cfg.ADU_MAX).mean())
@@ -386,6 +411,7 @@ def make_dataset(a, seed, pool_bank=POOL_BANK):
     np.savez(stem + ".meta.npz", theta=theta, paths=np.array(paths), lo=lo, hi=hi,
              seed=seed, names=np.array(ref["PANEL"].names),
              dyes=np.array([ref["PANEL"].fluorophores[k] for k in ref["PANEL"].names]),
+             channel_offsets=channel_offsets, cycle_of=cycle_of, edge_mode=edge_mode,
              with_artifacts=a.with_artifacts,
              max_aggregates=-1 if a.max_aggregates is None else a.max_aggregates,
              max_fussels=-1 if a.max_fussels is None else a.max_fussels,

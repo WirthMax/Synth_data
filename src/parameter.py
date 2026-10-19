@@ -929,6 +929,31 @@ class Detachment(ParamHolder):
 
 
 @dataclass
+class Cycle(ParamHolder):
+    """Residual misregistration between imaging cycles. MACSIMA does not take the whole panel at
+    once -- it images the markers in rounds (cycles), one to three markers per cycle, and stitches
+    and registers the cycles to each other afterwards. Registration gets them to about a pixel; a
+    small lateral shift survives, the SAME for every channel acquired in one cycle, DIFFERENT
+    between cycles, and zero for the reference cycle (the one carrying the nuclear counterstain,
+    which registration aligns to). This is lateral only -- a rigid translation of each channel, NOT
+    a focus/defocus/z change. It acts after the camera, on the already-noisy frame, because real
+    registration resamples images that have already been acquired."""
+
+    SHIFT_PX: P = P(
+        0.0,
+        3.0,
+        0.1,
+        1.0,
+        "cycle shift",
+        note="cycle shift",
+        comment="SD of the per-cycle (dy, dx) shift, PER AXIS, in pixels of the final frame. The "
+        "reference cycle (DAPI) is always 0 whatever this is. 0 = perfect registration; ~1 px is a "
+        "typical residual after a good stitch; 3 px is a visibly bad one. Orthogonal to blur -- the "
+        "channel moves rigidly, it does not smear.",
+    )
+
+
+@dataclass
 class Artifacts(ParamHolder):
     """Everything about artifacts, hung off the world as `AR` so config.PIN's `^AR\\.` reaches
     all of it."""
@@ -938,6 +963,7 @@ class Artifacts(ParamHolder):
     Aggregate: Aggregate = field(default_factory=Aggregate)
     Mask: ArtifactMask = field(default_factory=ArtifactMask)
     Detachment: Detachment = field(default_factory=Detachment)
+    Cycle: Cycle = field(default_factory=Cycle)
 
 
 @dataclass

@@ -141,6 +141,9 @@ def _render_attempt(index, master_seed, round_idx, attempt, proposal, ps, keep):
             if index in _mock_fail_indices():
                 raise ValueError(f"index {index}: forced failure (ROUNDS_MOCK_FAIL_INDICES)")
             img, mask = _mock_render_frame(comp, u, tape_seed)
+            n_ch = img.shape[-1]
+            cyc = dict(channel_offsets=np.zeros((n_ch, 2), np.float32),
+                       cycle_of=np.zeros(n_ch, np.int32), edge_mode=np.int32(0))
         else:
             # generate_world draws real nuisance randomness (marker defaults, per-type baseline
             # expression, tissue fractions) as a side effect of construction -- exactly
@@ -148,8 +151,8 @@ def _render_attempt(index, master_seed, round_idx, attempt, proposal, ps, keep):
             # its own independent seed, not the struct-seeded one ParamSpace's bounds came from.
             world = _build_world(comp, struct, np.random.default_rng(ss_world))
             ps.set_vector(world, u)
-            img, mask, _geojson = render_frame(world, seed=tape_seed,
-                                               with_artifacts=comp.with_artifacts)
+            img, mask, _geojson, cyc = render_frame(world, seed=tape_seed,
+                                                    with_artifacts=comp.with_artifacts)
     finally:
         if timeout_s and hasattr(signal, "SIGALRM"):
             signal.alarm(0)
@@ -159,7 +162,8 @@ def _render_attempt(index, master_seed, round_idx, attempt, proposal, ps, keep):
     if img.dtype != np.uint16:
         raise ValueError(f"index {index}: image dtype {img.dtype}, expected uint16")
     return dict(u=u.astype(np.float32), img=img, mask=mask, component_id=component_id,
-               n_constant=n_constant)
+               n_constant=n_constant, channel_offsets=cyc["channel_offsets"],
+               cycle_of=cyc["cycle_of"], edge_mode=cyc["edge_mode"])
 
 
 def _build_world(comp, struct, rng):
@@ -250,7 +254,8 @@ def _clean_incomplete_shards(round_dir, n_shards, progress):
                     os.remove(p)
 
 
-def _write_shard(round_dir, shard_idx, images, thetas, masks, comp_ids, n_constants):
+def _write_shard(round_dir, shard_idx, images, thetas, masks, comp_ids, n_constants,
+                 channel_offsets=None, cycle_of=None, edge_modes=None):
     img_path, npz_path = _shard_paths(round_dir, shard_idx)
     img_arr = np.stack(images, axis=0).astype(np.uint16)
     tmp_img = img_path + ".tmp"
@@ -261,6 +266,12 @@ def _write_shard(round_dir, shard_idx, images, thetas, masks, comp_ids, n_consta
     npz_kwargs = dict(u=np.stack(thetas, axis=0).astype(np.float32),
                       component_id=np.array(comp_ids, dtype=np.int32),
                       n_constant_channels=np.array(n_constants, dtype=np.int32))
+    # cycle-misregistration metadata (not theta; consumed by a later model phase). Optional so
+    # older callers that don't pass it still write a valid shard.
+    if channel_offsets is not None:
+        npz_kwargs["channel_offsets"] = np.stack(channel_offsets, axis=0).astype(np.float32)
+        npz_kwargs["cycle_of"] = np.stack(cycle_of, axis=0).astype(np.int32)
+        npz_kwargs["edge_mode"] = np.array(edge_modes, dtype=np.int32)
     if masks is not None:
         npz_kwargs["mask"] = np.stack(masks, axis=0).astype(np.int32)
     tmp_npz = npz_path + ".tmp"
@@ -350,6 +361,7 @@ def generate_samples(output_dir, master_seed, namespace_id, n, proposal, comp, g
                     continue
                 target = min(shard_size, n - shard_idx * shard_size)
                 images, thetas, masks, comp_ids, n_consts, rows = [], [], [], [], [], []
+                ch_offsets, cyc_ofs, edge_modes = [], [], []
 
                 while len(images) < target:
                     need = target - len(images)
@@ -376,13 +388,17 @@ def generate_samples(output_dir, master_seed, namespace_id, n, proposal, comp, g
                         thetas.append(result["u"])
                         comp_ids.append(result["component_id"])
                         n_consts.append(result["n_constant"])
+                        ch_offsets.append(result["channel_offsets"])
+                        cyc_ofs.append(result["cycle_of"])
+                        edge_modes.append(result["edge_mode"])
                         if store_masks:
                             masks.append(result["mask"])
                         rows.append((i, shard_idx, len(images) - 1, result["component_id"],
                                     result["attempts"], result["n_constant"]))
 
                 _write_shard(output_dir, shard_idx, images, thetas,
-                            masks if store_masks else None, comp_ids, n_consts)
+                            masks if store_masks else None, comp_ids, n_consts,
+                            ch_offsets, cyc_ofs, edge_modes)
                 for row in rows:
                     writer.writerow(row)
                 mf.flush()
