@@ -234,7 +234,8 @@ def render_frame(world, seed, pool_bank=POOL_BANK, with_artifacts=False):
     vols, labels, nuc_labels3d, _tau_img, types_by_id, info = build_tissue_V2(
         tape=tape, ARCH=arch, TG=tg, shape=shape, base_geom=world["CELL"],
         spacing=SPACING, Panel=panel, CellTypes=types, Fractions=world["FRACTIONS"],
-        um_per_vox=UM_PER_VOX, L=L, l_min=L_MIN, pool_bank=pool_bank)
+        um_per_vox=UM_PER_VOX, L=L, l_min=L_MIN, pool_bank=pool_bank,
+        compositions=world.get("COMPOSITIONS"))
 
     sub, sub_z = kryostat(labels, opt)
 
@@ -337,6 +338,36 @@ def draw_one(i, max_retries=5):
             print(f"  [sample {i}] attempt {attempt + 1}/{max_retries} failed ({e}); retrying "
                  f"with a perturbed seed", flush=True)
     raise RuntimeError(f"sample {i} failed after {max_retries} attempts") from last_err
+
+def draw_flexible(i, seed, curriculum=None, with_artifacts=False, pool_bank=POOL_BANK,
+                  max_retries=5):
+    """One flexible-mode sample (plan Phase 3): a freshly drawn panel / lineage type set /
+    compositions, rendered through the same pipeline as fixed mode, returning theta v3 instead of
+    the flat u vector. Mirrors `draw_one`'s bounded-retry on an infeasible architecture draw.
+
+    Returns (i, img, theta_v3_flat, mask, geojson, cyc, frame_labels). theta_v3_flat is the flat
+    numpy dict from flexible_types.theta_v3 -- directly np.savez-able; persisting it as dataset
+    shards (and the loader that reads it) is the Phase 6 seam.
+    """
+    import flexible_types as ft
+    last_err = None
+    for attempt in range(max_retries):
+        offset = attempt * 1_000_000_000
+        try:
+            world = ft.build_flexible_world(
+                np.random.default_rng(seed + 500_000 + i + offset),
+                curriculum=curriculum, dyes=cfg.DYES, detector=Detector(**cfg.DETECTOR))
+            img, mask, geojson, cyc, frame_labels = render_frame(
+                world, seed=seed + 10_000_000 + i + offset,
+                pool_bank=pool_bank, with_artifacts=with_artifacts)
+            theta = ft.theta_v3(world, cyc=cyc)
+            return i, img, theta, mask, geojson, cyc, frame_labels
+        except ValueError as e:
+            last_err = e
+            print(f"  [flex sample {i}] attempt {attempt + 1}/{max_retries} failed ({e}); "
+                 f"retrying with a perturbed seed", flush=True)
+    raise RuntimeError(f"flexible sample {i} failed after {max_retries} attempts") from last_err
+
 
 def worker_samples(n, seed, keep, run_cfg, workers):
     """Yield (index, image, theta) for every sample, from one process or from a pool."""

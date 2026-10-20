@@ -117,6 +117,48 @@ CONTEXT_KINDS = ("ordered", "vessel")
 IGNORE_LABEL = 255
 # This should be larger than the possible amount of cells that can be generated
 ARTIFACT_ID0 = 100000
+# ---- Phase 3: flexible cell types (plan 3.0, 3.7) ----
+# type_mode selects the generator's biology sampler. "fixed" is the original per-dataset layout
+# (panel/types/structures frozen once); "flexible" redraws the whole panel, lineage-tree type set
+# and per-context compositions per sample (flexible_types.build_flexible_world). "fixed" must stay
+# bit-identical to the pre-Phase-3 generator, so it is the default until Phase 6 flips it.
+# CURRICULUM is the set of knobs that widen the flexible prior across training rounds (plan 3.7):
+# the START column is the gentle early-round prior, FINAL the full prior the final fine-tune uses.
+# A round picks values between the two; the final fine-tune (plan 6.4) must use FINAL only.
+GENERATOR = dict(
+    type_mode="fixed",
+    curriculum=dict(
+        #              knob                 start        final
+        k_true_range=dict(start=(2, 8),   final=(1, 30)),   # number of distinct cell types
+        max_depth=dict(start=1,           final=4),         # lineage tree depth (1 = roots only)
+        min_level_diff=dict(start=0.6,    final=0.3),       # distinctness margin, decades
+        m_range=dict(start=(20, 40),      final=(8, 40)),   # channels (markers) per tile
+    ),
+)
+
+
+def curriculum_at(t):
+    """The plan 3.7 curriculum interpolated to progress `t` in [0, 1]: 0 = start prior, 1 = final.
+    Ranges interpolate endpoint-by-endpoint and round to int; max_depth steps linearly. Returns the
+    dict build_flexible_world's `curriculum` argument expects (m_range, k_true_range, max_depth,
+    min_level_diff)."""
+    t = float(min(max(t, 0.0), 1.0))
+    c = GENERATOR["curriculum"]
+
+    def _lerp_range(key):
+        s, f = c[key]["start"], c[key]["final"]
+        return (int(round(s[0] + t * (f[0] - s[0]))), int(round(s[1] + t * (f[1] - s[1]))))
+
+    return dict(
+        k_true_range=_lerp_range("k_true_range"),
+        m_range=_lerp_range("m_range"),
+        max_depth=int(round(c["max_depth"]["start"]
+                            + t * (c["max_depth"]["final"] - c["max_depth"]["start"]))),
+        min_level_diff=float(c["min_level_diff"]["start"]
+                             + t * (c["min_level_diff"]["final"] - c["min_level_diff"]["start"])),
+    )
+
+
 # ============================================================ amortized inversion
 # sigma in [2.5e-3, 7.4]; theta lives in [0, 1]
 LOGVAR_MIN, LOGVAR_MAX = -12.0, 4.0

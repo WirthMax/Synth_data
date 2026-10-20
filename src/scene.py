@@ -555,9 +555,23 @@ def support_mask(w, XY_scale_vox=40.0, Z_scale_vox=40.0, cover=0.75, psi = None)
     return z >= np.quantile(z, 1.0 - float(np.clip(cover, 0.0, 1.0)))
 
 
-def assign_types(info, tape, CellTypes, fractions, rule=None):
-    """Decide each cell's type: the global Fractions, tilted by the structure Profile it sits in
-    and by its cell type's Affinity for each named tissue feature."""
+def assign_types(info, tape, CellTypes, fractions, rule=None, compositions=None):
+    """Decide each cell's type.
+
+    Two priors live here, chosen by `compositions`:
+
+    - FIXED mode (`compositions is None`, the default): the global Fractions, tilted by the
+      structure Profile the cell sits in and by its cell type's Affinity for each named tissue
+      feature. Unchanged from before.
+    - FLEXIBLE mode (plan 3.4): a per-context composition replaces the Profile log-weights.
+      `p(type k | x) = sum_c w_c(x) . pi_c[k]`, where `w_c` is the cell's membership of context c
+      (contexts are [background] + the distinct structure KINDS, not per-instance), and `pi` is
+      the composition matrix in `CellTypes` order. There is no free additive direction here, so
+      nothing about the typing is hidden from the image. Affinity/Fractions are not consulted.
+
+    Both sample the chosen type with the SAME frozen per-cell uniform `tape["u_type"]`, so moving
+    a weight or a composition entry moves cells between types without resampling anything.
+    """
     type_names = list(CellTypes)
     f = np.asarray(fractions, float)
     flat = np.cumsum(f / np.sum(f))
@@ -566,12 +580,29 @@ def assign_types(info, tape, CellTypes, fractions, rule=None):
     lw = info.get("log_weights")
     refs = info.get("feat_refs", {})
     feat_names = list((field or {}).get("features", {})) if field is not None else []
+    if compositions is not None:
+        pi = np.asarray(compositions["pi"], float)                 # (C, K) in type_names order
+        s2c = np.asarray(compositions["struct_to_ctx"], int)       # per structure -> context idx
+        n_ctx = pi.shape[0]
+        if compositions["type_order"] != type_names:
+            raise ValueError(
+                "compositions['type_order'] must match list(CellTypes) exactly; got "
+                f"{compositions['type_order']} vs {type_names}. Build pi in CellTypes order.")
     types = {}
     for n in info["labels_present"]:
         i = info["cand_idx"][n]
         feat = {}
         if field is None or fmap is None:
             cuts = flat
+        elif compositions is not None:
+            feat = fmap[n]
+            m = np.asarray(feat["m"], float)                       # membership per structure
+            w = np.zeros(n_ctx)
+            np.add.at(w, s2c, m)                                   # pool instances into their kind
+            w[0] += max(0.0, 1.0 - float(m.sum()))                 # the rest is background
+            w = w / (w.sum() + 1e-12)
+            p = w @ pi
+            cuts = np.cumsum(p / (p.sum() + 1e-12))
         else:
             feat = fmap[n]
             tilt = feat["m"] @ lw if lw is not None and len(lw) else 0.0
@@ -592,8 +623,12 @@ class TapeDict(dict):
     __getattr__ = dict.__getitem__
 
 def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes, Fractions,
-                 um_per_vox, L=4, l_min=2, rule=None, pool_bank=None):
-    """Tissue in three phases: TYPE ASSIGNMENT, then geometry, then appearance."""
+                 um_per_vox, L=4, l_min=2, rule=None, pool_bank=None, compositions=None):
+    """Tissue in three phases: TYPE ASSIGNMENT, then geometry, then appearance.
+
+    `compositions` (plan 3.4, flexible mode) switches type assignment from the Fractions/Profile
+    prior to a per-context composition; see `assign_types`. None keeps the old behaviour exactly.
+    """
     import tissue_structures as ts
     
     sup, field, report = ts.build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox,
@@ -662,7 +697,7 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
         # The profile term is deliberately not centred -- see assign_types.
         pre["feat_refs"] = {k: float(fc[k].mean()) for k in feat_names}
     # every thinned candidate is typed; the return value is filtered to the survivors below
-    types_all = assign_types(pre, tape, CellTypes, Fractions, rule=rule)
+    types_all = assign_types(pre, tape, CellTypes, Fractions, rule=rule, compositions=compositions)
 
     # how much the local architecture wants cells to follow the director at all: 1 outside every
     # structure (the flow is simply what it is), each structure's own ALIGN inside it. ALIGN
