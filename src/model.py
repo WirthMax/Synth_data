@@ -314,7 +314,13 @@ def build_model(arch, in_ch, n_out, **kwargs):
         return ParamNet(in_ch, n_out, **kwargs)
     if arch == "set_transformer":
         return SetParamNet(in_ch, n_out, **kwargs)
-    raise ValueError(f"unknown model arch {arch!r} (expected 'cnn' or 'set_transformer')")
+    if arch == "v3":
+        # the set-valued flexible-panel model (Phase 4). It does not use in_ch/n_out (the panel is
+        # variable and theta v3 is set-structured); those are kept in the signature only so the
+        # dispatch stays uniform. Hyperparameters come through kwargs.
+        from model_v3 import ModelV3
+        return ModelV3(**kwargs)
+    raise ValueError(f"unknown model arch {arch!r} (expected 'cnn', 'set_transformer' or 'v3')")
 
 
 def to_input(adu):
