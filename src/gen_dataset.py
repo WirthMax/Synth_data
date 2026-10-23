@@ -383,9 +383,7 @@ def worker_samples(n, seed, keep, run_cfg, workers):
 # STIFF/ANISO/CONTACT govern tissue_structures' pressure-pack solve, which can fail to converge
 # or blow up under independently-sampled structures (divergent compliance ratios) -- pin them out
 # of theta so every structure stays uniformly stiff/isotropic and CONTACT's compliance-blend path
-# (which only engages when compliance actually varies) never activates. Module-level (not just a
-# make_dataset local) so rounds/composition.py can build an equivalent ParamSpace without
-# duplicating this regex tuple.
+# (which only engages when compliance actually varies) never activates.
 ARCH_PIN = (r"\.STIFF$", r"\.ANISO$", r"^ARCH\.CONTACT$")
 
 

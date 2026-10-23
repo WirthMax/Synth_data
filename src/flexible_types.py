@@ -62,6 +62,30 @@ COMPARTMENT_BAND: dict[str, dict] = {
 }
 RENDERABLE_COMPARTMENTS: tuple[str, ...] = ("nuclear", "membrane", "cytoplasmic")
 
+# A marker's localisation is NOT a 3-way category -- it is a continuous position of its intensity
+# band along tau (-1 nucleus centre, 0 envelope, +1 plasma membrane). That position is `mu`, and it
+# is what the model regresses. We sample it continuously over [MU_LO, MU_HI] (nucleus interior ->
+# membrane); the old compartment classes are just thresholds of this (and survive only as a
+# diagnostic readout). The band's shape (width/sharp) is tied to mu by a smooth map -- broad & soft
+# in the nucleus, tight & sharp at the membrane -- so `mu` is the SINGLE localisation knob and there
+# is no separate unpredicted nuisance.
+import config as cfg
+MU_LO, MU_HI, DAPI_MU = cfg.MU_LO, cfg.MU_HI, cfg.DAPI_MU   # single source of truth (config.py)
+
+
+def band_from_mu(mu):
+    """(mu, width, sharp) for a localisation band centred at `mu`. width/sharp interpolate from
+    broad/soft near the nucleus to tight/sharp at the membrane."""
+    t = float(np.clip((mu - MU_LO) / (MU_HI - MU_LO), 0.0, 1.0))
+    width = 0.65 + t * (0.30 - 0.65)
+    sharp = 3.0 + t * (6.0 - 3.0)
+    return float(mu), width, sharp
+
+
+def compartment_of_mu(mu):
+    """Nearest discrete compartment for a given mu -- diagnostic only (not used in generation)."""
+    return min(COMPARTMENT_BAND, key=lambda c: abs(COMPARTMENT_BAND[c]["mu"] - float(mu)))
+
 # the five geometry scalars that make up a type's shape in theta v3 (plan 3.6), in that order.
 GEOM_KEYS: tuple[str, ...] = ("RADIUS", "ELONG", "ROUGH", "BETA", "NUC_FRAC")
 
@@ -306,17 +330,19 @@ def sample_panel(rng, *, m_range=(8, 40), dyes, n_noise_kinds, noise_comps=(1, 4
     w = np.array([COMPARTMENT_PRIOR[c] for c in renderable], float)
     w = w / w.sum()
 
-    compartment = ["nuclear"]                               # the counterstain
+    # `renderable`/`w` are no longer used to pick a class; a marker's localisation is a continuous
+    # mu in [MU_LO, MU_HI]. The counterstain (channel 0) is fixed nuclear at DAPI_MU.
+    mu = [DAPI_MU]                                          # the counterstain
     dye = [None]                                            # filled by the caller's DAPI marker
     noise = [()]                                            # DAPI carries no antibody texture
     for _ in range(M - 1):
-        compartment.append(str(rng.choice(renderable, p=w)))
+        mu.append(float(rng.uniform(MU_LO, MU_HI)))
         dye.append(str(rng.choice(list(dyes))))
         k = int(rng.integers(noise_comps[0], noise_comps[1] + 1))
         noise.append(tuple(int(x) for x in rng.integers(0, n_noise_kinds, size=k)))
 
     order = rng.permutation(M)
-    return dict(M=M, compartment=compartment, dye=dye, noise=noise, order=order, counterstain=0)
+    return dict(M=M, mu=mu, dye=dye, noise=noise, order=order, counterstain=0)
 
 
 def sample_compositions(rng, kinds, K, *, p_allow_bg=0.8, p_allow_struct=0.4):
@@ -377,23 +403,20 @@ def _marker_name(m, dapi_name):
     return dapi_name if m == 0 else f"M{m:02d}"
 
 
-def build_marker(rng, *, name, dye, compartment, noise_kind_idx):
+def build_marker(rng, *, name, dye, mu, noise_kind_idx):
     """One antibody channel. Its texture components are drawn from the existing noise priors (they
-    are theta), but its tau localisation is fixed by the categorical `compartment` -- nuclear /
-    membrane / cytoplasmic set mu/width/sharp to that band on every component, so the marker shows
-    the same way in every type that expresses it. `amp` is pinned to 1.0: in flexible mode the
-    absolute brightness lives entirely in each type's expression level, so the old amp x level
-    product (which could trade off invisibly) is gone.
+    are theta), but its tau localisation is set by the continuous `mu` (plus width/sharp tied to it
+    via `band_from_mu`) on every component, so the marker shows the same way in every type that
+    expresses it. `amp` is pinned to 1.0: in flexible mode the absolute brightness lives entirely in
+    each type's expression level, so the old amp x level product (which could trade off invisibly)
+    is gone.
     """
     comps = [NOISE_KINDS[k]() for k in noise_kind_idx]
-    band = COMPARTMENT_BAND[compartment]
+    mu_v, width_v, sharp_v = band_from_mu(mu)
     for c in comps:
-        if band["nuclear"]:
-            make_nuclear(c)                                  # mu/width forced below the envelope
-        else:
-            c.mu = narrow(c.mu, c.mu.lo, c.mu.hi, band["mu"])
-            c.width = narrow(c.width, c.width.lo, c.width.hi, band["width"])
-        c.sharp = narrow(c.sharp, c.sharp.lo, c.sharp.hi, band["sharp"])
+        c.mu = narrow(c.mu, c.mu.lo, c.mu.hi, mu_v)
+        c.width = narrow(c.width, c.width.lo, c.width.hi, width_v)
+        c.sharp = narrow(c.sharp, c.sharp.lo, c.sharp.hi, sharp_v)
     m = PanelMarker(name=name, fluorophore=dye, noise_components=comps)
     m.amp = narrow(m.amp, 1.0, 1.0, 1.0)                     # pinned; brightness is in expression
     return m
@@ -453,7 +476,7 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
             canon[nm] = dapi_marker(name=nm)                 # the counterstain, always nuclear
         else:
             canon[nm] = build_marker(rng, name=nm, dye=panel_spec["dye"][m],
-                                     compartment=panel_spec["compartment"][m],
+                                     mu=panel_spec["mu"][m],
                                      noise_kind_idx=panel_spec["noise"][m])
     names_canon = [_marker_name(m, dapi_name) for m in range(M)]
     order = panel_spec["order"]
@@ -486,7 +509,7 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
         "COMPOSITIONS": compositions, "PANEL_SPEC": panel_spec, "TYPESET": ts,
         "META": dict(K=K, M=M, counterstain=panel_spec["counterstain"],
                      channel_order=order, b_range=(b_min, b_max),
-                     compartment=[COMPARTMENT_NAMES.index(c) for c in panel_spec["compartment"]]),
+                     mu=list(panel_spec["mu"])),               # canonical-order localisation targets
     }
     return world
 
@@ -507,6 +530,29 @@ _NOISE_KEEP = (r"\.scale$", r"\.clust$", r"\.fill$", r"\.s$")
 
 def _clamp_u(u):
     return np.clip(u, *_THETA_CLAMP)
+
+
+_NOISE4_KEYS = ("scale", "clust", "fill", "s")
+
+
+def _marker_noise4(panel):
+    """Per-marker [M, 4] noise target (scale, clust, fill, s), in IMAGE-channel order, normalised to
+    [0, 1]. The theta v3 marker.noise tensor the per-marker head predicts: one descriptor per
+    channel, read off that channel's first noise component (0.5 -- the neutral mid -- for a subfield
+    the component's noise kind does not carry). A lossy summary of a possibly multi-component texture,
+    but it matches the plan's declared [M, P_noise] shape."""
+    from parameter import P, to_u
+    markers = list(panel.Markers.values())                   # dict insertion order == image order
+    out = np.full((len(markers), len(_NOISE4_KEYS)), 0.5, np.float64)
+    for c, mk in enumerate(markers):
+        comp = mk.noise_components[0] if mk.noise_components else None
+        if comp is None:
+            continue
+        for j, key in enumerate(_NOISE4_KEYS):
+            p = getattr(comp, key, None)
+            if isinstance(p, P):
+                out[c, j] = _clamp_u(to_u(p))
+    return out
 
 
 def _scalar_block(root, prefix, pin=(), keep=None):
@@ -553,11 +599,13 @@ def theta_v3(world, cyc=None):
     lv = (ts.level[:, order] - lg_lo) / (lg_hi - lg_lo)
     level_u[positive] = _clamp_u(lv[positive])                 # defined only where positive
     geometry_u = _geometry_u(ts.geometry)
-    compartment = np.asarray(meta["compartment"], int)[order]
+    mu = np.asarray(meta["mu"], float)[order]                  # image order
+    mu_u = _clamp_u((mu - MU_LO) / (MU_HI - MU_LO))            # normalised localisation target [M]
 
     g_names, g_u = _scalar_block(world["ARCH"], "ARCH", pin=_GLOBAL_PIN)
     tg_names, tg_u = _scalar_block(world["TG"], "TG", keep=(r"\.SIZE_SIGMA$",))  # per-cell size CV
     n_names, n_u = _scalar_block(world["PANEL"], "PANEL", keep=_NOISE_KEEP)
+    noise4 = _marker_noise4(world["PANEL"])                   # [M, 4] target the marker head predicts
 
     offsets = np.zeros((M, 2), np.float32)
     if cyc is not None and "channel_offsets" in cyc:
@@ -568,7 +616,8 @@ def theta_v3(world, cyc=None):
         "global_u": np.concatenate([g_u, tg_u]),
         "noise_names": n_names,
         "noise_u": n_u,
-        "compartment": compartment.astype(np.int64),
+        "noise4": noise4,
+        "mu_u": mu_u,
         "positive": positive,
         "level_u": level_u,
         "geometry_u": geometry_u,
@@ -588,7 +637,7 @@ def theta_v3_nested(flat):
     return {
         "global": dict(zip(flat["global_names"].tolist(), flat["global_u"].tolist())),
         "marker": {"noise_names": flat["noise_names"], "noise_u": flat["noise_u"],
-                   "compartment": flat["compartment"]},
+                   "mu_u": flat["mu_u"]},
         "types": {"positive": flat["positive"], "level": flat["level_u"],
                   "geometry": flat["geometry_u"]},
         "contexts": {"pi": flat["pi"], "allowed": flat["allowed"], "names": flat["contexts"]},

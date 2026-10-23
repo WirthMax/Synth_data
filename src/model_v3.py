@@ -103,40 +103,63 @@ class WindowAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
 
-    def _shift_mask(self, H, W, ws, s, device):
-        img = torch.zeros(1, H, W, 1, device=device)
-        cnt = 0
-        for hsl in (slice(0, -ws), slice(-ws, -s), slice(-s, None)):
-            for wsl in (slice(0, -ws), slice(-ws, -s), slice(-s, None)):
-                img[:, hsl, wsl, :] = cnt
-                cnt += 1
-        nh, nw = H // ws, W // ws
-        mw = img.view(1, nh, ws, nw, ws, 1).permute(0, 1, 3, 2, 4, 5).reshape(nh * nw, ws * ws)
-        mask = mw[:, None, :] - mw[:, :, None]
-        return mask.masked_fill(mask != 0, float("-inf")).masked_fill(mask == 0, 0.0)
+    def _mask(self, Hp, Wp, H, W, ws, s, device):
+        """Additive attention mask [n_win, L, L]: -inf where a key is in a different shift region
+        than the query, or is a PADDED cell (so the grid can be any size, not just a multiple of
+        ws). None when there is neither a shift nor padding."""
+        if s == 0 and Hp == H and Wp == W:
+            return None
+        nh, nw = Hp // ws, Wp // ws
+        r = torch.zeros(1, Hp, Wp, 1, device=device)
+        if s:
+            cnt = 0
+            for hsl in (slice(0, -ws), slice(-ws, -s), slice(-s, None)):
+                for wsl in (slice(0, -ws), slice(-ws, -s), slice(-s, None)):
+                    r[:, hsl, wsl, :] = cnt
+                    cnt += 1
+        valid = torch.zeros(1, Hp, Wp, 1, device=device)
+        valid[:, :H, :W, :] = 1.0
+        if s:
+            r = torch.roll(r, (-s, -s), dims=(1, 2))
+            valid = torch.roll(valid, (-s, -s), dims=(1, 2))
+
+        def part(a):
+            return a.view(1, nh, ws, nw, ws, 1).permute(0, 1, 3, 2, 4, 5).reshape(nh * nw, ws * ws)
+
+        rw, vw = part(r), part(valid)
+        allow = (rw[:, :, None] == rw[:, None, :]) & (vw[:, None, :] > 0.5)
+        mask = torch.where(allow, torch.zeros_like(allow, dtype=torch.float32),
+                           torch.full_like(allow, float("-inf"), dtype=torch.float32))
+        dead = torch.isinf(mask).all(-1)                          # padded-query rows -> avoid NaN
+        mask[dead] = 0.0
+        return mask
 
     def forward(self, x, shift=False):
         n, H, W, C = x.shape
         ws = min(self.window, H, W)
-        s = ws // 2 if (shift and ws < H and ws < W) else 0
+        ph, pw = (ws - H % ws) % ws, (ws - W % ws) % ws           # pad grid up to a multiple of ws
+        if ph or pw:
+            x = F.pad(x, (0, 0, 0, pw, 0, ph))
+        Hp, Wp = H + ph, W + pw
+        s = ws // 2 if (shift and ws < Hp and ws < Wp) else 0
         if s:
             x = torch.roll(x, (-s, -s), dims=(1, 2))
-        nh, nw = H // ws, W // ws
+        nh, nw = Hp // ws, Wp // ws
         xw = x.view(n, nh, ws, nw, ws, C).permute(0, 1, 3, 2, 4, 5).reshape(-1, ws * ws, C)
         hd = C // self.heads
         qkv = self.qkv(xw).reshape(-1, ws * ws, 3, self.heads, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]                           # [B_, heads, L, hd]
         attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
-        if s:
-            mask = self._shift_mask(H, W, ws, s, x.device)         # [nh*nw, L, L]
+        mask = self._mask(Hp, Wp, H, W, ws, s, x.device)
+        if mask is not None:
             attn = attn.view(n, nh * nw, self.heads, ws * ws, ws * ws) + mask[None, :, None]
             attn = attn.view(-1, self.heads, ws * ws, ws * ws)
         o = (attn.softmax(-1) @ v).transpose(1, 2).reshape(-1, ws * ws, C)
         o = self.proj(o)
-        o = o.view(n, nh, nw, ws, ws, C).permute(0, 1, 3, 2, 4, 5).reshape(n, H, W, C)
+        o = o.view(n, nh, nw, ws, ws, C).permute(0, 1, 3, 2, 4, 5).reshape(n, Hp, Wp, C)
         if s:
             o = torch.roll(o, (s, s), dims=(1, 2))
-        return o
+        return o[:, :H, :W, :] if (ph or pw) else o
 
 
 class DropPath(nn.Module):
@@ -438,38 +461,49 @@ def slot_marker_readout(A, u, logI, dec4):
 
 # --- heads ------------------------------------------------------------------------------------
 class MarkerHead(nn.Module):
-    """Per-marker head (4.6): attention-pool each marker's own stride-16 tokens, then read out the
-    noise posterior, the compartment logits and (optionally) the channel offset. Equivariant: the
-    output for input channel m depends only on channel m."""
+    """Per-marker head (4.6). Two attention pools per marker, both learned to WEIGHT EVIDENCE BY
+    RELIABILITY rather than averaging every cell equally (a fixed average lets PSF-washed small cells
+    dilute the crisp signal from large ones):
+      - over the stride-16 trunk tokens (processed texture / context), and
+      - over stride-4 LOCATION tokens that each carry their sub-cellular region membership
+        (nucleus / cytoplasm / flow-derived membrane) + intensity + stem features, so the query can
+        focus on the informative, well-resolved cells.
+    Reads out the noise posterior, the localisation `mu` posterior (a REGRESSION -- mean + logvar in
+    the normalised-logit space, replacing the old collapsing 3-way classifier) and the channel
+    offset. Equivariant: output m depends only on channel m; padded markers are unused downstream."""
 
-    def __init__(self, d=128, n_noise=4, n_compartment=4, predict_offset=True):
+    def __init__(self, d=128, n_noise=4, loc_in=52, n_queries=4, predict_offset=True):
         super().__init__()
-        self.query = nn.Parameter(torch.randn(1, 1, d) * 0.02)
-        self.pool = nn.MultiheadAttention(d, 4, batch_first=True)
-        self.n_noise, self.n_compartment = n_noise, n_compartment
+        self.q_tok = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        self.pool_tok = nn.MultiheadAttention(d, 4, batch_first=True)
+        self.loc_proj = nn.Linear(loc_in, d)
+        self.ln_loc = nn.LayerNorm(d)
+        self.q_loc = nn.Parameter(torch.randn(1, n_queries, d) * 0.02)
+        self.pool_loc = nn.MultiheadAttention(d, 4, batch_first=True)
+        self.n_noise, self.n_queries = n_noise, n_queries
         self.predict_offset = predict_offset
-        out = 2 * n_noise + n_compartment + (2 if predict_offset else 0)
-        self.mlp = MLP(d, 256, out)
+        out = n_noise + 1 + (2 if predict_offset else 0)        # noise + mu + offset (point estimates)
+        self.mlp = MLP(d + n_queries * d, 256, out)
 
-    def forward(self, t):                                        # t: [B, M, Hg, Wg, d]
+    def forward(self, t, loc_feat):                             # t:[B,M,Hg,Wg,d] loc:[B,M,N4,loc_in]
         B, M, Hg, Wg, d = t.shape
-        z = t.reshape(B * M, Hg * Wg, d)
-        q = self.query.expand(B * M, -1, -1)
-        pooled, _ = self.pool(q, z, z, need_weights=False)
-        o = self.mlp(pooled.squeeze(1)).view(B, M, -1)
-        noise = o[..., :2 * self.n_noise].view(B, M, self.n_noise, 2)
-        off = 2 * self.n_noise
-        comp = o[..., off:off + self.n_compartment]
-        out = dict(noise_mu=noise[..., 0], noise_logvar=_clamp_logvar(noise[..., 1]),
-                   compartment=comp)
+        zt = t.reshape(B * M, Hg * Wg, d)
+        p_tok = self.pool_tok(self.q_tok.expand(B * M, -1, -1), zt, zt, need_weights=False)[0]
+        zl = self.ln_loc(self.loc_proj(loc_feat.reshape(B * M, loc_feat.shape[2], -1)))
+        p_loc = self.pool_loc(self.q_loc.expand(B * M, -1, -1), zl, zl, need_weights=False)[0]
+        o = self.mlp(torch.cat([p_tok.squeeze(1), p_loc.reshape(B * M, -1)], dim=-1)).view(B, M, -1)
+        out = dict(noise_mu=o[..., :self.n_noise], mu=o[..., self.n_noise])
+        off = self.n_noise + 1
         if self.predict_offset:
-            out["offset"] = o[..., off + self.n_compartment:off + self.n_compartment + 2]
+            out["offset"] = o[..., off:off + 2]
         return out
 
 
 class GlobalHead(nn.Module):
     """Global head (4.10): learned queries cross-attend the g32 tissue tokens through 2 decoder
-    layers, then read out mu/logvar per (padded-to-n_global) global theta entry."""
+    layers, then read out a POINT ESTIMATE per (padded-to-n_global) global theta entry. (Learned
+    variance removed -- a heteroscedastic NLL let the heads under-fit the mean; uncertainty is
+    deferred to a later calibration pass.)"""
 
     def __init__(self, g32=256, n_global=16, n_queries=8, heads=8):
         super().__init__()
@@ -478,7 +512,7 @@ class GlobalHead(nn.Module):
             n1=nn.LayerNorm(g32), ca=nn.MultiheadAttention(g32, heads, batch_first=True),
             n2=nn.LayerNorm(g32), sa=nn.MultiheadAttention(g32, heads, batch_first=True),
             n3=nn.LayerNorm(g32), mlp=MLP(g32, 4 * g32, g32))) for _ in range(2))
-        self.head = MLP(n_queries * g32, g32, 2 * n_global)
+        self.head = MLP(n_queries * g32, g32, n_global)
         self.n_global = n_global
 
     def forward(self, g32):
@@ -489,8 +523,7 @@ class GlobalHead(nn.Module):
             h = L["n2"](q)
             q = q + L["sa"](h, h, h, need_weights=False)[0]
             q = q + L["mlp"](L["n3"](q))
-        o = self.head(q.flatten(1)).view(-1, self.n_global, 2)
-        return o[..., 0], _clamp_logvar(o[..., 1])
+        return self.head(q.flatten(1)).view(-1, self.n_global)
 
 
 class SlotHeads(nn.Module):
@@ -501,8 +534,8 @@ class SlotHeads(nn.Module):
     def __init__(self, d=128, u_c=48, dec_c=96, n_geom=5, n_context=3, ctx_emb=16):
         super().__init__()
         self.exist = MLP(d, d, 1)
-        self.expr = MLP(d + u_c + 1, d, 3)                       # [slot; u_bar; i_bar] -> pos,mu,logvar
-        self.geom = MLP(d + dec_c, d, 2 * n_geom)
+        self.expr = MLP(d + u_c + 1, d, 2)                       # [slot; u_bar; i_bar] -> pos, level
+        self.geom = MLP(d + dec_c, d, n_geom)                    # point estimate (no variance)
         self.ctx_emb = nn.Embedding(n_context, ctx_emb)
         self.alpha = MLP(d + ctx_emb + 2, d, 1)
         self.n_geom, self.n_context = n_geom, n_context
@@ -518,11 +551,10 @@ class SlotHeads(nn.Module):
 
         se = type_slots[:, :, None].expand(-1, -1, M, -1)       # [B, K, M, d]
         expr_in = torch.cat([se, u_bar, i_bar[..., None]], dim=-1)
-        e = self.expr(expr_in)                                 # [B, K, M, 3]
-        expr = dict(positive=e[..., 0], level_mu=e[..., 1], level_logvar=_clamp_logvar(e[..., 2]))
+        e = self.expr(expr_in)                                 # [B, K, M, 2]
+        expr = dict(positive=e[..., 0], level_mu=e[..., 1])
 
-        g = self.geom(torch.cat([type_slots, g_bar], dim=-1)).view(B, K, self.n_geom, 2)
-        geom = dict(mu=g[..., 0], logvar=_clamp_logvar(g[..., 1]))
+        geom = dict(mu=self.geom(torch.cat([type_slots, g_bar], dim=-1)).view(B, K, self.n_geom))
 
         Ak = maps[:, :-1]                                       # [B, K, N]
         n = torch.einsum("bkn,bcn->bkc", Ak, P4)               # soft pixel counts [B, K, C]
@@ -546,7 +578,10 @@ class ModelV3(nn.Module):
     point sampling over the predicted cell interior.
     """
 
-    def __init__(self, n_global=16, n_marker_noise=4, n_compartment=4, n_context=None,
+    N_REGIONS = 4        # nucleus, cytoplasm, membrane, background
+    U_C = 48             # stem stride-4 per-marker feature channels (h4)
+
+    def __init__(self, n_global=16, n_marker_noise=4, n_context=None,
                  K=30, T=3, d=128, d_tag=32, predict_offset=True):
         super().__init__()
         n_context = (1 + len(cfg.CONTEXT_KINDS)) if n_context is None else n_context
@@ -559,24 +594,32 @@ class ModelV3(nn.Module):
         self.f4_ln = nn.LayerNorm(d)
         self.emb = nn.Linear(d, 16)
         self.slots = TypeSlots(d, K, T)
-        self.marker_head = MarkerHead(d, n_marker_noise, n_compartment, predict_offset)
+        loc_in = self.U_C + 1 + 3          # stem feats + log-intensity + (nucleus, cyto, membrane) probs
+        self.marker_head = MarkerHead(d, n_marker_noise, loc_in, predict_offset=predict_offset)
         self.global_head = GlobalHead(self.fusion.g32, n_global)
         self.slot_heads = SlotHeads(d, u_c=48, dec_c=96, n_geom=5, n_context=n_context)
         self.n_context = n_context
 
     def _seeds(self, emb, cell_prob4, Hf, Wf, seeds, n_seeds, device):
+        """Seeds for the type slots. `seeds=None` runs farthest-point sampling for every sample
+        (inference). During training, pass teacher seeds for some samples and mark the rest for FPS
+        with `n_seeds[b] < 0` -- those rows are recomputed by FPS here (plan 5.4)."""
         B, N, _ = emb.shape
-        if seeds is not None:
-            return seeds.to(device), n_seeds.to(device)
-        out = torch.zeros(B, self.K, dtype=torch.long, device=device)
-        ns = torch.zeros(B, dtype=torch.long, device=device)
+        if seeds is None:
+            seeds = torch.zeros(B, self.K, dtype=torch.long, device=device)
+            n_seeds = torch.full((B,), -1, dtype=torch.long, device=device)
+        else:
+            seeds, n_seeds = seeds.to(device).clone(), n_seeds.to(device).clone()
         for b in range(B):
+            if n_seeds[b] >= 0:
+                continue                                      # teacher seeds already provided
             cand = cell_prob4[b] > 0.5
             chosen = select_seeds(_smooth4(emb[b], Hf, Wf), cand, self.K)
+            seeds[b] = 0
             if chosen:
-                out[b, :len(chosen)] = torch.as_tensor(chosen, device=device)
-                ns[b] = len(chosen)
-        return out, ns
+                seeds[b, :len(chosen)] = torch.as_tensor(chosen, device=device)
+            n_seeds[b] = len(chosen)
+        return seeds, n_seeds
 
     def forward(self, tile, present=None, tags=None, seeds=None, n_seeds=None):
         B, M, H, W = tile.shape
@@ -617,9 +660,37 @@ class ModelV3(nn.Module):
             o["maps"] = maps[ti]
             slot_out.append(o)
 
-        g_mu, g_lv = self.global_head(g32)
+        loc_feat = self._loc_features(dense, logI, u, Hf, Wf)      # [B, M, N4, loc_in]
         return dict(
-            global_mu=g_mu, global_logvar=g_lv,
-            marker=self.marker_head(t),
+            global_mu=self.global_head(g32),
+            marker=self.marker_head(t, loc_feat),
             dense={k: dense[k] for k in ("nucleus", "cell", "flow", "structure")},
             slots=slot_out, seeds=seeds, n_seeds=n_seeds, emb=emb)
+
+    def _region_probs(self, dense, N4):
+        """Per-location sub-cellular region membership at stride 4: (nucleus, cytoplasm, membrane),
+        each [B, 1, N4]. The membrane is relu(divergence of the predicted FLOW field): the flows
+        point to each cell's centre, so they diverge at cell-cell boundaries -- the only cue that
+        resolves INTERNAL membranes in packed tissue (a union cell mask cannot)."""
+        nuc4 = F.avg_pool2d(torch.sigmoid(dense["nucleus"]), 4).reshape(dense["nucleus"].shape[0], 1, N4)
+        cell2d = F.avg_pool2d(torch.sigmoid(dense["cell"]), 4)
+        fy, fx = dense["flow"][:, 0:1], dense["flow"][:, 1:2]
+        div = (F.pad(fx[..., :, 1:] - fx[..., :, :-1], (0, 1))
+               + F.pad(fy[..., 1:, :] - fy[..., :-1, :], (0, 0, 0, 1)))
+        mem4 = (F.avg_pool2d(F.relu(div), 4) * cell2d).reshape(cell2d.shape[0], 1, N4)
+        cell4 = cell2d.reshape(cell2d.shape[0], 1, N4)
+        cyto4 = (cell4 - nuc4 - mem4).clamp(min=0)
+        return nuc4, cyto4, mem4
+
+    def _loc_features(self, dense, logI, u, Hf, Wf):
+        """Stride-4 per-marker, per-location tokens for the marker head's attention pool: the stem
+        features `u`, the marker's log-intensity, and the (nucleus, cyto, membrane) region memberships
+        broadcast to every marker. The attention query then learns which locations/cells to trust.
+        Padding-safe (regions from present-only dense maps) and per-marker (permutation-equivariant).
+        """
+        B, M, N4 = logI.shape
+        nuc4, cyto4, mem4 = self._region_probs(dense, N4)        # each [B, 1, N4]
+        reg = torch.cat([nuc4, cyto4, mem4], dim=1).transpose(1, 2)[:, None]   # [B, 1, N4, 3]
+        reg = reg.expand(B, M, N4, 3)
+        feat = u.permute(0, 1, 3, 2)                             # [B, M, N4, 48]
+        return torch.cat([feat, logI[..., None], reg], dim=-1)   # [B, M, N4, 48+1+3]

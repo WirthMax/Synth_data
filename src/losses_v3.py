@@ -176,6 +176,10 @@ def token_comp_target(frac16, slot_of_type, K):
 # --- small NLL / dense helpers ----------------------------------------------------------------
 _LOG2PI = float(np.log(2 * np.pi))
 
+# upweight the marker localisation (mu) point-estimate loss so it is not drowned by the other
+# per-marker / global terms while we check whether mu is learnable at all.
+MU_LOSS_WEIGHT = 3.0
+
 
 def gaussian_nll(mu, logvar, target):
     """Elementwise Gaussian negative log-likelihood (up to the constant kept for interpretability)."""
@@ -244,7 +248,11 @@ def type_losses_one(slot_out, tgt, w_match: MatchWeights, w: LossWeights,
     A = maps[:K]                                              # type-slot maps [K, N4]
     Mgt = tgt["Mgt"]                                          # [J, N4]
     J = Mgt.shape[0]
-    E_pred = _expr_pred(slot_out["expression"])              # [K, M]
+    # slot_out may carry m_max (padded) markers; the sample's real markers are the first M, matching
+    # the target. Slice the expression to them so a padded batch and a single sample agree.
+    M = tgt["mk"].shape[0]
+    expr = {k: v[:, :M] for k, v in slot_out["expression"].items()}
+    E_pred = _expr_pred(expr)                                # [K, M]
     p_exist = torch.sigmoid(slot_out["existence"])           # [K]
 
     slot_idx, type_idx = match_one(A, Mgt, E_pred, tgt["E_gt"], tgt["mk"], p_exist,
@@ -266,21 +274,20 @@ def type_losses_one(slot_out, tgt, w_match: MatchWeights, w: LossWeights,
     weights = torch.where(matched, torch.ones_like(bce), 0.1 * torch.ones_like(bce))
     terms["exist"] = (bce * weights).mean()
 
-    # (b) type parameters (matched only): positivity BCE, level NLL where positive, geometry NLL
-    expr = slot_out["expression"]
+    # (b) type parameters (matched only): positivity BCE, level + geometry Huber (point estimates;
+    # learned variance removed everywhere).
     pos_logit = expr["positive"][slot_idx]                   # [J, M]
     pos_tgt = tgt["positive"][type_idx].float()              # [J, M]
     mk = tgt["mk"]
     posbce = (F.binary_cross_entropy_with_logits(pos_logit, pos_tgt, reduction="none")
               * mk).sum() / (mk.sum() * J).clamp(min=1)
-    lvl_mu, lvl_lv = expr["level_mu"][slot_idx], expr["level_logvar"][slot_idx]
     lvl_tgt = logit(tgt["level"][type_idx])                  # normalised level -> logit space
     posmask = pos_tgt * mk
-    lvlnll = (gaussian_nll(lvl_mu, lvl_lv, lvl_tgt) * posmask).sum() / posmask.sum().clamp(min=1)
-    gmu, glv = slot_out["geometry"]["mu"][slot_idx], slot_out["geometry"]["logvar"][slot_idx]
+    lvl = (F.smooth_l1_loss(expr["level_mu"][slot_idx], lvl_tgt, reduction="none")
+           * posmask).sum() / posmask.sum().clamp(min=1)
     gtgt = logit(tgt["geometry"][type_idx])                  # [J, 5]
-    geomnll = gaussian_nll(gmu, glv, gtgt).mean()
-    terms["type_param"] = posbce + lvlnll + geomnll
+    geom = F.smooth_l1_loss(slot_out["geometry"]["mu"][slot_idx], gtgt, reduction="none").mean()
+    terms["type_param"] = posbce + lvl + geom
 
     # (c) context compositions: Dirichlet NLL per valid context (>= min_context_cells, J >= 2)
     ctx = A.new_zeros(())
@@ -338,17 +345,29 @@ def dense_losses(dense, tgt):
 
 # --- global / per-marker losses (h) ------------------------------------------------------------
 def global_marker_losses(out, tgt):
+    # All point-estimate (Huber) losses now -- learned variance removed everywhere (a heteroscedastic
+    # NLL let the heads under-fit the mean; uncertainty is deferred to a later calibration pass).
     g = tgt["global"]
-    gl = gaussian_nll(out["global_mu"], out["global_logvar"], logit(g["u"])).mean()
+    gerr = F.smooth_l1_loss(out["global_mu"], logit(g["u"]), reduction="none")
+    if "mask" in g:                                          # padded globals (variable ARCH length)
+        gm = g["mask"].float()
+        gl = (gerr * gm).sum() / gm.sum().clamp(min=1)
+    else:
+        gl = gerr.mean()
 
     mk = tgt["marker"]
     present = mk["present"].bool()                           # [B,M]
     mo = out["marker"]
-    nll = gaussian_nll(mo["noise_mu"], mo["noise_logvar"], logit(mk["noise_u"]))  # [B,M,P]
+    nerr = F.smooth_l1_loss(mo["noise_mu"], logit(mk["noise_u"]), reduction="none")  # [B,M,P]
     pm = present[..., None].float()
-    noise = (nll * pm).sum() / pm.sum().clamp(min=1)
-    comp = F.cross_entropy(mo["compartment"][present], mk["compartment"][present])
-    terms = dict(global_nll=gl, marker_noise=noise, compartment=comp)
+    noise = (nerr * pm).sum() / pm.sum().clamp(min=1)
+    # localisation mu: a Huber POINT-ESTIMATE loss in logit space, NOT an NLL. A learned variance
+    # lets the head minimise a Gaussian NLL by predicting the mean with a huge variance (observed:
+    # mu collapsed to the mean with uniformly large sigma and never learned), so here we optimise
+    # accuracy directly. `mu_logvar` is still produced for later calibration but is not used here.
+    mu_err = F.smooth_l1_loss(mo["mu"], logit(mk["mu_u"]), reduction="none")       # [B,M]
+    mu = MU_LOSS_WEIGHT * (mu_err * present.float()).sum() / present.float().sum().clamp(min=1)
+    terms = {"global": gl, "marker_noise": noise, "mu": mu}
     if "offset" in mo and "offset" in mk:
         off = ((mo["offset"] - mk["offset"]) ** 2)[present].mean()
         terms["offset"] = off

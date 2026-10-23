@@ -117,16 +117,27 @@ CONTEXT_KINDS = ("ordered", "vessel")
 IGNORE_LABEL = 255
 # This should be larger than the possible amount of cells that can be generated
 ARTIFACT_ID0 = 100000
+# marker localisation: a marker's intensity band sits at a continuous position `mu` along tau
+# (-1 nucleus centre, 0 envelope, +1 plasma membrane). The model REGRESSES this. Antibody markers
+# draw mu ~ U[MU_LO, MU_HI]; the nuclear counterstain is pinned at DAPI_MU. COMPARTMENT_MU are the
+# three discrete band-centres kept only for a diagnostic "derived compartment" readout (thresholding
+# mu), not for generation. Lives here (numpy-only module) so the synmodel training side can read it
+# without importing the generation stack.
+MU_LO, MU_HI = -0.9, 1.0
+DAPI_MU = -0.6
+COMPARTMENT_MU = {"nuclear": -0.50, "membrane": 1.00, "cytoplasmic": 0.40}
+
 # ---- Phase 3: flexible cell types (plan 3.0, 3.7) ----
-# type_mode selects the generator's biology sampler. "fixed" is the original per-dataset layout
-# (panel/types/structures frozen once); "flexible" redraws the whole panel, lineage-tree type set
-# and per-context compositions per sample (flexible_types.build_flexible_world). "fixed" must stay
-# bit-identical to the pre-Phase-3 generator, so it is the default until Phase 6 flips it.
+# type_mode selects the generator's biology sampler. "flexible" (the default, and the only path the
+# v3 model trains on) redraws the whole panel, lineage-tree type set and per-context compositions
+# per sample (flexible_types.build_flexible_world). "fixed" is the original per-dataset layout
+# (panel/types/structures frozen once) -- kept only as a reference generation mode; the old flat-theta
+# model it fed has been removed.
 # CURRICULUM is the set of knobs that widen the flexible prior across training rounds (plan 3.7):
 # the START column is the gentle early-round prior, FINAL the full prior the final fine-tune uses.
 # A round picks values between the two; the final fine-tune (plan 6.4) must use FINAL only.
 GENERATOR = dict(
-    type_mode="fixed",
+    type_mode="flexible",
     curriculum=dict(
         #              knob                 start        final
         k_true_range=dict(start=(2, 8),   final=(1, 30)),   # number of distinct cell types
