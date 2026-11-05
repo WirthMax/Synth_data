@@ -552,6 +552,10 @@ def _smooth_z(w, XY_scale_vox=40.0, Z_scale_vox=40.0):
 def support_mask(w, XY_scale_vox=40.0, Z_scale_vox=40.0, cover=0.75, psi = None):
     """Smooth the frozen field, then threshold at a quantile so `cover` IS the realised fraction."""
     z = _smooth_z(w, XY_scale_vox, Z_scale_vox) if psi is None else np.asarray(psi, np.float32)
+    # cover=0 is the empty-tile null: the quantile at 1.0 would otherwise keep the single max voxel,
+    # so an honest zero-cell tile needs an explicit all-False support.
+    if float(cover) <= 0.0:
+        return np.zeros(z.shape, bool)
     return z >= np.quantile(z, 1.0 - float(np.clip(cover, 0.0, 1.0)))
 
 
@@ -633,7 +637,9 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
     
     sup, field, report = ts.build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox,
                                                    L=L, l_min=l_min)
-    psi, thr = field["psi"], field["thr"]
+    # field is None on the structure-free path (no director, uniform thinning)
+    psi = field["psi"] if field is not None else None
+    thr = field["thr"] if field is not None else None
     nz, ny, nx = shape
 
     fc_all = None
@@ -677,7 +683,7 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
                centres_vox={n: cvox_all[n - 1] for n in lbl_all}, neighbours=neigh_all,
                field=field)
     feat = None
-    if field is not None and len(keep):
+    if field is not None and ARCH.Structures and len(keep):
         # ONE vectorised read for every cell centre, shared by typing and the geometry pass. A
         # 3-D Q needs six interpolations per cell plus one per structure, so sampling per cell in
         # two separate places would be thousands of tiny map_coordinates calls at the cell counts
@@ -777,8 +783,9 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
         # the field, the potential behind it, and the ledger's realised fractions, so a caller
         # can plot or report them. info["support"] already excludes every lumen, and that is what
         # artifacts consume, so debris and detachment avoid the lumina with no artifact-side
-        # change at all.
-        field=field, psi=psi, psi_bar=psi.mean(0), thr=thr, report=report, arch=ARCH)
+        # change at all. psi is None on the structure-free path.
+        field=field, psi=psi, psi_bar=(psi.mean(0) if psi is not None else None),
+        thr=thr, report=report, arch=ARCH)
 
     # typed before the geometry pass; filtered to the survivors here so the returned dict
     # still means "the type of every cell in the label image", exactly as it always did

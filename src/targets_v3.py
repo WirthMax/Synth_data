@@ -78,8 +78,9 @@ def build_sample_targets(b, k_slots, n_global):
     ignore = type_map == cfg.IGNORE_LABEL
     dense = dict(
         nucleus=_t(b["nuc"]).float(), cell=_t(b["cell_mask"]).float(),
-        flow=_t(b["flow"]), ignore=_t(ignore, torch.bool),
+        flow=_t(b["flow"]), nuc_flow=_t(b["nuc_flow"]), ignore=_t(ignore, torch.bool),
         cell_visible=_t(b["cell_mask"]).float(),
+        nuc_visible=_t(np.asarray(b["nuc"]) > 0).float(),    # nucleus flow-loss region
         structure=_t(b["cfrac16"]),                          # [C, h16, w16] soft target
         structure_mask=torch.ones(h16, w16))
 
@@ -110,21 +111,25 @@ def seed_frac_from(seeds, Mgt, k_slots):
 
 def collate_v3(samples, m_max=None):
     """Batch samples with different M. Pads the image channels to m_max (present mask marks the
-    real ones), stacks dense/global, and keeps the per-sample `type` dicts as a list (the loss loops
-    over them). Returns (tile [B, m_max, H, W], present [B, m_max], tgt)."""
+    real ones), per-marker-normalises each tile and carries the per-marker expression `strength`,
+    stacks dense/global, and keeps the per-sample `type` dicts as a list (the loss loops over them).
+    Returns (tile [B, m_max, H, W], present [B, m_max], tgt); `tgt['strength']` is [B, m_max]."""
     B = len(samples)
     m_max = m_max or max(int(s["M"]) for s in samples)
     H, W = samples[0]["image"].shape[:2]
     tile = torch.zeros(B, m_max, H, W)
     present = torch.zeros(B, m_max, dtype=torch.bool)
+    strength = torch.zeros(B, m_max)
     noise = torch.zeros(B, m_max, samples[0]["marker"]["noise_u"].shape[-1])
     mu_u = torch.zeros(B, m_max)
     offset = torch.zeros(B, m_max, 2)
-    from model import to_input
+    from model import normalize_markers
     for b, s in enumerate(samples):
         M = int(s["M"])
         img = s["image"]                                     # [H, W, M] uint16 tensor
-        tile[b, :M] = torch.as_tensor(to_input(img.cpu().numpy())).permute(2, 0, 1)
+        norm, strn = normalize_markers(img.cpu().numpy())    # per-marker [0,1] + strength [M]
+        tile[b, :M] = torch.as_tensor(norm).permute(2, 0, 1)
+        strength[b, :M] = torch.as_tensor(strn)
         present[b, :M] = True
         noise[b, :M] = s["marker"]["noise_u"]
         mu_u[b, :M] = s["marker"]["mu_u"]
@@ -133,11 +138,11 @@ def collate_v3(samples, m_max=None):
     def _stack(key):
         return torch.stack([s["dense"][key] for s in samples])
 
-    dense = {k: _stack(k) for k in ("nucleus", "cell", "flow", "ignore", "cell_visible",
-                                    "structure", "structure_mask")}
+    dense = {k: _stack(k) for k in ("nucleus", "cell", "flow", "nuc_flow", "ignore",
+                                    "cell_visible", "nuc_visible", "structure", "structure_mask")}
     glob = dict(u=torch.stack([s["glob"]["u"] for s in samples]),
                 mask=torch.stack([s["glob"]["mask"] for s in samples]))
     marker = dict(noise_u=noise, mu_u=mu_u, offset=offset, present=present)
     tgt = dict(type=[s["type"] for s in samples], dense=dense, marker=marker,
-               **{"global": glob})
+               strength=strength, **{"global": glob})
     return tile, present, tgt

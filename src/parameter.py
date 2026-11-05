@@ -1020,10 +1020,14 @@ class Detector(ParamHolder):
         0.0,
         50.0,
         0.5,
-        2.5,
+        20.0,
         "read noise",
         note="read e-",
-        comment="camera read noise, electrons RMS. Dominates where the signal is dark.",
+        comment="camera read noise, electrons RMS. Dominates where the signal is dark, and -- "
+        "because the staged pipeline subtracts an independent blank (BG_SUBTRACT) -- it is what "
+        "mostly sets the empty-tile floor the per-channel normalisation then reveals. 20 e- ~ "
+        "12 ADU single-frame at ADU_PER_E 0.5, matching the measured MACSIMA slide; the backsub "
+        "difference of two such frames is ~sqrt(2)x that, rectified at 0.",
     )
     DARK_E: P = P(
         0.0,
@@ -1045,6 +1049,85 @@ class Detector(ParamHolder):
     )
     OFFSET_ADU: P = P(
         0.0, 2000.0, 10.0, 100.0, "offset", note="offset", comment="camera black level"
+    )
+    BG_SUBTRACT: P = P(
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        "bg subtract",
+        note="backsub",
+        comment="mimic the MACSIMA staged pipeline: subtract an independent blank (bleach/"
+        "autofluorescence reference) cycle from each non-DAPI marker and clip at 0. 1 = staged "
+        "domain (pedestal removed, empty tiles are near-zero with sparse speckle, matching "
+        "*_backsub.ome.tif); 0 = raw pedestal frame, bit-for-bit the old camera. DAPI is the "
+        "registration target and is never subtracted.",
+    )
+    BG_DRIFT: P = P(
+        0.0,
+        0.5,
+        0.01,
+        0.10,
+        "bg drift",
+        note="bleach drift",
+        comment="fractional autofluorescence mismatch (bleach / illumination drift) between the "
+        "blank and marker cycles: the blank is brighter by this factor, so AF over-subtracts. "
+        "Together with BG_MARGIN_ADU it sets the empty-tile zero fraction (~60% at 0.08). "
+        "Orthogonal to BG_SHIFT_PX, which sets the residual's texture not its mean.",
+    )
+    BG_SHIFT_PX: P = P(
+        0.0,
+        4.0,
+        0.1,
+        1.0,
+        "bg shift",
+        note="bg misreg px",
+        comment="registration offset (pixels) of the blank's AF vs the marker's, random direction "
+        "per channel. Turns a smooth AF field into a short-correlation residual; 0 = the AF "
+        "cancels perfectly (floor is pure read/shot difference, nearly white).",
+    )
+    BG_MARGIN_ADU: P = P(
+        0.0,
+        50.0,
+        1.0,
+        6.0,
+        "bg margin",
+        note="over-sub adu",
+        comment="constant ADU over-subtracted after the blank, standing in for a slightly "
+        "conservative background estimate. Raises the empty-tile zero fraction; 6 ADU ~ 62% "
+        "zeros here. Orthogonal to the noise magnitude (READ_E).",
+    )
+    HOT_RATE: P = P(
+        0.0,
+        1e-3,
+        1e-5,
+        7e-5,
+        "hot rate",
+        note="hot frac",
+        comment="fraction of pixels that read out a spurious hot charge this frame (defective / "
+        "transient / cosmic-ray-like). On the marker frame only, so they survive backsub as the "
+        "heavy upper tail. 7e-5 ~ the 0.007% measured on the real slide; 0 = none.",
+    )
+    HOT_E: P = P(
+        0.0,
+        5000.0,
+        10.0,
+        500.0,
+        "hot e",
+        note="hot e-",
+        comment="electrons a hot pixel dumps. 500 e- ~ 250 ADU at ADU_PER_E 0.5, a spike well "
+        "above the ~8 ADU empty floor that normalises toward 1.0. Orthogonal to HOT_RATE.",
+    )
+    READ_SMOOTH_PX: P = P(
+        0.0,
+        2.0,
+        0.1,
+        0.5,
+        "read smooth",
+        note="read corr px",
+        comment="Gaussian sigma (px) applied to the read-noise fields (variance-preserving) so the "
+        "empty floor is slightly spatially correlated rather than pure white; 0.5 ~ the lag-1 0.15 "
+        "measured on the staged slide, 0 = white. Only active under BG_SUBTRACT.",
     )
     BIT_DEPTH: int = 16
 
@@ -1125,14 +1208,16 @@ class TissueGeometry(ParamHolder):
         comment="AXIAL correlation length, separately.",
     )
     COVER: P = P(
-        0.05,
+        0.0,
         1.0,
         0.05,
         0.75,
         "cover",
         note="cover",
         comment="fraction of the volume that is tissue. Applied as a quantile of "
-        "the support field, so it maps monotonically onto realised cover.",
+        "the support field, so it maps monotonically onto realised cover. The null "
+        "case COVER=0 is a genuinely empty tile (no tissue, no cells) -- support_mask "
+        "returns all-False, so no candidate survives.",
     )
     GROW: P = P(
         1.0,
@@ -1813,7 +1898,7 @@ NOISE_KINDS = (BlobNoise, ClusterNoise, NetworkNoise, FibreNoise, SheetNoise)
 
 DEVICE_DETECTOR = Detector(
     E_PER_UNIT=120.0,
-    READ_E=2.5,
+    READ_E=20.0,
     DARK_E=5.0,
     ADU_PER_E=0.5,
     OFFSET_ADU=100.0,
@@ -1821,4 +1906,11 @@ DEVICE_DETECTOR = Detector(
     AF_CV=0.45,
     ILLUM_CV=0.06,
     VIGNETTE=0.18,
+    BG_SUBTRACT=1.0,
+    BG_DRIFT=0.10,
+    BG_SHIFT_PX=1.0,
+    BG_MARGIN_ADU=6.0,
+    HOT_RATE=7e-5,
+    HOT_E=500.0,
+    READ_SMOOTH_PX=0.5,
 )

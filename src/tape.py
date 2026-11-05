@@ -72,6 +72,22 @@ class Tape(object):
         self.w_af   = self.rng.standard_normal((nc, ny, nx), dtype=np.float32)
         # flat field texture
         self.w_ill  = self.rng.standard_normal((ny, nx), dtype=np.float32)
+
+        # --- MACSIMA background-subtraction (the staged pipeline subtracts a separately-acquired
+        # blank/bleach cycle from each marker). The blank is an INDEPENDENT acquisition of the same
+        # autofluorescence, so it needs its own noise realisations; what survives subtraction is the
+        # empty-tile floor the inversion model has to recognise. All of it is frozen here, once.
+        # shot + read noise of the blank frame (independent of the marker frame's z_shot/z_read)
+        self.z_shot_bg = self.rng.standard_normal((nc, ny, nx), dtype=np.float32)
+        self.z_read_bg = self.rng.standard_normal((nc, ny, nx), dtype=np.float32)
+        # hot / defective pixel draws (thresholded by DET.HOT_RATE in the detector) -- present on the
+        # marker frame but not the blank, so they survive subtraction as the heavy upper tail
+        self.u_hot     = self.rng.random((nc, ny, nx), dtype=np.float32)
+        # per-channel registration offset (direction) of the blank's AF vs the marker's AF, and the
+        # per-channel bleach/illumination drift between the two cycles -- these make the AF cancel
+        # only imperfectly, the spatially-correlated part of the residual
+        self.af_shift   = self.rng.standard_normal((nc, 2)).astype(np.float32)
+        self.z_bg_drift = self.rng.standard_normal(nc).astype(np.float32)
         
     def drawArtifacts(self, shape=(40, 160, 160), n_cand=256, n_mark=64, n_mode=16,
                       n_t=512, n_lm=21):

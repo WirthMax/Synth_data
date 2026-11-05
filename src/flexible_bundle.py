@@ -55,14 +55,18 @@ def build_bundle(i, seed, curriculum=None, with_artifacts=False, pool_bank=None)
     cfrac16, _ = dt.context_fractions(context_map, n_context, stride=16)
     pure4 = dt.pure_locations(type_map, K, stride=4)                # [h4, w4], 0 bg / 1..K / -1
     cellmask = dt.cell_mask(inst, vis)
-    flow = dt.instance_flows(inst, vis)                             # [2, H, W]
+    flow = dt.instance_flows(inst, vis)                             # [2, H, W] cell flows
+    nuc = labels["nuc"].astype(np.uint8)
+    nuc_inst = np.where(nuc > 0, inst, 0)                           # each nucleus labelled by its cell id
+    nuc_flow = dt.instance_flows(nuc_inst, vis)                     # [2, H, W] nucleus flows
 
     bundle = dict(
         image=img.astype(np.uint16),
         type_map=type_map.astype(np.uint8),
-        nuc=labels["nuc"].astype(np.uint8),
+        nuc=nuc,
         cell_mask=cellmask.astype(np.bool_),
         flow=flow.astype(np.float32),
+        nuc_flow=nuc_flow.astype(np.float32),
         frac4=frac4.astype(np.float32), valid4=valid4.astype(np.bool_),
         frac16=frac16.astype(np.float32),
         cfrac16=cfrac16.astype(np.float32),

@@ -48,16 +48,18 @@ def build_seeds(model, tgt, p_teacher, gen, device):
     return seeds, n_seeds
 
 
-def train_step(model, opt, tile, present, tgt, step, total_steps, gen, device="cpu"):
+def train_step(model, opt, tile, present, tgt, step, total_steps, gen, device="cpu",
+               family_weights=None):
     model.train()
     tgt = move_targets(tgt, device)
     sched = schedule(step, total_steps)
     seeds, n_seeds = build_seeds(model, tgt, sched["p_teacher"], gen, device)
-    out = model(tile.to(device), present=present.to(device), seeds=seeds, n_seeds=n_seeds)
+    out = model(tile.to(device), present=present.to(device), strength=tgt["strength"],
+                seeds=seeds, n_seeds=n_seeds)
     for b in range(len(tgt["type"])):
         tgt["type"][b]["seed_frac"] = seed_frac_from(
             out["seeds"][b], tgt["type"][b]["Mgt"], model.K)
-    total, log = total_loss(out, tgt, step, total_steps)
+    total, log = total_loss(out, tgt, step, total_steps, family_weights=family_weights)
     opt.zero_grad()
     total.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -72,7 +74,7 @@ def evaluate_v3(model, tile, present, tgt, device="cpu"):
     (w_seed = 0, FPS seeds). Returns a dict of scalar means over the batch."""
     model.eval()
     tgt = move_targets(tgt, device)
-    out = model(tile.to(device), present=present.to(device))   # seeds=None -> FPS everywhere
+    out = model(tile.to(device), present=present.to(device), strength=tgt["strength"])  # FPS seeds
     w0 = MatchWeights(seed=0.0)
     B = len(tgt["type"])
     acc = dict(recovered_rate=[], type_count_err=[], mu_nmse=[], compartment_acc=[],
@@ -88,28 +90,32 @@ def evaluate_v3(model, tile, present, tgt, device="cpu"):
         expr = {k: v[b][:, :M] for k, v in slots["expression"].items()}
         p_exist = torch.sigmoid(slots["existence"][b])
         E_pred = _expr_pred(expr)
-        slot_idx, type_idx = match_one(A, Mgt, E_pred, t["E_gt"], t["mk"], p_exist,
-                                       torch.zeros(model.K, J, device=device), w0)
 
-        # recovered-type rate: matched slot Dice >= 0.5
-        dice = (2 * (A[slot_idx] * Mgt[type_idx]).sum(1)) / (
-            A[slot_idx].sum(1) + Mgt[type_idx].sum(1)).clamp(min=1e-6)
-        acc["recovered_rate"].append(float((dice >= 0.5).float().mean()))
+        # type-count error is defined even for an empty tile (the model should predict zero types);
+        # duplicate rate too. The matching-based metrics (recovered/positivity/expr/geom/cost) have
+        # no referent when J=0, so they are skipped for that sample.
         acc["type_count_err"].append(abs(int((p_exist > 0.5).sum()) - J))
-        # duplicate rate: unmatched slots that are confident and carry > 1% of mass
-        matched = torch.zeros(model.K, dtype=torch.bool, device=device)
-        matched[slot_idx] = True
         mass = A.sum(1) / A.sum(1).sum().clamp(min=1e-6)
+        if J > 0:
+            slot_idx, type_idx = match_one(A, Mgt, E_pred, t["E_gt"], t["mk"], p_exist,
+                                           torch.zeros(model.K, J, device=device), w0)
+            # recovered-type rate: matched slot Dice >= 0.5
+            dice = (2 * (A[slot_idx] * Mgt[type_idx]).sum(1)) / (
+                A[slot_idx].sum(1) + Mgt[type_idx].sum(1)).clamp(min=1e-6)
+            acc["recovered_rate"].append(float((dice >= 0.5).float().mean()))
+            matched = torch.zeros(model.K, dtype=torch.bool, device=device)
+            matched[slot_idx] = True
+            pos = (torch.sigmoid(expr["positive"][slot_idx]) > 0.5).float()
+            acc["positivity_acc"].append(float((pos == t["positive"]).float().mean()))
+            acc["expr_nmse"].append(float(((E_pred[slot_idx] - t["E_gt"]) ** 2).mean()))
+            gmu = slots["geometry"]["mu"][b][slot_idx]
+            acc["geom_nmse"].append(float(((torch.sigmoid(gmu) - t["geometry"]) ** 2).mean()))
+            acc["mean_match_cost"].append(float(1 - dice.mean()))
+        else:
+            matched = torch.zeros(model.K, dtype=torch.bool, device=device)
+        # duplicate rate: confident slots carrying > 1% of mass that are not matched to any type
         dup = (~matched) & (p_exist > 0.5) & (mass > 0.01)
         acc["duplicate_rate"].append(float(dup.float().mean()))
-
-        pos = (torch.sigmoid(expr["positive"][slot_idx]) > 0.5).float()
-        acc["positivity_acc"].append(float((pos == t["positive"]).float().mean()))
-        acc["expr_nmse"].append(float(((E_pred[slot_idx] - t["E_gt"]) ** 2).mean()))
-        gmu = slots["geometry"]["mu"][b][slot_idx]
-        from losses_v3 import logit
-        acc["geom_nmse"].append(float(((torch.sigmoid(gmu) - t["geometry"]) ** 2).mean()))
-        acc["mean_match_cost"].append(float(1 - dice.mean()))
 
         cl = (torch.sigmoid(out["dense"]["cell"][b, 0]) > 0.5)
         ct = t if False else tgt["dense"]["cell"][b] > 0.5

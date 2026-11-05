@@ -236,7 +236,7 @@ def _expr_pred(expr):
 
 
 def type_losses_one(slot_out, tgt, w_match: MatchWeights, w: LossWeights,
-                    exist_target="one", min_context_cells=10):
+                    exist_target="one", min_context_cells=10, fw=None):
     """All matched type terms (a,b,c,d,e) for ONE sample at ONE slot-attention iteration.
 
     slot_out: the model's per-iteration dict (existence/expression/geometry/alpha/token_comp/maps)
@@ -248,6 +248,17 @@ def type_losses_one(slot_out, tgt, w_match: MatchWeights, w: LossWeights,
     A = maps[:K]                                              # type-slot maps [K, N4]
     Mgt = tgt["Mgt"]                                          # [J, N4]
     J = Mgt.shape[0]
+    if J == 0:
+        # empty tile: zero present types, so there is nothing to match. Train every slot to predict
+        # "absent" (exactly the negative signal empty patches should teach) and zero the matched-only
+        # terms (b-e), which would otherwise reduce over an empty axis and inject NaN.
+        tgt_pos = torch.zeros(K, device=A.device)
+        bce = F.binary_cross_entropy_with_logits(slot_out["existence"], tgt_pos, reduction="none")
+        z = A.new_zeros(())
+        empty = torch.zeros(0, dtype=torch.long, device=A.device)
+        terms = {"exist": (0.1 * bce).mean(), "type_param": z, "context": z,
+                 "token_comp": z, "matched_map": z}
+        return terms, dict(slot_idx=empty, type_idx=empty)
     # slot_out may carry m_max (padded) markers; the sample's real markers are the first M, matching
     # the target. Slice the expression to them so a padded batch and a single sample agree.
     M = tgt["mk"].shape[0]
@@ -283,11 +294,12 @@ def type_losses_one(slot_out, tgt, w_match: MatchWeights, w: LossWeights,
               * mk).sum() / (mk.sum() * J).clamp(min=1)
     lvl_tgt = logit(tgt["level"][type_idx])                  # normalised level -> logit space
     posmask = pos_tgt * mk
+    fw = fw or {}
     lvl = (F.smooth_l1_loss(expr["level_mu"][slot_idx], lvl_tgt, reduction="none")
            * posmask).sum() / posmask.sum().clamp(min=1)
     gtgt = logit(tgt["geometry"][type_idx])                  # [J, 5]
     geom = F.smooth_l1_loss(slot_out["geometry"]["mu"][slot_idx], gtgt, reduction="none").mean()
-    terms["type_param"] = posbce + lvl + geom
+    terms["type_param"] = posbce + fw.get("level", 1.0) * lvl + fw.get("geom", 1.0) * geom
 
     # (c) context compositions: Dirichlet NLL per valid context (>= min_context_cells, J >= 2)
     ctx = A.new_zeros(())
@@ -337,16 +349,20 @@ def dense_losses(dense, tgt):
     cell = dice_bce(dense["cell"], d["cell"][:, None], mask=keep)
     vis = d["cell_visible"][:, None].float()                 # [B,1,H,W]
     flow = (((dense["flow"] - d["flow"]) ** 2) * vis).sum() / vis.sum().clamp(min=1) / 2
+    nvis = d["nuc_visible"][:, None].float()                 # nucleus flow MSE inside visible nuclei
+    nflow = (((dense["nuc_flow"] - d["nuc_flow"]) ** 2) * nvis).sum() / nvis.sum().clamp(min=1) / 2
     logp = F.log_softmax(dense["structure"], dim=1)         # [B,C,Hg,Wg]
     smask = d["structure_mask"][:, None].float()
     struct = -((d["structure"] * logp).sum(1, keepdim=True) * smask).sum() / smask.sum().clamp(min=1)
-    return dict(nucleus=nuc, cell=cell, flow=flow, structure=struct)
+    return dict(nucleus=nuc, cell=cell, flow=flow, nuc_flow=nflow, structure=struct)
 
 
 # --- global / per-marker losses (h) ------------------------------------------------------------
-def global_marker_losses(out, tgt):
+def global_marker_losses(out, tgt, fw=None):
     # All point-estimate (Huber) losses now -- learned variance removed everywhere (a heteroscedastic
     # NLL let the heads under-fit the mean; uncertainty is deferred to a later calibration pass).
+    # `fw` scales each family (hard-parameter focus across rounds); default 1.0.
+    fw = fw or {}
     g = tgt["global"]
     gerr = F.smooth_l1_loss(out["global_mu"], logit(g["u"]), reduction="none")
     if "mask" in g:                                          # padded globals (variable ARCH length)
@@ -354,19 +370,21 @@ def global_marker_losses(out, tgt):
         gl = (gerr * gm).sum() / gm.sum().clamp(min=1)
     else:
         gl = gerr.mean()
+    gl = gl * fw.get("global", 1.0)
 
     mk = tgt["marker"]
     present = mk["present"].bool()                           # [B,M]
     mo = out["marker"]
     nerr = F.smooth_l1_loss(mo["noise_mu"], logit(mk["noise_u"]), reduction="none")  # [B,M,P]
     pm = present[..., None].float()
-    noise = (nerr * pm).sum() / pm.sum().clamp(min=1)
+    noise = fw.get("noise", 1.0) * (nerr * pm).sum() / pm.sum().clamp(min=1)
     # localisation mu: a Huber POINT-ESTIMATE loss in logit space, NOT an NLL. A learned variance
     # lets the head minimise a Gaussian NLL by predicting the mean with a huge variance (observed:
     # mu collapsed to the mean with uniformly large sigma and never learned), so here we optimise
     # accuracy directly. `mu_logvar` is still produced for later calibration but is not used here.
     mu_err = F.smooth_l1_loss(mo["mu"], logit(mk["mu_u"]), reduction="none")       # [B,M]
-    mu = MU_LOSS_WEIGHT * (mu_err * present.float()).sum() / present.float().sum().clamp(min=1)
+    mu = (MU_LOSS_WEIGHT * fw.get("mu", 1.0)
+          * (mu_err * present.float()).sum() / present.float().sum().clamp(min=1))
     terms = {"global": gl, "marker_noise": noise, "mu": mu}
     if "offset" in mo and "offset" in mk:
         off = ((mo["offset"] - mk["offset"]) ** 2)[present].mean()
@@ -376,12 +394,14 @@ def global_marker_losses(out, tgt):
 
 # --- top-level combiner ------------------------------------------------------------------------
 def total_loss(out, tgt, step, total_steps, w_match: MatchWeights = None,
-               w: LossWeights = None, exist_target="one"):
+               w: LossWeights = None, exist_target="one", family_weights=None):
     """Combine every group with the plan 5.3 fixed weights. Type terms (a-e) are matched and
     averaged over the T slot-attention iterations; (f) discriminative, (g) dense and (h)
-    global/per-marker are charged once. `step` drives the seed-anchor weight (plan 5.4). Returns
-    (scalar total, dict of logged term values)."""
+    global/per-marker are charged once. `step` drives the seed-anchor weight (plan 5.4).
+    `family_weights` (mu/noise/global/level/geom) upweights hard parameter families across rounds
+    (plan 6.3 hard-parameter focus); None = all 1.0. Returns (scalar total, dict of logged terms)."""
     w = w or LossWeights()
+    fw = family_weights or {}
     sched = schedule(step, total_steps)
     w_match = w_match or MatchWeights()
     w_match = MatchWeights(w_match.dice, w_match.bce, w_match.expr, w_match.exist, sched["w_seed"])
@@ -395,13 +415,13 @@ def total_loss(out, tgt, step, total_steps, w_match: MatchWeights = None,
         for ti in range(T):
             so = {k: (v[b] if torch.is_tensor(v) else
                       {kk: vv[b] for kk, vv in v.items()}) for k, v in out["slots"][ti].items()}
-            terms, _ = type_losses_one(so, tgt["type"][b], w_match, w, exist_target)
+            terms, _ = type_losses_one(so, tgt["type"][b], w_match, w, exist_target, fw=fw)
             for k in type_terms:
                 type_terms[k] = type_terms[k] + terms[k] / (B * T)
         discrim = discrim + discriminative_one(out["emb"][b], tgt["type"][b]["type4_pure"]) / B
 
     dense = dense_losses(out["dense"], tgt)
-    gm = global_marker_losses(out, tgt)
+    gm = global_marker_losses(out, tgt, fw=fw)
 
     total = (w.exist * type_terms["exist"] + w.type_param * type_terms["type_param"]
              + w.context * type_terms["context"] + w.token_comp * type_terms["token_comp"]

@@ -223,7 +223,9 @@ class Stem(nn.Module):
 
     def __init__(self, d_tag=32):
         super().__init__()
-        self.c1 = nn.ModuleList([_conv(1, 16, 3), _conv(16, 16, 3), _conv(16, 16, 5)])
+        # 2 input channels: the (per-marker normalised) intensity + the per-marker expression-strength
+        # plane, so the stem sees each channel's relative brightness alongside its texture.
+        self.c1 = nn.ModuleList([_conv(2, 16, 3), _conv(16, 16, 3), _conv(16, 16, 5)])
         self.mix1 = PixelMix(16, 16, d_tag)
         self.c2 = nn.ModuleList([_conv(16, 32, 3, 2), _conv(32, 32, 3)])
         self.mix2 = PixelMix(32, 32, d_tag)
@@ -237,9 +239,11 @@ class Stem(nn.Module):
             y = F.gelu(conv(y))
         return y.view(B, M, *y.shape[1:])
 
-    def forward(self, tile, tags, present):                      # tile: [B, M, H, W]
+    def forward(self, tile, tags, present, strength):            # tile: [B, M, H, W]; strength: [B, M]
         logI4 = F.avg_pool2d(tile.flatten(0, 1), 4).view(*tile.shape[:2], tile.shape[2] // 4, -1)
-        h = tile[:, :, None]                                      # [B, M, 1, H, W]
+        B, M, H, W = tile.shape
+        sp = strength[:, :, None, None, None].expand(B, M, 1, H, W)   # strength broadcast as a plane
+        h = torch.cat([tile[:, :, None], sp], dim=2)              # [B, M, 2, H, W]
         h = self._run_convs(self.c1, h)
         h, s1 = self.mix1(h, tags, present)
         h = self._run_convs(self.c2, h)
@@ -255,17 +259,19 @@ class Trunk(nn.Module):
         super().__init__()
         self.tokenize = nn.Conv2d(48, d, 4, stride=4)
         self.tag_proj = nn.Linear(d_tag, d)
+        self.strength_proj = nn.Linear(1, d)                     # per-marker expression strength
         self.ln = nn.LayerNorm(d)
         self.blocks = nn.ModuleList(
             AxialBlock(d, heads, window, shift=(i % 2 == 1)) for i in range(n_blocks))
         self.d = d
 
-    def forward(self, h4, tags, present):                        # h4: [B, M, 48, Hf, Wf]
+    def forward(self, h4, tags, present, strength):              # h4: [B, M, 48, Hf, Wf]
         B, M, _, Hf, Wf = h4.shape
         t = self.tokenize(h4.flatten(0, 1))                      # [B*M, d, Hg, Wg]
         Hg, Wg = t.shape[-2:]
         t = t.view(B, M, self.d, Hg, Wg).permute(0, 1, 3, 4, 2)  # [B, M, Hg, Wg, d]
-        t = t + self.tag_proj(tags)[:, :, None, None, :]
+        t = (t + self.tag_proj(tags)[:, :, None, None, :]
+             + self.strength_proj(strength[:, :, None])[:, :, None, None, :])
         pe = sincos_2d(Hg, Wg, self.d, t.device).view(1, 1, Hg, Wg, self.d)
         t = self.ln(t + pe)
         for blk in self.blocks:
@@ -346,6 +352,7 @@ class DenseDecoder(nn.Module):
         self.nucleus = _conv(32, 1, 1)
         self.cell = _conv(32, 1, 1)
         self.flow = _conv(32, 2, 1)
+        self.nuc_flow = _conv(32, 2, 1)             # Omnipose flows for nuclei (separate touching ones)
         self.structure = _conv(g16, n_context, 1)
         self.ctx4 = _conv(g16, 64, 1)
 
@@ -357,6 +364,7 @@ class DenseDecoder(nn.Module):
         d2 = self.up2(dec4)
         d1 = self.up1(d2)
         out = dict(nucleus=self.nucleus(d1), cell=self.cell(d1), flow=torch.tanh(self.flow(d1)),
+                   nuc_flow=torch.tanh(self.nuc_flow(d1)),
                    structure=self.structure(x), dec4=dec4,
                    ctx4=F.interpolate(self.ctx4(x), scale_factor=4, mode="bilinear",
                                       align_corners=False))
@@ -621,16 +629,19 @@ class ModelV3(nn.Module):
             n_seeds[b] = len(chosen)
         return seeds, n_seeds
 
-    def forward(self, tile, present=None, tags=None, seeds=None, n_seeds=None):
+    def forward(self, tile, present=None, strength=None, tags=None, seeds=None, n_seeds=None):
         B, M, H, W = tile.shape
         device = tile.device
         if present is None:
             present = torch.ones(B, M, dtype=torch.bool, device=device)
+        if strength is None:
+            strength = torch.zeros(B, M, device=device)
+        strength = strength.to(device)
         if tags is None:
             tags = torch.randn(B, M, self.d_tag, device=device) / math.sqrt(self.d_tag)
 
-        feats = self.stem(tile, tags, present)
-        t = self.trunk(feats["h4"], tags, present)               # [B, M, Hg, Wg, d]
+        feats = self.stem(tile, tags, present, strength)
+        t = self.trunk(feats["h4"], tags, present, strength)     # [B, M, Hg, Wg, d]
         g16p, g32 = self.fusion(t, present)
         dense = self.decoder(g16p, feats["s4"])
 
@@ -664,7 +675,7 @@ class ModelV3(nn.Module):
         return dict(
             global_mu=self.global_head(g32),
             marker=self.marker_head(t, loc_feat),
-            dense={k: dense[k] for k in ("nucleus", "cell", "flow", "structure")},
+            dense={k: dense[k] for k in ("nucleus", "cell", "flow", "nuc_flow", "structure")},
             slots=slot_out, seeds=seeds, n_seeds=n_seeds, emb=emb)
 
     def _region_probs(self, dense, N4):

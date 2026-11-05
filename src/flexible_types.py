@@ -214,7 +214,7 @@ def are_distinct(a: int, b: int, positive, level, geometry, min_level_diff):
 
 
 def sample_typeset(rng, M, *, k_true_range=(1, 30), max_depth=4, min_level_diff=0.3,
-                   p_pos=0.25, counterstain=0, max_retries=20):
+                   p_pos=0.25, counterstain=0, max_retries=20, background=None):
     """Draw a cell-type set from the lineage-tree prior (plan 3.2).
 
     Root types are independent: each marker (bar the counterstain) is positive with probability
@@ -231,6 +231,7 @@ def sample_typeset(rng, M, *, k_true_range=(1, 30), max_depth=4, min_level_diff=
     """
     b_min, b_max = expression_range()
     lg_lo, lg_hi = np.log10(b_min), np.log10(b_max)
+    bg = np.zeros(M, bool) if background is None else np.asarray(background, bool)
 
     k_true = int(rng.integers(k_true_range[0], k_true_range[1] + 1))
     n_roots = int(rng.integers(1, min(5, k_true) + 1))
@@ -264,6 +265,7 @@ def sample_typeset(rng, M, *, k_true_range=(1, 30), max_depth=4, min_level_diff=
         for _try in range(max_retries):
             pos_row = rng.random(M) < p_pos
             pos_row[counterstain] = True
+            pos_row[bg] = False                              # background-only markers: never expressed
             lvl_row = np.full(M, np.nan)
             lvl_row[pos_row] = [draw_level() for _ in range(int(pos_row.sum()))]
             geom = _sample_geometry(rng)
@@ -283,9 +285,9 @@ def sample_typeset(rng, M, *, k_true_range=(1, 30), max_depth=4, min_level_diff=
             lvl_row = level[par].copy()
             geom = {k: geometry[par, i] for i, k in enumerate(GEOM_KEYS)}
 
-            # flip 1 + Poisson(1) markers (never the counterstain); a new positive draws a level
+            # flip 1 + Poisson(1) markers (never the counterstain or a background marker)
             n_flip = 1 + int(rng.poisson(1))
-            cand = np.array([m for m in range(M) if m != counterstain])
+            cand = np.array([m for m in range(M) if m != counterstain and not bg[m]])
             flip = rng.choice(cand, size=min(n_flip, cand.size), replace=False)
             for m in flip:
                 pos_row[m] = not pos_row[m]
@@ -313,36 +315,35 @@ def sample_typeset(rng, M, *, k_true_range=(1, 30), max_depth=4, min_level_diff=
 
 
 def sample_panel(rng, *, m_range=(8, 40), dyes, n_noise_kinds, noise_comps=(1, 4),
-                 renderable=RENDERABLE_COMPARTMENTS):
+                 p_background=0.0):
     """Draw a panel of M markers (plan 3.1).
 
     M ~ U{m_range}. Channel 0 is the nuclear counterstain -- always present, nuclear, the
     registration reference -- the canonical, UNPERMUTED order. Every other channel draws a dye, a
-    compartment (from `COMPARTMENT_PRIOR` renormalised over `renderable`) and a handful of noise
-    texture kinds. `order` is a per-sample permutation of the output channel positions so that
-    position carries no information; callers apply it, and the counterstain's post-permutation slot
-    is `order[0]`. Compartment is per marker: a marker localises the same way in every type that
-    expresses it.
+    continuous localisation `mu` in [MU_LO, MU_HI] and a handful of noise texture kinds. `order` is a
+    per-sample permutation of the output channel positions so that position carries no information.
+
+    `background[m]` (prob `p_background` per antibody channel; never the counterstain) flags a
+    BACKGROUND-ONLY marker -- a channel that no cell type expresses, so it shows only per-dye
+    autofluorescence + noise (+ aggregates when artifacts are on). Real panels are full of these
+    (non-binding antibodies, failed stains); the model must learn to ignore them rather than read
+    cells from them.
     """
     M = int(rng.integers(m_range[0], m_range[1] + 1))
-
-    renderable = list(renderable)
-    w = np.array([COMPARTMENT_PRIOR[c] for c in renderable], float)
-    w = w / w.sum()
-
-    # `renderable`/`w` are no longer used to pick a class; a marker's localisation is a continuous
-    # mu in [MU_LO, MU_HI]. The counterstain (channel 0) is fixed nuclear at DAPI_MU.
     mu = [DAPI_MU]                                          # the counterstain
     dye = [None]                                            # filled by the caller's DAPI marker
     noise = [()]                                            # DAPI carries no antibody texture
+    background = [False]                                    # the counterstain is never background
     for _ in range(M - 1):
         mu.append(float(rng.uniform(MU_LO, MU_HI)))
         dye.append(str(rng.choice(list(dyes))))
         k = int(rng.integers(noise_comps[0], noise_comps[1] + 1))
         noise.append(tuple(int(x) for x in rng.integers(0, n_noise_kinds, size=k)))
+        background.append(bool(rng.random() < p_background))
 
     order = rng.permutation(M)
-    return dict(M=M, mu=mu, dye=dye, noise=noise, order=order, counterstain=0)
+    return dict(M=M, mu=mu, dye=dye, noise=noise, order=order, counterstain=0,
+                background=np.array(background, bool))
 
 
 def sample_compositions(rng, kinds, K, *, p_allow_bg=0.8, p_allow_struct=0.4):
@@ -423,26 +424,39 @@ def build_marker(rng, *, name, dye, mu, noise_kind_idx):
 
 
 def _flexible_architecture(rng, *, max_structures=3):
-    """A small tissue architecture for flexible mode: 1..max_structures bundles/vessels of random
-    kind. Profiles are left empty -- compositions (per kind) replace the per-instance log-weights,
-    so no structure needs a Profile any more. FRAC/WALL_IN are narrowed and CONTACT pinned exactly
-    as the fixed-mode builder does, for the same feasibility reasons (a lumen must not outgrow the
-    tissue budget; the compliance solve must not engage)."""
-    n = int(rng.integers(1, max_structures + 1))
-    frac_hi = 0.9 / n
+    """A small tissue architecture for flexible mode: 0..max_structures bundles/vessels of random
+    kind. ZERO is now reachable -- a structure-free, cell-only (or, with COVER=0, empty) tile, which
+    build_architecture handles by uniform thinning with no director. Profiles are left empty --
+    compositions (per kind) replace the per-instance log-weights, so no structure needs a Profile any
+    more. FRAC/WALL_IN are narrowed and CONTACT pinned exactly as the fixed-mode builder does, for the
+    same feasibility reasons (a lumen must not outgrow the tissue budget; the compliance solve must
+    not engage)."""
+    n = int(rng.integers(0, max_structures + 1))
     structures, kinds = [], []
-    for i in range(n):
-        kind = "vessel" if rng.random() < 0.5 else "ordered"
-        cls = Vasculature if kind == "vessel" else Ordered
-        st = cls(name=f"s{i}", Profile={})
-        st.FRAC = narrow(st.FRAC, st.FRAC.lo, frac_hi * (0.5 if kind == "vessel" else 1.0))
-        if kind == "vessel":
-            st.WALL_IN = narrow(st.WALL_IN, st.WALL_IN.lo, min(st.WALL_IN.hi, 0.5))
-        structures.append(st)
-        kinds.append(kind)
+    if n > 0:
+        frac_hi = 0.9 / n
+        for i in range(n):
+            kind = "vessel" if rng.random() < 0.5 else "ordered"
+            cls = Vasculature if kind == "vessel" else Ordered
+            st = cls(name=f"s{i}", Profile={})
+            st.FRAC = narrow(st.FRAC, st.FRAC.lo, frac_hi * (0.5 if kind == "vessel" else 1.0))
+            if kind == "vessel":
+                st.WALL_IN = narrow(st.WALL_IN, st.WALL_IN.lo, min(st.WALL_IN.hi, 0.5))
+            structures.append(st)
+            kinds.append(kind)
     arch = TissueArchitecture(Structures=structures)
     arch.CONTACT = narrow(arch.CONTACT, 0.0, 0.0)
     return arch, kinds
+
+
+def _expected_visible_cells(tg):
+    """Rough estimate of how many cells a tile of this density will actually SHOW. Used only to cap
+    the requested type count so a sparse tile does not ask for more distinct types than it can
+    realise (each present type needs several visible cells). Anchored at the historical prior
+    (MIN_DIST=11, COVER=0.75 -> ~40 visible cells) and scaled inverse-square in spacing and linearly
+    in coverage. Deliberately approximate -- it bounds a count, it is not a target."""
+    md = max(float(tg.MIN_DIST.v), 1e-3)
+    return 40.0 * (float(tg.COVER.v) / 0.75) * (11.0 / md) ** 2
 
 
 def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_KINDS),
@@ -457,14 +471,52 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
     None uses the final prior. The order in which markers appear in the panel (and so in the image)
     is a per-sample permutation, so channel position carries no information.
     """
-    from parameter import TissueGeometry                    # local: avoids a heavy import at load
-    cur = dict(m_range=(8, 40), k_true_range=(1, 30), max_depth=4, min_level_diff=0.3)
+    from parameter import TissueGeometry, narrow as _narrow  # local: avoids a heavy import at load
+    import config as _cfg
+    cur = dict(m_range=(8, 40), k_true_range=(1, 30), max_depth=4, min_level_diff=0.3,
+               p_background=0.0)
     cur.update(curriculum or {})
 
-    panel_spec = sample_panel(rng, m_range=cur["m_range"], dyes=dyes, n_noise_kinds=n_noise_kinds)
+    # --- per-tile tissue density, drawn BEFORE the type set so the type count can be capped to what
+    # the cellularity can actually show. The model must handle the whole span (dense-no-background ->
+    # empty) at every round, so density is NOT interpolated by the curriculum. An empty tile is
+    # COVER=0 (support_mask returns all-False) with zero structures -- a genuine zero-cell negative. ---
+    dens = _cfg.DENSITY
+    empty = bool(rng.random() < float(dens.get("p_empty", 0.0)))
+    ms = 0 if empty else int(dens["max_structures"])
+    arch, kinds = _flexible_architecture(rng, max_structures=ms)
+
+    tg = TissueGeometry()
+    if empty:
+        tg.COVER = _narrow(tg.COVER, tg.COVER.lo, tg.COVER.hi, 0.0)
+        tg.MIN_DIST = _narrow(tg.MIN_DIST, tg.MIN_DIST.lo, tg.MIN_DIST.hi, dens["MIN_DIST"][1])
+    else:
+        # a vessel lumen is non-tissue, so a near-full COVER plus a vessel is geometrically infeasible
+        # (tissue + lumen > volume, which build_architecture rejects). Cap COVER when a vessel is
+        # present; a structure-free or ordered-only tile can still fill the frame (dense, no-background).
+        cov_lo, cov_hi = dens["COVER"]
+        if "vessel" in kinds:
+            cov_hi = min(cov_hi, 0.8)
+        tg.MIN_DIST = _narrow(tg.MIN_DIST, tg.MIN_DIST.lo, tg.MIN_DIST.hi,
+                              float(rng.uniform(*dens["MIN_DIST"])))
+        tg.COVER = _narrow(tg.COVER, tg.COVER.lo, tg.COVER.hi, float(rng.uniform(cov_lo, cov_hi)))
+        tg.GROW = _narrow(tg.GROW, tg.GROW.lo, tg.GROW.hi, float(rng.uniform(*dens["GROW"])))
+
+    # cap the requested number of distinct types to what this cellularity can realise: a type counts
+    # as present only with >= VIS.min_visible_cells visible cells, so a sparse tile that asked for many
+    # types would end up with ZERO present types (no typing signal) and bias the existence head toward
+    # "no types". Dense tiles are unaffected (the cap exceeds the curriculum ceiling there).
+    klo, khi = cur["k_true_range"]
+    k_cap = max(1, int(round(_expected_visible_cells(tg) / float(_cfg.VIS["min_visible_cells"]))))
+    k_range = (min(klo, k_cap), min(khi, k_cap))
+
+    panel_spec = sample_panel(rng, m_range=cur["m_range"], dyes=dyes, n_noise_kinds=n_noise_kinds,
+                              p_background=cur["p_background"])
     M = panel_spec["M"]
-    ts = sample_typeset(rng, M, k_true_range=cur["k_true_range"], max_depth=cur["max_depth"],
-                        min_level_diff=cur["min_level_diff"], counterstain=panel_spec["counterstain"])
+    bg = panel_spec["background"]
+    ts = sample_typeset(rng, M, k_true_range=k_range, max_depth=cur["max_depth"],
+                        min_level_diff=cur["min_level_diff"], counterstain=panel_spec["counterstain"],
+                        background=bg)
     K = ts.K
     b_min, b_max = expression_range()
 
@@ -475,9 +527,12 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
         if m == panel_spec["counterstain"]:
             canon[nm] = dapi_marker(name=nm)                 # the counterstain, always nuclear
         else:
-            canon[nm] = build_marker(rng, name=nm, dye=panel_spec["dye"][m],
-                                     mu=panel_spec["mu"][m],
-                                     noise_kind_idx=panel_spec["noise"][m])
+            mk = build_marker(rng, name=nm, dye=panel_spec["dye"][m], mu=panel_spec["mu"][m],
+                              noise_kind_idx=panel_spec["noise"][m])
+            if bg[m]:                                        # background-only -> antibody aggregates
+                mk.artifact_affinity = _narrow(mk.artifact_affinity, 1.0,
+                                               mk.artifact_affinity.hi, mk.artifact_affinity.hi)
+            canon[nm] = mk
     names_canon = [_marker_name(m, dapi_name) for m in range(M)]
     order = panel_spec["order"]
     panel = MarkerPanel(Markers={names_canon[p]: canon[names_canon[p]] for p in order})
@@ -497,19 +552,19 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
         types[_type_name(k)] = CellType(name=_type_name(k), Color="black",
                                         Geometry=geom, Expression=expr)
 
-    arch, kinds = _flexible_architecture(rng, max_structures=max_structures)
     contexts, allowed, pi = sample_compositions(rng, kinds, K)
     struct_to_ctx = [contexts.index(kd) for kd in kinds]
     compositions = dict(contexts=contexts, pi=pi, allowed=allowed,
                         struct_to_ctx=struct_to_ctx, type_order=[_type_name(k) for k in range(K)])
 
     world = {
-        "PANEL": panel, "TYPES": types, "TG": TissueGeometry(), "DET": detector,
+        "PANEL": panel, "TYPES": types, "TG": tg, "DET": detector,
         "ARCH": arch, "CELL": CellGeometry(), "FRACTIONS": list(np.ones(K) / K),
         "COMPOSITIONS": compositions, "PANEL_SPEC": panel_spec, "TYPESET": ts,
         "META": dict(K=K, M=M, counterstain=panel_spec["counterstain"],
                      channel_order=order, b_range=(b_min, b_max),
-                     mu=list(panel_spec["mu"])),               # canonical-order localisation targets
+                     mu=list(panel_spec["mu"]),                 # canonical-order localisation targets
+                     empty=empty, n_struct=len(arch.Structures)),
     }
     return world
 
@@ -605,6 +660,20 @@ def theta_v3(world, cyc=None):
     g_names, g_u = _scalar_block(world["ARCH"], "ARCH", pin=_GLOBAL_PIN)
     tg_names, tg_u = _scalar_block(world["TG"], "TG", keep=(r"\.SIZE_SIGMA$",))  # per-cell size CV
     n_names, n_u = _scalar_block(world["PANEL"], "PANEL", keep=_NOISE_KEEP)
+
+    # DENSITY block, PREPENDED so it sits at fixed global indices 0..3. The global target is padded
+    # positionally (targets_v3.build_sample_targets), and the ARCH block length varies with the
+    # structure count, so anything after it lands at a shifting index and is hard to learn. Density
+    # is the user-facing prediction, so it goes first: cell spacing / coverage / confluence, plus the
+    # total structure territory fraction (0 when there are no structures).
+    from parameter import get_p, to_u
+    tgw = world["TG"]
+    struct_frac = float(np.clip(sum(float(s.FRAC.v) for s in world["ARCH"].Structures), 0.0, 1.0))
+    dens_names = np.array(["TG.MIN_DIST", "TG.COVER", "TG.GROW", "ARCH.STRUCT_FRAC"])
+    dens_u = np.array([_clamp_u(to_u(get_p(tgw, "MIN_DIST"))),
+                       _clamp_u(to_u(get_p(tgw, "COVER"))),
+                       _clamp_u(to_u(get_p(tgw, "GROW"))),
+                       _clamp_u(struct_frac)], np.float64)
     noise4 = _marker_noise4(world["PANEL"])                   # [M, 4] target the marker head predicts
 
     offsets = np.zeros((M, 2), np.float32)
@@ -612,8 +681,8 @@ def theta_v3(world, cyc=None):
         offsets = np.asarray(cyc["channel_offsets"], np.float32).reshape(M, 2)
 
     return {
-        "global_names": np.concatenate([g_names, tg_names]),
-        "global_u": np.concatenate([g_u, tg_u]),
+        "global_names": np.concatenate([dens_names, g_names, tg_names]),
+        "global_u": np.concatenate([dens_u, g_u, tg_u]),
         "noise_names": n_names,
         "noise_u": n_u,
         "noise4": noise4,

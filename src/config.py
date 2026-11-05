@@ -70,8 +70,9 @@ _TAU_CLIP = 4.0
 DETECTOR = dict(
     # photoelectrons per unit of marker amplitude
     E_PER_UNIT=120.0,
-    # camera read noise, electrons RMS
-    READ_E=2.5,
+    # camera read noise, electrons RMS (20 e- ~ 12 ADU single-frame, matching the real slide; it is
+    # also what sets the backsub empty-tile floor -- see Detector.READ_E)
+    READ_E=20.0,
     # dark current + stray light, electrons
     DARK_E=5.0,
     # digitiser conversion gain
@@ -86,6 +87,21 @@ DETECTOR = dict(
     ILLUM_CV=0.06,
     # radial falloff at the frame corners
     VIGNETTE=0.18,
+    # --- MACSIMA background subtraction (staged-pipeline domain); see Detector for the physics ---
+    # subtract an independent blank cycle from each non-DAPI marker and clip at 0 (1 = staged, 0 = raw)
+    BG_SUBTRACT=1.0,
+    # blank-vs-marker bleach/illumination drift (fraction); with BG_MARGIN_ADU sets the zero fraction
+    BG_DRIFT=0.10,
+    # blank-AF registration offset vs the marker (px); sets the residual's spatial texture
+    BG_SHIFT_PX=1.0,
+    # constant ADU over-subtracted after the blank; raises the empty-tile zero fraction
+    BG_MARGIN_ADU=6.0,
+    # fraction of defective/transient hot pixels (marker frame only -> survive backsub as the tail)
+    HOT_RATE=7e-5,
+    # electrons a hot pixel dumps
+    HOT_E=500.0,
+    # Gaussian sigma (px) correlating the read-noise floor; 0 = white (only active under BG_SUBTRACT)
+    READ_SMOOTH_PX=0.5,
 )
 BIT_DEPTH = 16
 ADU_MAX = 2**BIT_DEPTH - 1
@@ -144,7 +160,25 @@ GENERATOR = dict(
         max_depth=dict(start=1,           final=4),         # lineage tree depth (1 = roots only)
         min_level_diff=dict(start=0.6,    final=0.3),       # distinctness margin, decades
         m_range=dict(start=(20, 40),      final=(8, 40)),   # channels (markers) per tile
+        p_background=dict(start=0.1,      final=0.3),       # fraction of background-only markers
     ),
+)
+
+
+# DENSITY is the per-tile cellularity/structure spread, drawn fresh for EVERY tile in
+# build_flexible_world -- deliberately NOT a curriculum (no start/final): the model must handle the
+# whole span at every training round, from a fully-packed field with no empty background down to a
+# genuinely empty patch. MIN_DIST/COVER/GROW are voxels / fraction / confluence as on TissueGeometry;
+# max_structures is the inclusive ceiling on structure instances (0 is now reachable -> a cell-only
+# tile); p_empty is the share of tiles that carry ZERO cells (COVER 0, no structures) as negatives.
+DENSITY = dict(
+    MIN_DIST=(4.0, 30.0),      # vox: 4 ~ fully packed (no gaps), 30 ~ sparse (a few cells). Cell
+                               # count ~ 1/MIN_DIST^2, so the very-sparse end (>30) adds almost
+                               # nothing between "sparse" and the explicit empty tiles below.
+    COVER=(0.15, 1.0),         # fraction of the frame that is tissue; 1.0 = no empty background
+    GROW=(1.1, 2.8),           # confluence: ~1.1 gaps between cells, ~2.8 confluent sheet
+    max_structures=3,          # structure count drawn uniform in [0, max_structures]
+    p_empty=0.10,              # ~10% genuinely empty (zero-cell) tiles
 )
 
 
@@ -167,6 +201,8 @@ def curriculum_at(t):
                             + t * (c["max_depth"]["final"] - c["max_depth"]["start"]))),
         min_level_diff=float(c["min_level_diff"]["start"]
                              + t * (c["min_level_diff"]["final"] - c["min_level_diff"]["start"])),
+        p_background=float(c["p_background"]["start"]
+                           + t * (c["p_background"]["final"] - c["p_background"]["start"])),
     )
 
 

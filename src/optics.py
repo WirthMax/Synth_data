@@ -88,8 +88,15 @@ def _cov_thresh(cov, mask_pct):
 def mask_collapse(mask, z_um, opt=None, mask_pct=0.95, keep_largest = True):
     """The honest 2D footprint of a 3D object seen through the exact optics.
     """
-    # single mask case
     mask = np.asarray(mask)
+    # empty tile: nothing is labelled. Return an honest empty footprint -- without this the
+    # `max() <= 1` branch below thresholds an all-zero coverage and declares the WHOLE frame one
+    # instance (a frame-filling phantom cell on a tile that should have none).
+    if mask.max() <= 0:
+        z = np.zeros(mask.shape[1:], np.float32)
+        return np.zeros(mask.shape[1:], bool), z
+
+    # single mask case
     if mask.dtype == bool or mask.max() <= 1:
         cov = psf_project(slice_vol=mask.astype(np.float32), z_um=z_um, optics=opt)
         thr = _cov_thresh(cov, mask_pct)
@@ -133,6 +140,18 @@ def _smooth_unit(w, sigma_px):
     z = np.fft.irfftn(np.fft.rfftn(w) * H, s=(ny, nx), axes=(0, 1))
     z = z - z.mean()
     return (z / (z.std() + 1e-12)).astype(np.float32)
+
+
+def _corr_noise(z, sigma_px):
+    """Give a frozen white-noise field a short correlation length, variance-preserving. A real
+    sensor's read noise is not perfectly per-pixel white (demosaic, on-chip readout, the resampling
+    the registration applies downstream), so the empty-tile floor is slightly blobby. sigma_px 0
+    returns the field untouched (pure white); a small sigma renormalises back to unit SD so the
+    read_e scaling downstream is unchanged."""
+    if sigma_px <= 0:
+        return z
+    zz = ndi.gaussian_filter(np.asarray(z, np.float32), float(sigma_px), mode="reflect")
+    return (zz / (zz.std() + 1e-12)).astype(np.float32)
 
 
 def illumination(shape, illum_cv, vignette, tape):
@@ -186,14 +205,27 @@ def detector(img_psf, profile, det, opt, tape, markers, quantise=False,
     illum_cv    = det.ILLUM_CV.v
     vignette    = det.VIGNETTE.v
     bit_depth   = det.BIT_DEPTH
-    
+    # MACSIMA background-subtraction + sensor-floor knobs (absent on old Detector instances -> off)
+    bg_subtract = bool(det.BG_SUBTRACT.v) if hasattr(det, "BG_SUBTRACT") else False
+    bg_drift    = det.BG_DRIFT.v      if hasattr(det, "BG_DRIFT")      else 0.0
+    bg_shift_px = det.BG_SHIFT_PX.v   if hasattr(det, "BG_SHIFT_PX")   else 0.0
+    bg_margin   = det.BG_MARGIN_ADU.v if hasattr(det, "BG_MARGIN_ADU") else 0.0
+    hot_rate    = det.HOT_RATE.v      if hasattr(det, "HOT_RATE")      else 0.0
+    hot_e       = det.HOT_E.v         if hasattr(det, "HOT_E")         else 0.0
+    read_smooth = det.READ_SMOOTH_PX.v if hasattr(det, "READ_SMOOTH_PX") else 0.0
+
     img_psf = np.asarray(img_psf, np.float32)
     ny, nx, nc = img_psf.shape
     if tape.z_shot.shape != (nc, ny, nx):
         raise ValueError(
             f"sensor tape is {tape.z_shot.shape} but the image is {(nc, ny, nx)}. "
             f"Re-run tape.drawSensor(shape=({ny}, {nx}, {nc})) -- and set IMG to match.")
-    
+    if bg_subtract and (not hasattr(tape, "u_hot") or tape.u_hot.shape != (nc, ny, nx)):
+        raise ValueError(
+            f"BG_SUBTRACT is on but the backsub tape fields are missing or {getattr(tape, 'u_hot', None) is not None and tape.u_hot.shape}. "
+            f"Re-run tape.drawSensor(shape=({ny}, {nx}, {nc})) so z_shot_bg/z_read_bg/u_hot/af_shift/"
+            f"z_bg_drift are drawn -- or set DET.BG_SUBTRACT=0 for the raw-pedestal camera.")
+
     ill = illumination((ny, nx), illum_cv, vignette, tape)
     sig_px = max(af_scale_um / opt.um_per_px, 0.5)
 
@@ -202,17 +234,50 @@ def detector(img_psf, profile, det, opt, tape, markers, quantise=False,
         fl = profile.Markers[m].fluorophore
         af_level = float(autofluor.get(fl, 0.0))
         # autofluorescence is emitted BY the tissue, so it is illuminated like everything else
-        af = af_level * np.maximum(1.0 + af_cv * _smooth_unit(tape["w_af"][k], sig_px), 0.0)
+        af_prof = np.maximum(1.0 + af_cv * _smooth_unit(tape["w_af"][k], sig_px), 0.0)
+        af = af_level * af_prof
 
         # marker photoelectrons
         sig_e = e_per_unit * img_psf[..., k] * ill
         # autofluorescence photoelectrons
         bg_e = e_per_unit * af * ill
         e = np.maximum(sig_e + bg_e, 0.0)
-        # shot noise scales as sqrt(signal): bright pixels are noisier
-        noisy = e + np.sqrt(e) * tape["z_shot"][k] + read_e * tape["z_read"][k] + dark_e
-        # unclipped, unrounded ADU -- clip/round happen once, after the optional cycle shift
-        adu[..., k] = noisy * adu_per_e + offset_adu
+
+        if not bg_subtract:
+            # raw-pedestal camera, bit-for-bit the old behaviour
+            # shot noise scales as sqrt(signal): bright pixels are noisier
+            noisy = e + np.sqrt(e) * tape["z_shot"][k] + read_e * tape["z_read"][k] + dark_e
+            # unclipped, unrounded ADU -- clip/round happen once, after the optional cycle shift
+            adu[..., k] = noisy * adu_per_e + offset_adu
+            continue
+
+        # staged-pipeline domain: acquire the marker frame (with hot pixels), then an independent
+        # blank/bleach reference of the SAME autofluorescence, and subtract. DAPI is the
+        # registration target -- it has no blank, so it keeps its pedestal and is not subtracted.
+        z_read_m = _corr_noise(tape["z_read"][k], read_smooth)
+        hot = hot_e * (tape["u_hot"][k] < hot_rate)
+        marker = e + np.sqrt(e) * tape["z_shot"][k] + read_e * z_read_m + dark_e + hot
+        marker_adu = marker * adu_per_e + offset_adu
+
+        if fl == "DAPI":
+            adu[..., k] = marker_adu
+            continue
+
+        # the blank images the same AF, bleach-drifted (brighter by bg_drift, so AF over-subtracts)
+        # and misregistered by bg_shift_px in a per-channel random direction, with its own noise
+        sh = tape["af_shift"][k]
+        nrm = float(np.hypot(sh[0], sh[1])) + 1e-6
+        dy, dx = bg_shift_px * sh[0] / nrm, bg_shift_px * sh[1] / nrm
+        drift = max(0.0, 1.0 + bg_drift * (1.0 + 0.5 * float(tape["z_bg_drift"][k])))
+        af_b = drift * af_level * np.maximum(
+            ndi.shift(af_prof, (dy, dx), order=1, mode="reflect"), 0.0)
+        bg_e_b = np.maximum(e_per_unit * af_b * ill, 0.0)
+        z_read_b = _corr_noise(tape["z_read_bg"][k], read_smooth)
+        blank = bg_e_b + np.sqrt(bg_e_b) * tape["z_shot_bg"][k] + read_e * z_read_b + dark_e
+        blank_adu = blank * adu_per_e + offset_adu
+        # subtract + a small over-subtraction margin; the final np.clip(., 0, .) rectifies at 0,
+        # leaving the near-zero floor with sparse positive speckle the staged images show
+        adu[..., k] = marker_adu - blank_adu - bg_margin
 
     if cycle_of is not None:
         adu = apply_cycle_misregistration(adu, cycle_of, cycle_offsets, cycle_mode)

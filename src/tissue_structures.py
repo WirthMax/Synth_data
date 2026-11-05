@@ -240,6 +240,22 @@ def build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox, L=4, l_min=2)
             f"structure FRACs sum to {frac_sum:.3f}; they are shares of the TISSUE, so they "
             f"must leave room for the interstitium. Lower some, or raise TG.COVER.")
 
+    # no structures: a cell-only (or empty) tile. There is no director field and no pressure solve
+    # to run, so support is just the frozen tissue field thresholded at `cover` (COVER=0 => empty).
+    # `field=None` signals the structure-free path to build_tissue_V2, which then thins uniformly.
+    if not structs:
+        w = np.asarray(tape["support3"], np.float32)
+        psi = _smooth_z(w, max(float(TG.SUPPORT_SCALE.v), 0.5),
+                        max(float(TG.SUPPORT_SCALE_Z.v), 0.5))
+        support = (np.zeros(shape, bool) if cover <= 0.0
+                   else psi >= np.quantile(psi, 1.0 - cover))
+        realised = float(support.sum()) / max(n_tot, 1)
+        report = {"targets": {"background": cover}, "realised": {"background": realised},
+                  "territory": {}, "levels": {}, "count": {}, "asked": {}, "size_um": {},
+                  "body_kept": {}, "split": {}, "density": {}, "cover": realised,
+                  "seed_clear": float("inf"), "iters": 0, "converged": True}
+        return support, None, report
+
     report = {"targets": {}, "realised": {}, "levels": {}, "territory": {},
               "count": {}, "asked": {}, "size_um": {}, "body_kept": {}, "split": {},
               "density": {}}
