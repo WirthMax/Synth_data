@@ -140,6 +140,17 @@ ARTIFACT_ID0 = 100000
 # mu), not for generation. Lives here (numpy-only module) so the synmodel training side can read it
 # without importing the generation stack.
 MU_LO, MU_HI = -0.9, 1.0
+
+# Absolute brightness of antibody markers relative to the panel `amp` prior. The model sees only
+# per-channel normalised images plus a RELATIVE strength, so absolute brightness is set by the
+# training prior, not inferred -- but it still matters through shot-noise SNR and the zero fraction.
+# Measured (auto_improve exp 000, DEV): at gain 1 the rendered marker channels had median 40-180 ADU
+# and p99 0.7-4.8k against real backsub tissue tiles at median 1.4-4.8k and p99 6-40k (5-30x
+# dimmer, 15% exact zeros vs 1% real). DAPI was only 2-3.6x dim, so the gain is applied to the
+# MARKER expression range only (flexible_types.expression_range). 1.0 reproduces the old prior
+# bit-for-bit. VERIFY: a later check put real marker medians at 100-700 against ~1.7k for gain-10
+# renders, so 10 may overshoot.
+EXPR_GAIN = 10.0
 DAPI_MU = -0.6
 COMPARTMENT_MU = {"nuclear": -0.50, "membrane": 1.00, "cytoplasmic": 0.40}
 

@@ -45,6 +45,10 @@ def _hungarian(a):
     """Min-cost assignment for a cost matrix with n rows <= m cols. Returns `col[i]`, the column
     matched to each row. Classic O(n^2 m) shortest-augmenting-path algorithm with potentials."""
     a = np.asarray(a, dtype=np.float64)
+    # a NaN/inf cost makes delta NaN and j1 stay -1, so the augmenting loop never terminates -- a
+    # silent hang, not an error (seen in the auto_improve exp001 guardrail run, ~19 h). Clamp to a
+    # large finite cost instead; finite matrices are untouched.
+    a = np.nan_to_num(a, nan=1e9, posinf=1e9, neginf=-1e9)
     n, m = a.shape
     assert n <= m, "internal: _hungarian needs rows <= cols"
     INF = np.inf

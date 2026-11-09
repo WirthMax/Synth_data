@@ -111,7 +111,7 @@ def expression_range():
     so the two together can no longer trade off against each other and leave the image unchanged.
     """
     lo, hi = _bounds(PanelMarker, "amp")
-    return 0.3 * lo, 3.0 * hi
+    return 0.3 * lo * cfg.EXPR_GAIN, 3.0 * hi * cfg.EXPR_GAIN
 
 
 def _geometry_bounds():
