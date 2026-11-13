@@ -13,7 +13,10 @@ import targets_v3 as T
 
 class BundleShardDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir, k_slots, n_global):
-        self.paths = sorted(glob.glob(os.path.join(data_dir, "bundle_*.npz")))
+        # several dirs may be joined with commas -- the open-ended rounds train on a rolling pool of
+        # the last few rounds, so a slow generator does not mean many epochs over one round's data
+        self.paths = sorted(p for d in str(data_dir).split(",") if d
+                            for p in glob.glob(os.path.join(d, "bundle_*.npz")))
         if not self.paths:
             raise FileNotFoundError(f"no bundle_*.npz under {data_dir}")
         self.k_slots, self.n_global = k_slots, n_global

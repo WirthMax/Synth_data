@@ -68,7 +68,16 @@ def build_sample_targets(b, k_slots, n_global):
     type4[~np.isin(type4, pidx)] = -1
     type4_pure = _t(type4, torch.long)
 
-    type_t = dict(
+    # per-instance truth for the query head: present-type index j (-1 = not a present type) and context
+    inst_t = {}
+    if "inst_type" in b:
+        j_of = np.full(max(K, 1), -1, np.int64)
+        j_of[pidx] = np.arange(J)
+        it = np.asarray(b["inst_type"]).astype(np.int64)
+        inst_t = dict(inst_j=_t(np.where(it >= 0, j_of[np.clip(it, 0, max(K, 1) - 1)], -1), torch.long),
+                      inst_ctx=_t(np.asarray(b["inst_ctx"]).astype(np.int64), torch.long))
+
+    type_t = dict(**inst_t,
         Mgt=Mgt, E_gt=E_gt, mk=torch.ones(M), positive=positive, level=level, geometry=geometry,
         pi=pi, context_cells=context_cells, frac16=frac16_t, token_mask=token_mask,
         type4_pure=type4_pure, seed_frac=torch.zeros(k_slots, J))  # seed_frac filled at train time
@@ -83,6 +92,8 @@ def build_sample_targets(b, k_slots, n_global):
         nuc_visible=_t(np.asarray(b["nuc"]) > 0).float(),    # nucleus flow-loss region
         structure=_t(b["cfrac16"]),                          # [C, h16, w16] soft target
         structure_mask=torch.ones(h16, w16))
+    if "inst" in b:                                          # bundles from before it was stored lack it
+        dense["inst"] = _t(np.asarray(b["inst"]).astype(np.int64), torch.long)
 
     # --- global (padded to n_global with a mask; variable ARCH length) + per-marker ---
     gu = np.asarray(b["th_global_u"], np.float32)
@@ -140,6 +151,8 @@ def collate_v3(samples, m_max=None):
 
     dense = {k: _stack(k) for k in ("nucleus", "cell", "flow", "nuc_flow", "ignore",
                                     "cell_visible", "nuc_visible", "structure", "structure_mask")}
+    if all("inst" in s["dense"] for s in samples):
+        dense["inst"] = _stack("inst")
     glob = dict(u=torch.stack([s["glob"]["u"] for s in samples]),
                 mask=torch.stack([s["glob"]["mask"] for s in samples]))
     marker = dict(noise_u=noise, mu_u=mu_u, offset=offset, present=present)

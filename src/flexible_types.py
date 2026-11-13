@@ -114,15 +114,25 @@ def expression_range():
     return 0.3 * lo * cfg.EXPR_GAIN, 3.0 * hi * cfg.EXPR_GAIN
 
 
+# ELONG sampling range in force. None = the wide prior's (cfg.WIDE_PRIOR); build_flexible_world
+# sets it to the run12 range for the duration of a prior="run12" draw. Theta normalisation always
+# runs outside a draw, so it always uses the wide range -- one normalisation for every new dataset.
+_ELONG_OVERRIDE = None
+# Wide prior: the tile's cell-size scale (vox) while one world is being drawn, or None. Root types
+# draw their RADIUS around it instead of log-uniform over the whole range -- see
+# config.WIDE_PRIOR["CELL_RADIUS"]. Set and cleared by build_flexible_world.
+_RADIUS_CENTRE = None
+
+
 def _geometry_bounds():
-    """Sampling bounds for the five geometry scalars. RADIUS/ELONG are the ranges confirmed for
-    this FOV (RADIUS log-uniform over its full voxel range; ELONG [1, 7], narrower than the
-    class's [0.3, 15] prolate/oblate span because a tile this size never shows extreme oblates);
-    the rest keep their class bounds."""
+    """Sampling bounds for the five geometry scalars. RADIUS is log-uniform over its full voxel
+    range; ELONG is cfg.WIDE_PRIOR["ELONG"] = [0.6, 12] (was [1, 7], "confirmed with the user"; then
+    widened on the user's request so cardiomyocyte-long cells, ~10 at this FOV, and mildly oblate
+    ones are inside the prior); the rest keep their class bounds."""
     g = CellGeometry()
     lo = {k: _bounds(g, k)[0] for k in GEOM_KEYS}
     hi = {k: _bounds(g, k)[1] for k in GEOM_KEYS}
-    lo["ELONG"], hi["ELONG"] = 1.0, 7.0          # confirmed with the user; subset of [0.3, 15]
+    lo["ELONG"], hi["ELONG"] = _ELONG_OVERRIDE or cfg.WIDE_PRIOR["ELONG"]
     return lo, hi
 
 
@@ -131,7 +141,14 @@ def _sample_geometry(rng):
     equal odds per decade, not per voxel); the others are uniform over their bounds."""
     lo, hi = _geometry_bounds()
     g = {}
-    g["RADIUS"] = float(np.exp(rng.uniform(np.log(lo["RADIUS"]), np.log(hi["RADIUS"]))))
+    if _RADIUS_CENTRE is None:
+        g["RADIUS"] = float(np.exp(rng.uniform(np.log(lo["RADIUS"]), np.log(hi["RADIUS"]))))
+    else:
+        # wide prior: around the tile's size scale, so the spacing (drawn from the same scale) can
+        # actually hold the cells -- a big cell between close seeds is squeezed to the seed spacing
+        g["RADIUS"] = float(np.clip(_RADIUS_CENTRE * np.exp(cfg.WIDE_PRIOR["TYPE_RADIUS_SD"]
+                                                            * rng.standard_normal()),
+                                    lo["RADIUS"], hi["RADIUS"]))
     for k in ("ELONG", "ROUGH", "BETA", "NUC_FRAC"):
         g[k] = float(rng.uniform(lo[k], hi[k]))
     return g
@@ -459,8 +476,47 @@ def _expected_visible_cells(tg):
     return 40.0 * (float(tg.COVER.v) / 0.75) * (11.0 / md) ** 2
 
 
+def _dapi_brightness(bright, b_min, b_max):
+    """Counterstain brightness: the theta level (drawn on the antibody range [b_min, b_max]) mapped
+    log-affinely onto cfg.DAPI_BRIGHT. Same ordering across types, but nuclei span ~0.1-60k ADU
+    instead of saturating the frame -- see config.DAPI_BRIGHT."""
+    lo, hi = cfg.DAPI_BRIGHT
+    u = (np.log(max(bright, 1e-12)) - np.log(b_min)) / (np.log(b_max) - np.log(b_min) + 1e-12)
+    return float(lo * (hi / lo) ** float(np.clip(u, 0.0, 1.0)))
+
+
+def _widen_textures(rng, panel):
+    """Wide prior: every antibody component's texture scalars uniform over their class bounds (they
+    used to stay at the class defaults, so all markers of one noise kind had ONE look and the
+    per-marker noise head had almost nothing to regress). w of the extra components varies too; the
+    first component's w stays pinned (PIN_DEGENERATE)."""
+    wp = cfg.WIDE_PRIOR
+    for mk in panel.Markers.values():
+        if mk.fluorophore == cfg.DAPI_DYE:
+            continue
+        for i, c in enumerate(mk.noise_components):
+            for key in wp["texture_keys"]:
+                p = getattr(c, key, None)
+                if isinstance(p, P):
+                    setattr(c, key, narrow(p, p.lo, p.hi, float(rng.uniform(p.lo, p.hi))))
+            c.s = narrow(c.s, c.s.lo, c.s.hi, float(rng.uniform(*wp["texture_s"])))
+            if i > 0:
+                c.w = narrow(c.w, c.w.lo, c.w.hi, float(rng.uniform(*wp["texture_w"])))
+
+
+def _widen_detector(rng, det):
+    """Wide prior: the camera and staining run drawn per tile within cfg.WIDE_PRIOR["DET"] (each
+    inside the Detector class bounds). Returns a NEW Detector -- the caller's stays untouched."""
+    import copy
+    det = copy.deepcopy(det)
+    for key, (lo, hi) in cfg.WIDE_PRIOR["DET"].items():
+        p = getattr(det, key)
+        setattr(det, key, narrow(p, p.lo, p.hi, float(rng.uniform(lo, hi))))
+    return det
+
+
 def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_KINDS),
-                         dapi_name="DAPI", max_structures=3, detector=None):
+                         dapi_name="DAPI", max_structures=3, detector=None, prior=None):
     """Draw a whole flexible-mode sample: the panel, the lineage cell-type set, the tissue
     architecture and the per-context compositions, assembled into the same world dict that
     `render_frame` already consumes (PANEL / TYPES / ARCH / CELL / TG / FRACTIONS), plus the extra
@@ -470,18 +526,44 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
     `curriculum` is the plan 3.7 knob dict (m_range, k_true_range, max_depth, min_level_diff);
     None uses the final prior. The order in which markers appear in the panel (and so in the image)
     is a per-sample permutation, so channel position carries no information.
+
+    `prior` ("wide" / "run12", default cfg.PRIOR) picks the prior -- see config.WIDE_PRIOR. "run12"
+    reproduces the run12 training distribution bit-for-bit for a given rng seed.
     """
-    from parameter import TissueGeometry, narrow as _narrow  # local: avoids a heavy import at load
+    global _ELONG_OVERRIDE, _RADIUS_CENTRE
+    prior = prior or cfg.PRIOR
+    if prior not in ("wide", "run12"):
+        raise ValueError(f"prior {prior!r} unknown; use 'wide' (cfg.WIDE_PRIOR) or 'run12'.")
+    wide = prior == "wide"
+    _ELONG_OVERRIDE = None if wide else cfg.RUN12_PRIOR["ELONG"]
+    try:
+        return _build_flexible_world(rng, curriculum=curriculum, dyes=dyes,
+                                     n_noise_kinds=n_noise_kinds, dapi_name=dapi_name,
+                                     max_structures=max_structures, detector=detector, wide=wide)
+    finally:
+        _ELONG_OVERRIDE = None
+        _RADIUS_CENTRE = None
+
+
+def _build_flexible_world(rng, *, curriculum, dyes, n_noise_kinds, dapi_name, max_structures,
+                          detector, wide):
+    from parameter import TissueGeometry, Artifacts, narrow as _narrow   # local: heavy import
     import config as _cfg
     cur = dict(m_range=(8, 40), k_true_range=(1, 30), max_depth=4, min_level_diff=0.3,
                p_background=0.0)
     cur.update(curriculum or {})
+    wp = _cfg.WIDE_PRIOR
+    if wide:
+        cur["m_range"] = wp["m_range"]
+        cur["p_background"] = float(rng.uniform(*wp["p_background"]))
 
     # --- per-tile tissue density, drawn BEFORE the type set so the type count can be capped to what
     # the cellularity can actually show. The model must handle the whole span (dense-no-background ->
     # empty) at every round, so density is NOT interpolated by the curriculum. An empty tile is
     # COVER=0 (support_mask returns all-False) with zero structures -- a genuine zero-cell negative. ---
-    dens = _cfg.DENSITY
+    dens = dict(_cfg.DENSITY)
+    if wide:
+        dens.update({k: wp[k] for k in ("MIN_DIST", "COVER", "GROW")})
     empty = bool(rng.random() < float(dens.get("p_empty", 0.0)))
     ms = 0 if empty else int(dens["max_structures"])
     arch, kinds = _flexible_architecture(rng, max_structures=ms)
@@ -497,9 +579,24 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
         cov_lo, cov_hi = dens["COVER"]
         if "vessel" in kinds:
             cov_hi = min(cov_hi, 0.8)
-        tg.MIN_DIST = _narrow(tg.MIN_DIST, tg.MIN_DIST.lo, tg.MIN_DIST.hi,
-                              float(rng.uniform(*dens["MIN_DIST"])))
-        tg.COVER = _narrow(tg.COVER, tg.COVER.lo, tg.COVER.hi, float(rng.uniform(cov_lo, cov_hi)))
+        if wide:
+            # same full span, mass moved toward tissue: spacing log-uniform (cell count ~ 1/MIN_DIST^2,
+            # so uniform spacing made half the tiles <= 7 cells against 50-90 on the real slide) and
+            # cover the max of two uniforms (density 2u -- dense frames twice as likely as sparse)
+            # spacing FOLLOWS the tile's cell size (config.WIDE_PRIOR["CELL_RADIUS"]): drawn on its
+            # own it squeezed every cell to ~3 um whatever its RADIUS
+            global _RADIUS_CENTRE
+            r_lo, r_hi = wp["CELL_RADIUS"]
+            _RADIUS_CENTRE = float(np.exp(rng.uniform(np.log(r_lo), np.log(r_hi))))
+            s_lo, s_hi = wp["SPACING_RATIO"]
+            md = float(np.clip(_RADIUS_CENTRE * np.exp(rng.uniform(np.log(s_lo), np.log(s_hi))),
+                               tg.MIN_DIST.lo, tg.MIN_DIST.hi))
+            cov = float(max(rng.uniform(cov_lo, cov_hi), rng.uniform(cov_lo, cov_hi)))
+        else:
+            md = float(rng.uniform(*dens["MIN_DIST"]))
+            cov = float(rng.uniform(cov_lo, cov_hi))
+        tg.MIN_DIST = _narrow(tg.MIN_DIST, tg.MIN_DIST.lo, tg.MIN_DIST.hi, md)
+        tg.COVER = _narrow(tg.COVER, tg.COVER.lo, tg.COVER.hi, cov)
         tg.GROW = _narrow(tg.GROW, tg.GROW.lo, tg.GROW.hi, float(rng.uniform(*dens["GROW"])))
 
     # cap the requested number of distinct types to what this cellularity can realise: a type counts
@@ -546,6 +643,8 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
         for m in np.flatnonzero(ts.positive[k]):
             nm = names_canon[m]
             bright = float(10.0 ** ts.level[k, m])
+            if wide and m == panel_spec["counterstain"]:
+                bright = _dapi_brightness(bright, b_min, b_max)
             expr[nm] = P(0.0, b_max, 0.05, bright, f"expr {nm}",
                          comment="absolute brightness of this marker in this type (flexible mode); "
                                  "replaces the panel amp x level product.")
@@ -554,6 +653,24 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
 
     contexts, allowed, pi = sample_compositions(rng, kinds, K)
     struct_to_ctx = [contexts.index(kd) for kd in kinds]
+
+    # wide-prior extras, drawn LAST so every earlier draw is the run12 stream. Tissue background
+    # per channel (log-uniform), sampled textures, and a per-tile detector / staining run.
+    if wide:
+        for m in range(M):
+            mk = canon[names_canon[m]]
+            lo, hi = _cfg.TISSUE_BG["dapi" if m == panel_spec["counterstain"] else "marker"]
+            level = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            mk.tissue_bg = _narrow(mk.tissue_bg, mk.tissue_bg.lo, mk.tissue_bg.hi, level)
+        _widen_textures(rng, panel)
+        if detector is not None:
+            detector = _widen_detector(rng, detector)
+    elif detector is not None:
+        # run12 rendered DAPI on the camera pedestal, before the staged offset correction existed
+        import copy
+        detector = copy.deepcopy(detector)
+        detector.DAPI_OFFSET_ADU = _narrow(detector.DAPI_OFFSET_ADU, detector.DAPI_OFFSET_ADU.lo,
+                                           detector.DAPI_OFFSET_ADU.hi, float(detector.OFFSET_ADU.v))
     compositions = dict(contexts=contexts, pi=pi, allowed=allowed,
                         struct_to_ctx=struct_to_ctx, type_order=[_type_name(k) for k in range(K)])
 
@@ -561,6 +678,9 @@ def build_flexible_world(rng, *, curriculum=None, dyes, n_noise_kinds=len(NOISE_
         "PANEL": panel, "TYPES": types, "TG": tg, "DET": detector,
         "ARCH": arch, "CELL": CellGeometry(), "FRACTIONS": list(np.ones(K) / K),
         "COMPOSITIONS": compositions, "PANEL_SPEC": panel_spec, "TYPESET": ts,
+        # artifact parameters (fibres, aggregates, detachment, cycle shift): only read when the frame
+        # is rendered with_artifacts, which the generator decides per sample
+        "AR": Artifacts(),
         "META": dict(K=K, M=M, counterstain=panel_spec["counterstain"],
                      channel_order=order, b_range=(b_min, b_max),
                      mu=list(panel_spec["mu"]),                 # canonical-order localisation targets

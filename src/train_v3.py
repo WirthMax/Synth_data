@@ -14,8 +14,9 @@ import torch
 
 from losses_v3 import (MatchWeights, schedule, total_loss, match_one, dice_bce_prob,
                        _expr_pred)
-from model_v3 import teacher_seeds
+from model_v3 import teacher_seeds, decode_queries
 from targets_v3 import seed_frac_from
+from flow_decode import flow_to_instances, match
 
 
 def move_targets(x, device):
@@ -121,6 +122,26 @@ def evaluate_v3(model, tile, present, tgt, device="cpu"):
         ct = t if False else tgt["dense"]["cell"][b] > 0.5
         inter = (cl & ct).sum().float()
         acc["cell_iou"].append(float(inter / (cl | ct).sum().clamp(min=1)))
+
+        # instance-level: decode the predicted flows exactly as inference does and score against the
+        # stored labels. cell_iou alone hid this -- 0.77 semantic IoU sat on a 0.31 instance F1.
+        # Nuclei are scored on visible cells' nuclei (the stored labels are visible-only).
+        if "inst" in tgt["dense"]:
+            gi = tgt["dense"]["inst"][b].cpu().numpy()
+            gn = np.where(tgt["dense"]["nucleus"][b].cpu().numpy() > 0.5, gi, 0)
+            dn = out["dense"]
+            if "flow" in dn:     # flow baseline only while the model still trains flows
+                pc = flow_to_instances(dn["flow"][b], torch.sigmoid(dn["cell"][b, 0]) > 0.5, device=device)
+                pn = flow_to_instances(dn["nuc_flow"][b], torch.sigmoid(dn["nucleus"][b, 0]) > 0.5,
+                                       device=device)
+                acc.setdefault("cell_f1", []).append(match(gi, pc)["f1"])
+                acc.setdefault("nuc_f1", []).append(match(gn, pn)["f1"])
+            # the query head, scored the same way (and its per-cell typing against the slot match)
+            if out.get("inst") is not None:
+                qc, qn, props = decode_queries(out["inst"], b)
+                acc.setdefault("q_cell_f1", []).append(match(gi, qc)["f1"])
+                acc.setdefault("q_nuc_f1", []).append(match(gn, qn)["f1"])
+                acc.setdefault("q_count_err", []).append(abs(int(qc.max()) - int(gi.max())))
 
     # localisation mu: regression quality, plus a derived-compartment accuracy for continuity with
     # the old metric (threshold predicted and true mu into nuclear/cyto/membrane). Constants from

@@ -164,6 +164,24 @@ def illumination(shape, illum_cv, vignette, tape):
     return np.maximum(rnd * (1.0 - vignette * rr2), 0.0).astype(np.float32)
 
 
+def tissue_background(tissue2d, levels, det, opt, tape):
+    """The light every channel picks up from tissue whether or not its antibody is there: per
+    channel k, levels[k] x the PSF-projected tissue occupancy (in [0, 1], one map per dye in
+    `tissue2d`) x one shared texture. The texture is the tissue's own structure, so every channel
+    gets the SAME mottling at its own brightness -- which is what makes an unexpressed real channel
+    look like faint tissue instead of a black frame. Added to the clean projection BEFORE the camera,
+    so it carries shot noise and survives backsub like any signal. Returns (H, W, C), clean units."""
+    tissue2d = [np.asarray(t, np.float32) for t in tissue2d]
+    ny, nx = tissue2d[0].shape
+    if getattr(tape, "w_tbg", None) is None or tape.w_tbg.shape != (ny, nx):
+        raise ValueError(
+            f"tissue background needs tape.w_tbg of shape {(ny, nx)}. "
+            f"Call tape.drawTissueBg(shape=({ny}, {nx})) before the detector.")
+    sig_px = max(float(det.TBG_TEX_UM.v) / opt.um_per_px, 0.5)
+    tex = np.maximum(1.0 + float(det.TBG_TEX_CV.v) * _smooth_unit(tape.w_tbg, sig_px), 0.0)
+    return np.stack([float(l) * t * tex for l, t in zip(levels, tissue2d)], -1).astype(np.float32)
+
+
 def apply_cycle_misregistration(adu, cycle_of, offsets, mode="reflect"):
     """Shift each channel by its imaging cycle's residual (dy, dx), in pixels.
 
@@ -260,7 +278,9 @@ def detector(img_psf, profile, det, opt, tape, markers, quantise=False,
         marker_adu = marker * adu_per_e + offset_adu
 
         if fl == "DAPI":
-            adu[..., k] = marker_adu
+            # the staged DAPI is offset-corrected to ~10 ADU on glass, not the camera pedestal
+            dapi_off = det.DAPI_OFFSET_ADU.v if hasattr(det, "DAPI_OFFSET_ADU") else offset_adu
+            adu[..., k] = marker_adu - offset_adu + dapi_off
             continue
 
         # the blank images the same AF, bleach-drifted (brighter by bg_drift, so AF over-subtracts)

@@ -95,10 +95,20 @@ def _hungarian(a):
     return col
 
 
+try:                                   # scipy's C solver when the env has it (synmodel got it for
+    from scipy.optimize import linear_sum_assignment as _scipy_lsa   # the instance head: its 320 x
+except ImportError:                    # ~250 near-tied costs took ~8 s in the numpy one below)
+    _scipy_lsa = None
+
+
 def linear_sum_assignment(cost):
     """Drop-in for scipy.optimize.linear_sum_assignment: returns (row_ind, col_ind), the optimal
-    assignment of min(R, C) pairs minimising total cost."""
+    assignment of min(R, C) pairs minimising total cost. Uses scipy when importable; the numpy
+    fallback is exact too, just slow on large near-tied matrices."""
     cost = np.asarray(cost, dtype=np.float64)
+    if _scipy_lsa is not None and np.isfinite(cost).all():
+        r, c = _scipy_lsa(cost)
+        return np.asarray(r), np.asarray(c)
     R, C = cost.shape
     if R <= C:
         col = _hungarian(cost)
@@ -231,6 +241,7 @@ class LossWeights:
     discrim: float = 1.0
     dense: float = 1.0
     global_marker: float = 1.0
+    instance: float = 1.0
 
 
 def _expr_pred(expr):
@@ -351,14 +362,16 @@ def dense_losses(dense, tgt):
     keep = (~d["ignore"]).float()[:, None]                   # [B,1,H,W]
     nuc = dice_bce(dense["nucleus"], d["nucleus"][:, None], mask=keep)
     cell = dice_bce(dense["cell"], d["cell"][:, None], mask=keep)
-    vis = d["cell_visible"][:, None].float()                 # [B,1,H,W]
-    flow = (((dense["flow"] - d["flow"]) ** 2) * vis).sum() / vis.sum().clamp(min=1) / 2
-    nvis = d["nuc_visible"][:, None].float()                 # nucleus flow MSE inside visible nuclei
-    nflow = (((dense["nuc_flow"] - d["nuc_flow"]) ** 2) * nvis).sum() / nvis.sum().clamp(min=1) / 2
     logp = F.log_softmax(dense["structure"], dim=1)         # [B,C,Hg,Wg]
     smask = d["structure_mask"][:, None].float()
     struct = -((d["structure"] * logp).sum(1, keepdim=True) * smask).sum() / smask.sum().clamp(min=1)
-    return dict(nucleus=nuc, cell=cell, flow=flow, nuc_flow=nflow, structure=struct)
+    out = dict(nucleus=nuc, cell=cell, structure=struct)
+    if "flow" in dense:          # a query-only model (use_flow=False) returns no flows -> no flow loss
+        vis = d["cell_visible"][:, None].float()             # [B,1,H,W]
+        out["flow"] = (((dense["flow"] - d["flow"]) ** 2) * vis).sum() / vis.sum().clamp(min=1) / 2
+        nvis = d["nuc_visible"][:, None].float()             # nucleus flow MSE inside visible nuclei
+        out["nuc_flow"] = (((dense["nuc_flow"] - d["nuc_flow"]) ** 2) * nvis).sum() / nvis.sum().clamp(min=1) / 2
+    return out
 
 
 # --- global / per-marker losses (h) ------------------------------------------------------------
@@ -396,6 +409,116 @@ def global_marker_losses(out, tgt, fw=None):
     return terms
 
 
+# --- per-cell instance head (query-based) ------------------------------------------------------
+@dataclass
+class InstanceWeights:
+    """Matching-cost and loss weights for the query head. The cost follows Mask2Former (mask BCE +
+    dice, minus existence); the masks are compared at stride `match_stride` for the matching only
+    (the loss itself is full resolution) -- 2 keeps a 160 x 100 cost matrix cheap on a 160 px tile."""
+    cost_bce: float = 5.0
+    cost_dice: float = 5.0
+    cost_exist: float = 2.0
+    match_stride: int = 2
+    exist: float = 2.0
+    mask: float = 5.0
+    nuc: float = 2.0
+    type: float = 1.0
+    context: float = 0.5
+    no_object: float = 0.1          # weight of the existence BCE on UNMATCHED queries (most of them)
+
+
+def _mask_cost(x, y):
+    """Pairwise BCE + dice between Q mask logits x [Q, P] and n binary/soft targets y [n, P], as
+    matmuls -- [Q, n] each."""
+    P = x.shape[1]
+    bce = (F.softplus(x).sum(1, keepdim=True) - x @ y.T) / P
+    p = torch.sigmoid(x)
+    dice = 1 - (2 * p @ y.T + 1) / (p.sum(1, keepdim=True) + y.sum(1)[None] + 1)
+    return bce, dice
+
+
+def _dice_loss(x, y, valid):
+    p = torch.sigmoid(x) * valid
+    y = y * valid
+    return (1 - (2 * (p * y).sum((-2, -1)) + 1) / (p.sum((-2, -1)) + y.sum((-2, -1)) + 1)).mean()
+
+
+def instance_losses_one(inst, b, gt, nuc, ignore, ttgt, slot_match, w: InstanceWeights):
+    """Query-head terms for sample b. gt [H, W] instance labels 1..n (visible cells); nuc [H, W]
+    nucleus mask; ignore [H, W] pixels with no honest label (invisible cells), excluded from the
+    mask losses; ttgt the sample's type-target dict (inst_j, inst_ctx); slot_match the final
+    slot-attention iteration's (slot_idx, type_idx), which maps a cell's present type j to the slot
+    its type logit should pick. A cell of a non-present type (j = -1) or an unmatched type gets no
+    type loss -- it still gets mask, existence and context."""
+    ex = inst["exist"][b]
+    Q = ex.shape[0]
+    n = int(gt.max())
+    z = ex.new_zeros(())
+    if n == 0:
+        return dict(exist=w.no_object * F.binary_cross_entropy_with_logits(ex, torch.zeros_like(ex)),
+                    mask=z, nuc=z, type=z, context=z)
+    lab = torch.arange(1, n + 1, device=gt.device)
+    Mc = (gt[None] == lab[:, None, None]).float()                         # [n, H, W]
+    Mn = Mc * nuc[None].float()
+    s = w.match_stride
+    with torch.no_grad():
+        xc = F.avg_pool2d(inst["cell"][b][None], s)[0].flatten(1)          # [Q, P]
+        yc = F.avg_pool2d(Mc[None], s)[0].flatten(1)                       # [n, P]
+        bce, dice = _mask_cost(xc.float(), yc)
+        C = w.cost_bce * bce + w.cost_dice * dice - w.cost_exist * torch.sigmoid(ex)[:, None]
+        qi, ci = linear_sum_assignment(C.cpu().numpy())                    # Q >= n: every cell matched
+    qi = torch.as_tensor(qi, device=gt.device, dtype=torch.long)
+    ci = torch.as_tensor(ci, device=gt.device, dtype=torch.long)
+
+    tgt_ex = torch.zeros_like(ex)
+    tgt_ex[qi] = 1.0
+    wt = torch.full_like(ex, w.no_object)
+    wt[qi] = 1.0
+    exist = (F.binary_cross_entropy_with_logits(ex, tgt_ex, reduction="none") * wt).sum() / wt.sum()
+
+    valid = (~ignore).float()[None]
+    xc, xn = inst["cell"][b][qi], inst["nuc"][b][qi]                       # [n, H, W]
+    yc, yn = Mc[ci], Mn[ci]
+    bce_c = (F.binary_cross_entropy_with_logits(xc, yc, reduction="none") * valid).sum() / (
+        valid.sum() * n).clamp(min=1)
+    bce_n = (F.binary_cross_entropy_with_logits(xn, yn, reduction="none") * valid).sum() / (
+        valid.sum() * n).clamp(min=1)
+    mask = bce_c + _dice_loss(xc, yc, valid)
+    nucl = bce_n + _dice_loss(xn, yn, valid)
+
+    typ, ctxl = z, z
+    if "inst_j" in ttgt and ttgt["inst_j"].numel() == n:
+        j = ttgt["inst_j"][ci]                                             # present-type index per match
+        slot_of_j = torch.full((max(int(ttgt["Mgt"].shape[0]), 1),), -1, dtype=torch.long,
+                               device=gt.device)
+        if slot_match["type_idx"].numel():
+            slot_of_j[slot_match["type_idx"]] = slot_match["slot_idx"]
+        tslot = torch.where(j >= 0, slot_of_j[j.clamp(min=0)], torch.full_like(j, -1))
+        ok = tslot >= 0
+        if ok.any():
+            typ = F.cross_entropy(inst["type"][b][qi[ok]], tslot[ok])
+        ctxl = F.cross_entropy(inst["context"][b][qi], ttgt["inst_ctx"][ci])
+    return dict(exist=exist, mask=mask, nuc=nucl, type=typ, context=ctxl)
+
+
+def instance_losses(inst, tgt, matches, w: InstanceWeights = None):
+    """Batch mean of instance_losses_one, each term weighted. `matches[b]` is the final-iteration
+    slot match of sample b. Returns (weighted scalar, dict of unweighted terms)."""
+    w = w or InstanceWeights()
+    d = tgt["dense"]
+    B = inst["exist"].shape[0]
+    acc = {k: inst["exist"].new_zeros(()) for k in ("exist", "mask", "nuc", "type", "context")}
+    ign = d["ignore"] & (d["inst"] == 0)
+    for b in range(B):
+        t = instance_losses_one(inst, b, d["inst"][b], d["nucleus"][b] > 0.5, ign[b],
+                                tgt["type"][b], matches[b], w)
+        for k in acc:
+            acc[k] = acc[k] + t[k] / B
+    total = (w.exist * acc["exist"] + w.mask * acc["mask"] + w.nuc * acc["nuc"]
+             + w.type * acc["type"] + w.context * acc["context"])
+    return total, acc
+
+
 # --- top-level combiner ------------------------------------------------------------------------
 def total_loss(out, tgt, step, total_steps, w_match: MatchWeights = None,
                w: LossWeights = None, exist_target="one", family_weights=None):
@@ -415,11 +538,14 @@ def total_loss(out, tgt, step, total_steps, w_match: MatchWeights = None,
     type_terms = {k: out["global_mu"].new_zeros(()) for k in
                   ("exist", "type_param", "context", "token_comp", "matched_map")}
     discrim = out["global_mu"].new_zeros(())
+    final_match = []
     for b in range(B):
         for ti in range(T):
             so = {k: (v[b] if torch.is_tensor(v) else
                       {kk: vv[b] for kk, vv in v.items()}) for k, v in out["slots"][ti].items()}
-            terms, _ = type_losses_one(so, tgt["type"][b], w_match, w, exist_target, fw=fw)
+            terms, match = type_losses_one(so, tgt["type"][b], w_match, w, exist_target, fw=fw)
+            if ti == T - 1:
+                final_match.append(match)
             for k in type_terms:
                 type_terms[k] = type_terms[k] + terms[k] / (B * T)
         discrim = discrim + discriminative_one(out["emb"][b], tgt["type"][b]["type4_pure"]) / B
@@ -430,9 +556,18 @@ def total_loss(out, tgt, step, total_steps, w_match: MatchWeights = None,
     total = (w.exist * type_terms["exist"] + w.type_param * type_terms["type_param"]
              + w.context * type_terms["context"] + w.token_comp * type_terms["token_comp"]
              + w.matched_map * type_terms["matched_map"] + w.discrim * discrim
-             + w.dense * sum(dense.values()) + w.global_marker * sum(gm.values()))
+             + w.dense * float(fw.get("dense", 1.0)) * sum(dense.values())
+             + w.global_marker * sum(gm.values()))
+
+    # query head: only when the model has one AND the bundles carry instance labels (older bundles
+    # do not, and then the head simply gets no gradient)
+    inst_terms = {}
+    if out.get("inst") is not None and "inst" in tgt["dense"]:
+        inst_total, inst_terms = instance_losses(out["inst"], tgt, final_match)
+        total = total + w.instance * float(fw.get("inst", 1.0)) * inst_total
 
     log = {f"type/{k}": float(v) for k, v in type_terms.items()}
+    log.update({f"inst/{k}": float(v) for k, v in inst_terms.items()})
     log["type/discrim"] = float(discrim)
     log.update({f"dense/{k}": float(v) for k, v in dense.items()})
     log.update({f"gm/{k}": float(v) for k, v in gm.items()})

@@ -102,6 +102,11 @@ DETECTOR = dict(
     HOT_E=500.0,
     # Gaussian sigma (px) correlating the read-noise floor; 0 = white (only active under BG_SUBTRACT)
     READ_SMOOTH_PX=0.5,
+    # texture of the tissue background (PanelMarker.tissue_bg): correlation length um, relative SD
+    TBG_TEX_UM=1.5,
+    TBG_TEX_CV=0.5,
+    # black level of the staged DAPI channel (offset-corrected, glass ~10 ADU on the real slide)
+    DAPI_OFFSET_ADU=10.0,
 )
 BIT_DEPTH = 16
 ADU_MAX = 2**BIT_DEPTH - 1
@@ -151,6 +156,73 @@ MU_LO, MU_HI = -0.9, 1.0
 # bit-for-bit. VERIFY: a later check put real marker medians at 100-700 against ~1.7k for gain-10
 # renders, so 10 may overshoot.
 EXPR_GAIN = 10.0
+
+# Tissue background prior (PanelMarker.tissue_bg, drawn per channel per sample in flexible mode,
+# log-uniform). The CALIBRATED centre, against 5 crops of the staged myocarditis slide, was marker
+# (0.3, 25) / DAPI (1.5, 40): backsub marker channels in tissue median over channels 167 ADU (10-90%
+# 19-1378), 0-9% zeros; DAPI off/on-nucleus 0.16-0.72 (NB: measured on the cycle-1 "DAPI", which
+# on that slide is mostly autofluorescence -- see DAPI_BRIGHT; the real stain is 0.03-0.06). At E_PER_UNIT 120 and ADU_PER_E 0.5 one unit
+# is ~60 ADU in solid tissue. The ranges below are deliberately WIDER than that calibration (a
+# decade-plus either side), so other tissues -- less blue AF, cleaner or dirtier stains -- are inside
+# the prior, not extrapolated. VERIFY: the centre comes from one slide, one tissue (heart).
+TISSUE_BG = dict(marker=(0.1, 60.0), dapi=(0.3, 60.0))
+# The counterstain's brightness is mapped from its theta level onto its OWN range instead of the
+# antibody range (0.3-90 after EXPR_GAIN): drawn from the antibody range DAPI saturated the 16-bit
+# frame (synthetic tissue median 8-16k ADU, p99.5 = 65535) against real nuclei at ~2-4k ADU.
+# The theta level stays the same number -- only the rendered brightness is remapped, log-affinely,
+# so the ordering of DAPI levels across types is preserved.
+# RECALIBRATED 2026-11-10 against the right channel. The first calibration (0.3, 2.0) was read off
+# channel 0 of the Slide2 backsub image, which markers_bs.csv names "DAPI" (cycle 1) but which on the
+# Slide1-3 runs is mostly blue tissue autofluorescence -- nuclei ~1-2k ADU, off/on-nucleus 0.6-0.7.
+# The real nuclear stain there is the re-stain "DAPI_cycle5": nuclei 24-44k ADU, tissue between
+# nuclei 0.4-1.4k, off/on 0.03-0.06, up to ~0.6% saturated pixels. Across 13 slides the usable
+# nuclear channel puts nuclei at 0.8-31k ADU (off/on 0.02-0.74, the weak end being those cycle-1
+# stains). Measured on wide-prior renders (Otsu on both sides): DAPI_BRIGHT 2 -> nuclei ~1-4k,
+# 8 -> ~2-18k, 30 -> ~4-64k with up to 6% saturation. (0.15, 40.0) spans the weak cycle-1 look up to
+# a saturating stain. Synthetic off/on is 0.003-0.014 at the same estimator -- slightly SHARPER than
+# real; the DAPI tissue_bg range (TISSUE_BG["dapi"]) is what lifts the floor. VERIFY on more tissues.
+DAPI_BRIGHT = (0.15, 40.0)
+
+# WHICH prior build_flexible_world draws from. "wide" (the default) is everything below on top of
+# the calibrated generator; "run12" reproduces, bit-for-bit, the distribution the run12 checkpoint
+# was trained on (no tissue background, DAPI on the antibody range, 100 ADU DAPI pedestal, the old
+# DENSITY / ELONG / panel ranges, default textures, one fixed detector) -- the honest in-distribution
+# control for that checkpoint. Every "wide" draw comes AFTER all run12 draws, so switching the prior
+# never shifts the random stream of the parts both share.
+PRIOR = "wide"
+WIDE_PRIOR = dict(
+    # density: sparser and denser than DENSITY, and down to near-empty tissue cover. MIN_DIST is now
+    # only the empty-tile fallback -- a tissue tile's spacing follows its cell size (below).
+    MIN_DIST=(3.0, 40.0), COVER=(0.05, 1.0), GROW=(1.0, 3.0),
+    # cell SIZE, per tile (2026-11-10). The packing gives each pixel to the nearest seed in units of
+    # that cell's own boundary, so a cell can never be bigger than its spacing allows: with MIN_DIST
+    # drawn on its own (log-uniform 3-40 vox, median ~11 vox = 3.6 um) the realised cells had a median
+    # section diameter of 3.2 um and the nuclei 3.4 um (Otsu 2.3 um), against real myocarditis nuclei
+    # at ~5.3 um (Otsu, DAPI_cycle5) -- every real cell was ~2.3x bigger than anything trained on.
+    # Now one tile scale is drawn log-uniform over CELL_RADIUS (vox, = the class RADIUS bounds, so
+    # theta normalisation is unchanged: 1.3-15.6 um equivalent-sphere radius, lymphocyte to
+    # cardiomyocyte), the spacing is that scale x SPACING_RATIO (log-uniform; ~1 = squeezed, confluent,
+    # ~3 = loose), clipped to the class MIN_DIST bounds, and every root type's RADIUS is the tile scale
+    # x exp(TYPE_RADIUS_SD x N(0,1)) -- so a tile can still mix small and big types around its scale.
+    CELL_RADIUS=(4.0, 48.0), SPACING_RATIO=(1.0, 3.0), TYPE_RADIUS_SD=0.35,
+    # cell shape: ELONG was [1, 7]; real cardiomyocytes reach ~10 at this FOV, and < 1 is oblate
+    ELONG=(0.6, 12.0),
+    # panel: the real slide has 48 channels, beyond the old 40 ceiling; background-only share per tile
+    m_range=(6, 56), p_background=(0.0, 0.6),
+    # marker texture: each antibody component's texture scalars uniform over their CLASS bounds (they
+    # were never sampled -- every marker of a kind had the default texture); `s` floored so a texture
+    # never vanishes outright, `w` of the extra components so multi-component mixes vary too
+    texture_keys=("scale", "clust", "fill", "soft"), texture_s=(0.2, 2.0), texture_w=(0.2, 1.0),
+    # the camera / staining run, per tile: everything the instrument and the backsub do differently
+    # from slide to slide. Not theta (DET is pinned) -- nuisance the model must be invariant to.
+    DET=dict(E_PER_UNIT=(60.0, 300.0), READ_E=(8.0, 40.0), DARK_E=(0.0, 20.0),
+             AF_SCALE_UM=(5.0, 60.0), AF_CV=(0.1, 0.9), ILLUM_CV=(0.0, 0.15), VIGNETTE=(0.0, 0.35),
+             BG_DRIFT=(0.0, 0.25), BG_SHIFT_PX=(0.0, 2.5), BG_MARGIN_ADU=(0.0, 15.0),
+             HOT_RATE=(0.0, 3e-4), READ_SMOOTH_PX=(0.0, 1.0), TBG_TEX_UM=(0.5, 4.0),
+             TBG_TEX_CV=(0.1, 1.0), DAPI_OFFSET_ADU=(0.0, 120.0)),
+)
+# the run12 values the "run12" prior restores (kept here so the switch is data, not code)
+RUN12_PRIOR = dict(ELONG=(1.0, 7.0))
 DAPI_MU = -0.6
 COMPARTMENT_MU = {"nuclear": -0.50, "membrane": 1.00, "cytoplasmic": 0.40}
 

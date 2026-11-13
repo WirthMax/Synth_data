@@ -22,6 +22,27 @@ def _visible_ids(cells):
     return [int(r["id"]) for r in cells if bool(r["visible"])]
 
 
+def _relabel_visible(inst, vis):
+    """inst restricted to visible cells and renumbered 1..n (uint16 -- a 160 px tile never holds
+    65k cells), so the stored labels are dense and the cell ids of the scene graph do not leak."""
+    keep = np.where(np.isin(inst, np.asarray(vis, inst.dtype)), inst, 0)
+    u, inv = np.unique(keep, return_inverse=True)
+    out = inv.reshape(keep.shape) if u[0] == 0 else inv.reshape(keep.shape) + 1
+    return out.astype(np.uint16)
+
+
+def _instance_table(inst, cells, vis):
+    """Type and context of each instance in `_relabel_visible` order (ascending cell id). The cell
+    table stores the type as 1..K (0 = unknown); it is shifted to the theta index 0..K-1, -1 for a
+    cell whose type is unknown."""
+    ids = np.unique(np.where(np.isin(inst, np.asarray(vis, inst.dtype)), inst, 0))
+    ids = ids[ids > 0]
+    row = {int(r["id"]): r for r in cells}
+    typ = np.array([int(row[i]["type_idx"]) - 1 if i in row else -1 for i in ids], np.int16)
+    ctx = np.array([int(row[i]["context"]) if i in row else 0 for i in ids], np.int16)
+    return dict(inst_type=typ, inst_ctx=ctx)
+
+
 def _context_cells(cells, n_context):
     """Visible-cell count per context (0 = background, 1.. = CONTEXT_KINDS), the gate the context
     Dirichlet loss uses (plan 5.3c needs >= min_context_cells)."""
@@ -65,6 +86,12 @@ def build_bundle(i, seed, curriculum=None, with_artifacts=False, pool_bank=None)
         type_map=type_map.astype(np.uint8),
         nuc=nuc,
         cell_mask=cellmask.astype(np.bool_),
+        # visible-cell instance labels, consecutive 1..n: the referent for instance-level scores
+        # (flow_decode.match) and the per-cell truth a query-based instance head matches against
+        inst=_relabel_visible(inst, vis),
+        # per stored instance (row i <-> label i+1): its theta type index (0..K-1) and its context,
+        # the per-cell truth the query head's type / context logits are trained against
+        **_instance_table(inst, labels["cells"], vis),
         flow=flow.astype(np.float32),
         nuc_flow=nuc_flow.astype(np.float32),
         frac4=frac4.astype(np.float32), valid4=valid4.astype(np.bool_),

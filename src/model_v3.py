@@ -365,10 +365,90 @@ class DenseDecoder(nn.Module):
         d1 = self.up1(d2)
         out = dict(nucleus=self.nucleus(d1), cell=self.cell(d1), flow=torch.tanh(self.flow(d1)),
                    nuc_flow=torch.tanh(self.nuc_flow(d1)),
-                   structure=self.structure(x), dec4=dec4,
+                   structure=self.structure(x), dec4=dec4, d1=d1,
                    ctx4=F.interpolate(self.ctx4(x), scale_factor=4, mode="bilinear",
                                       align_corners=False))
         return out
+
+
+# --- per-cell instance head (query-based) ------------------------------------------------------
+class InstanceHead(nn.Module):
+    """One learned QUERY per candidate cell, Mask2Former-style. The queries read the stride-4 token
+    map F4 through a small transformer decoder; each then owns a full-resolution cell mask and a
+    nucleus mask (its embedding dotted with a per-pixel mask embedding taken off the decoder's d1),
+    an existence logit, a context logit and a TYPE logit over the type slots -- the similarity of
+    the query to each slot's state, so an instance's type is the same slot the biology heads already
+    describe, not a parallel classifier that could disagree with them.
+
+    Why queries and not flows or anchors: a flow decoder has to find one sink per cell, and a long
+    cell (a cardiomyocyte at ELONG 5-7) has a ridge, not a sink; an anchor box around a diagonal
+    elongated cell contains its neighbours and NMS throws touching cells away. A query's mask is free
+    of both -- any shape, and because the masks are independent per query, two instances may
+    overlap (the 2D truth is still one label per pixel; overlapping truth is a later step).
+
+    n_queries must exceed the visible cells a tile can hold (~100 at the densest prior); unmatched
+    queries learn existence 0."""
+
+    def __init__(self, d=128, n_queries=160, d_mask=64, n_layers=3, heads=4, n_context=3, dec_c=32):
+        super().__init__()
+        self.n_queries = n_queries
+        self.query = nn.Parameter(torch.randn(1, n_queries, d) * 0.02)
+        layer = nn.TransformerDecoderLayer(d, heads, 2 * d, dropout=0.0, batch_first=True,
+                                           norm_first=True)
+        self.dec = nn.TransformerDecoder(layer, n_layers)
+        self.norm = nn.LayerNorm(d)
+        self.pix_cell = nn.Sequential(_conv(dec_c, d_mask, 3), nn.GELU(), _conv(d_mask, d_mask, 1))
+        self.pix_nuc = nn.Sequential(_conv(dec_c, d_mask, 3), nn.GELU(), _conv(d_mask, d_mask, 1))
+        self.q_cell, self.q_nuc = MLP(d, d, d_mask), MLP(d, d, d_mask)
+        self.exist = nn.Linear(d, 1)
+        self.context = nn.Linear(d, n_context)
+        self.type_q, self.type_s = nn.Linear(d, d), nn.Linear(d, d)
+
+    def forward(self, F4, d1, slot_state, Hf, Wf):
+        """F4 [B, N4, d] stride-4 tokens; d1 [B, dec_c, H, W]; slot_state [B, K, d] (final
+        slot-attention iteration). Returns logits: exist [B, Q], cell/nuc [B, Q, H, W],
+        type [B, Q, K], context [B, Q, C]."""
+        B, N4, d = F4.shape
+        mem = F4 + sincos_2d(Hf, Wf, d, device=F4.device)[None]
+        h = self.norm(self.dec(self.query.expand(B, -1, -1), mem))           # [B, Q, d]
+        cell = torch.einsum("bqc,bchw->bqhw", self.q_cell(h), self.pix_cell(d1))
+        nuc = torch.einsum("bqc,bchw->bqhw", self.q_nuc(h), self.pix_nuc(d1))
+        typ = torch.einsum("bqd,bkd->bqk", self.type_q(h), self.type_s(slot_state)) / math.sqrt(d)
+        return dict(exist=self.exist(h)[..., 0], cell=cell, nuc=nuc, type=typ,
+                    context=self.context(h))
+
+
+@torch.no_grad()
+def decode_queries(inst, b, exist_thr=0.5, mask_thr=0.5):
+    """One sample's query outputs -> instance labels, the inference-side inverse of InstanceHead.
+    A pixel goes to the kept query (existence > exist_thr) with the highest existence x mask
+    probability, if that query's own mask probability there exceeds mask_thr; the nucleus labels
+    reuse the SAME query ids, so nucleus i is the nucleus of cell i. Per-instance properties come
+    back in the order of the labels (row i-1 <-> label i). Returns numpy arrays."""
+    pe = torch.sigmoid(inst["exist"][b])
+    keep = torch.nonzero(pe > exist_thr)[:, 0]
+    H, W = inst["cell"].shape[-2:]
+    lab = torch.zeros(H, W, dtype=torch.long, device=pe.device)
+    nlab = torch.zeros_like(lab)
+    if keep.numel():
+        pc = torch.sigmoid(inst["cell"][b, keep])                              # [k, H, W]
+        pn = torch.sigmoid(inst["nuc"][b, keep])
+        score = pc * pe[keep, None, None]
+        best = score.argmax(0)
+        own = pc.gather(0, best[None])[0] > mask_thr
+        lab = torch.where(own, best + 1, lab)
+        nuc_own = pn.gather(0, best[None])[0] > mask_thr
+        nlab = torch.where(own & nuc_own, best + 1, nlab)
+    # renumber 1..n by the queries that actually won pixels, and carry their properties along
+    used = torch.unique(lab[lab > 0])
+    remap = torch.zeros(len(keep) + 1, dtype=torch.long, device=pe.device)
+    remap[used] = torch.arange(1, used.numel() + 1, device=pe.device)
+    q = keep[used - 1] if used.numel() else keep[:0]
+    props = dict(query=q, score=pe[q], type=inst["type"][b, q].argmax(-1),
+                 type_prob=torch.softmax(inst["type"][b, q], -1).max(-1).values,
+                 context=inst["context"][b, q].argmax(-1))
+    return (remap[lab].cpu().numpy().astype("int32"), remap[nlab].cpu().numpy().astype("int32"),
+            {k: v.cpu().numpy() for k, v in props.items()})
 
 
 # --- A.3 seeds --------------------------------------------------------------------------------
@@ -590,7 +670,7 @@ class ModelV3(nn.Module):
     U_C = 48             # stem stride-4 per-marker feature channels (h4)
 
     def __init__(self, n_global=16, n_marker_noise=4, n_context=None,
-                 K=30, T=3, d=128, d_tag=32, predict_offset=True):
+                 K=30, T=3, d=128, d_tag=32, predict_offset=True, n_queries=0, use_flow=True):
         super().__init__()
         n_context = (1 + len(cfg.CONTEXT_KINDS)) if n_context is None else n_context
         self.K, self.T, self.d, self.d_tag = K, T, d, d_tag
@@ -607,6 +687,17 @@ class ModelV3(nn.Module):
         self.global_head = GlobalHead(self.fusion.g32, n_global)
         self.slot_heads = SlotHeads(d, u_c=48, dec_c=96, n_geom=5, n_context=n_context)
         self.n_context = n_context
+        # 0 = no instance head: the model (and its state dict) is exactly the pre-instance-head one,
+        # so old checkpoints load strictly. > 0 adds the query-based per-cell head.
+        self.n_queries = n_queries
+        self.inst_head = InstanceHead(d, n_queries, n_context=n_context) if n_queries else None
+        # use_flow=False (query-only segmentation, from run13 round 21): the flow / nuc_flow convs
+        # stay in the module so every checkpoint loads strictly, but they are neither returned nor
+        # trained, and the marker head's membrane cue comes from the query masks instead of the
+        # flow divergence (an untrained flow field would feed it noise).
+        if not use_flow and not n_queries:
+            raise ValueError("use_flow=False needs the query head for its membranes -- pass n_queries > 0.")
+        self.use_flow = use_flow
 
     def _seeds(self, emb, cell_prob4, Hf, Wf, seeds, n_seeds, device):
         """Seeds for the type slots. `seeds=None` runs farthest-point sampling for every sample
@@ -671,36 +762,51 @@ class ModelV3(nn.Module):
             o["maps"] = maps[ti]
             slot_out.append(o)
 
-        loc_feat = self._loc_features(dense, logI, u, Hf, Wf)      # [B, M, N4, loc_in]
-        return dict(
+        extra = {}
+        if self.inst_head is not None:
+            extra["inst"] = self.inst_head(F4, dense["d1"], states[-1][:, :self.K], Hf, Wf)
+        loc_feat = self._loc_features(dense, logI, u, Hf, Wf, inst=extra.get("inst"))  # [B, M, N4, loc_in]
+        dense_keys = (("nucleus", "cell", "flow", "nuc_flow", "structure") if self.use_flow
+                      else ("nucleus", "cell", "structure"))
+        return dict(**extra,
             global_mu=self.global_head(g32),
             marker=self.marker_head(t, loc_feat),
-            dense={k: dense[k] for k in ("nucleus", "cell", "flow", "nuc_flow", "structure")},
+            dense={k: dense[k] for k in dense_keys},
             slots=slot_out, seeds=seeds, n_seeds=n_seeds, emb=emb)
 
-    def _region_probs(self, dense, N4):
+    def _region_probs(self, dense, N4, inst=None):
         """Per-location sub-cellular region membership at stride 4: (nucleus, cytoplasm, membrane),
         each [B, 1, N4]. The membrane is relu(divergence of the predicted FLOW field): the flows
         point to each cell's centre, so they diverge at cell-cell boundaries -- the only cue that
-        resolves INTERNAL membranes in packed tissue (a union cell mask cannot)."""
+        resolves INTERNAL membranes in packed tissue (a union cell mask cannot).
+        Without flows (use_flow=False) the same cue comes from the query head: each kept cell's
+        ownership is p_exist x p_mask, and a pixel claimed by MORE than one cell -- the summed
+        ownership minus the strongest -- is a cell-cell contact. Detached, so the marker head reads
+        the segmentation without pulling on it."""
         nuc4 = F.avg_pool2d(torch.sigmoid(dense["nucleus"]), 4).reshape(dense["nucleus"].shape[0], 1, N4)
         cell2d = F.avg_pool2d(torch.sigmoid(dense["cell"]), 4)
-        fy, fx = dense["flow"][:, 0:1], dense["flow"][:, 1:2]
-        div = (F.pad(fx[..., :, 1:] - fx[..., :, :-1], (0, 1))
-               + F.pad(fy[..., 1:, :] - fy[..., :-1, :], (0, 0, 0, 1)))
-        mem4 = (F.avg_pool2d(F.relu(div), 4) * cell2d).reshape(cell2d.shape[0], 1, N4)
+        if self.use_flow:
+            fy, fx = dense["flow"][:, 0:1], dense["flow"][:, 1:2]
+            div = (F.pad(fx[..., :, 1:] - fx[..., :, :-1], (0, 1))
+                   + F.pad(fy[..., 1:, :] - fy[..., :-1, :], (0, 0, 0, 1)))
+            edge = F.relu(div)
+        else:
+            with torch.no_grad():
+                own = torch.sigmoid(inst["exist"])[..., None, None] * torch.sigmoid(inst["cell"])
+                edge = (own.sum(1, keepdim=True) - own.amax(1, keepdim=True)).clamp(0.0, 1.0)
+        mem4 = (F.avg_pool2d(edge, 4) * cell2d).reshape(cell2d.shape[0], 1, N4)
         cell4 = cell2d.reshape(cell2d.shape[0], 1, N4)
         cyto4 = (cell4 - nuc4 - mem4).clamp(min=0)
         return nuc4, cyto4, mem4
 
-    def _loc_features(self, dense, logI, u, Hf, Wf):
+    def _loc_features(self, dense, logI, u, Hf, Wf, inst=None):
         """Stride-4 per-marker, per-location tokens for the marker head's attention pool: the stem
         features `u`, the marker's log-intensity, and the (nucleus, cyto, membrane) region memberships
         broadcast to every marker. The attention query then learns which locations/cells to trust.
         Padding-safe (regions from present-only dense maps) and per-marker (permutation-equivariant).
         """
         B, M, N4 = logI.shape
-        nuc4, cyto4, mem4 = self._region_probs(dense, N4)        # each [B, 1, N4]
+        nuc4, cyto4, mem4 = self._region_probs(dense, N4, inst)  # each [B, 1, N4]
         reg = torch.cat([nuc4, cyto4, mem4], dim=1).transpose(1, 2)[:, None]   # [B, 1, N4, 3]
         reg = reg.expand(B, M, N4, 3)
         feat = u.permute(0, 1, 3, 2)                             # [B, M, N4, 48]

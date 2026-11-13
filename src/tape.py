@@ -88,7 +88,15 @@ class Tape(object):
         # only imperfectly, the spatially-correlated part of the residual
         self.af_shift   = self.rng.standard_normal((nc, 2)).astype(np.float32)
         self.z_bg_drift = self.rng.standard_normal(nc).astype(np.float32)
-        
+
+    def drawTissueBg(self, shape=(128, 128)):
+        """The frozen texture of the tissue background (PanelMarker.tissue_bg): one white field the
+        detector low-passes to Detector.TBG_TEX_UM. Drawn from its OWN stream, keyed on the tape seed,
+        so adding it leaves every draw on the main stream -- and so every older render -- bit-identical."""
+        ny, nx = shape
+        self.w_tbg = np.random.default_rng([int(self.seed), 7001]).standard_normal(
+            (ny, nx), dtype=np.float32)
+
     def drawArtifacts(self, shape=(40, 160, 160), n_cand=256, n_mark=64, n_mode=16,
                       n_t=512, n_lm=21):
         """RNG for Fussel and Aggregate"""
@@ -160,18 +168,25 @@ class Tape(object):
         self.carve_noise=self.rng.standard_normal(shape, dtype=np.float32)
         
         
-    def drawCycles(self, n_ch, group_sizes=(1, 2, 3), ref_group_size=1):
+    def drawCycles(self, n_ch, group_sizes=(1, 2, 3), ref_group_size=1, ref_channel=0):
         """Imaging-cycle grouping and per-cycle offsets for AR.Cycle (cycle misregistration).
 
-        The grouping is config + tape, NOT a parameter: channel 0 (DAPI, the registration
+        The grouping is config + tape, NOT a parameter: `ref_channel` (DAPI, the registration
         reference) and the next ref_group_size-1 channels form cycle 0, which never moves; the
-        remaining channels are shuffled and cut into consecutive cycles of 1-3 markers. eps_cycle
+        remaining channels are shuffled and cut into consecutive cycles of 1-3 markers.
+        ref_channel MUST be wherever DAPI actually sits: the flexible panels permute the channel
+        order per tile, and with the reference pinned to index 0 DAPI was shifted (median 1.2 px)
+        in 181 of 187 artifact tiles while its nucleus masks were not. ref_channel=0 is the old
+        draw, bit-identical. eps_cycle
         is the per-cycle UNIT offset (the parameter AR.Cycle.SHIFT_PX scales it later), with cycle
         0 pinned to zero. u_edge_mode picks, per tile, whether a shifted cycle shows a black border
         (a crop from the slide edge) or a filled one (an interior crop)."""
         gs = np.asarray(group_sizes)
         cycle_of = np.zeros(n_ch, dtype=np.int64)
-        rest = self.rng.permutation(np.arange(ref_group_size, n_ch))
+        # channels in "reference first" order; for ref_channel=0 this is arange(n_ch), the old stream
+        others = [c for c in range(n_ch) if c != ref_channel]
+        ordered = np.asarray([ref_channel] + others, dtype=np.int64)
+        rest = self.rng.permutation(ordered[ref_group_size:])
         c, i = 1, 0
         while i < rest.size:
             k = int(self.rng.choice(gs))

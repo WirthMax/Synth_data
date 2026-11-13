@@ -121,3 +121,51 @@ def build_frame_geojson(cell2d, art2d, simplify_tolerance=1.0):
     features = (_mask_features(cell2d, "cell", simplify_tolerance)
                 + _mask_features(art2d, "artifact", simplify_tolerance))
     return {"type": "FeatureCollection", "features": features}
+
+
+def build_prediction_geojson(cell_lab, nuc_lab, props, type_names=None, context_names=None,
+                             scale=1.0, offset_xy=(0.0, 0.0), simplify_tolerance=1.0):
+    """Predicted instances from the query head (model_v3.decode_queries) as QuPath CELL objects:
+    one feature per cell with its body as `geometry`, its nucleus as `nucleusGeometry` (the same
+    query owns both, so they cannot be mismatched), and the cell type + tissue context the SAME query
+    predicted as `classification` / `measurements`. Coordinates are model pixels mapped by
+    `scale` and `offset_xy` (x, y) -- e.g. scale = 0.325 / 0.17 and the crop's top-left corner put the
+    polygons back onto the full-resolution slide. A type is a slot index unless `type_names` names
+    the slots; slot identities are per tile (they are matched, not fixed classes), so compare types
+    across tiles by their predicted expression, not by the slot number."""
+    def _poly(mask):
+        cs = clean_and_close_contours(mask_to_contours(mask.astype(np.int32), simplify_tolerance))
+        if 1 not in cs:
+            return None
+        rings = sorted(cs[1], key=len, reverse=True)
+        tr = lambda c: [[float(x) * scale + offset_xy[0], float(y) * scale + offset_xy[1]] for x, y in c]
+        return {"type": "Polygon", "coordinates": [tr(r) for r in rings]}
+
+    features = []
+    for i in range(1, int(cell_lab.max()) + 1):
+        geom = _poly(cell_lab == i)
+        if geom is None:
+            continue
+        t, c = int(props["type"][i - 1]), int(props["context"][i - 1])
+        tname = type_names[t] if type_names is not None else f"T{t:02d}"
+        feat = {
+            "type": "Feature",
+            "id": f"cell_{i}",
+            "geometry": geom,
+            "properties": {
+                "objectType": "cell",
+                "classification": {"name": tname},
+                "measurements": {
+                    "label": i,
+                    "existence": float(props["score"][i - 1]),
+                    "type_prob": float(props["type_prob"][i - 1]),
+                    "context_idx": c,
+                },
+                "context": context_names[c] if context_names is not None else c,
+            },
+        }
+        ngeom = _poly(nuc_lab == i)
+        if ngeom is not None:
+            feat["nucleusGeometry"] = ngeom
+        features.append(feat)
+    return {"type": "FeatureCollection", "features": features}

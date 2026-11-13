@@ -5,7 +5,7 @@ from scene import build_tissue_V2, artifact_priority, build_training_mask
 from render import render_image, to_rgb
 from tape import Tape
 from plot import plot_surface_xyz_inline, plot_surface_xyz_html, plot_surface_rgb_html, ortho, ortho_rgb, tau_cmap, NormalizeData
-from optics import kryostat, psf_project, mask_collapse, detector
+from optics import kryostat, psf_project, mask_collapse, detector, tissue_background
 from artifacts import build_artifacts, detachment_map, lift_slab, extend_z, lift_project
 from geojson_export import build_frame_geojson
 from labels_export import build_frame_labels
@@ -264,12 +264,29 @@ def render_frame(world, seed, pool_bank=POOL_BANK, with_artifacts=False):
         psf = np.stack([psf_project(v, z, opt, panel.Markers[k].fluorophore)
                         for k, (v, z) in subs.items()], -1)
     tape.drawSensor(shape=(shape[1], shape[2], len(panel.names)))
+    # tissue background: every channel sees all tissue at its own tissue_bg level (0 = off, and the
+    # whole block is skipped so a panel without it renders bit-identically to before)
+    tbg = [float(panel.Markers[k].tissue_bg.v) for k in panel.names]
+    if any(l > 0 for l in tbg):
+        occ_sub, occ_z = kryostat((labels > 0).astype(np.float32), opt)
+        by_fl = {}
+        for k in panel.names:
+            fl = panel.Markers[k].fluorophore
+            if fl not in by_fl:
+                by_fl[fl] = (lift_project(occ_sub, occ_z, shift, n_ext, opt, fl) if with_artifacts
+                             else psf_project(occ_sub, occ_z, opt, fl))
+        tape.drawTissueBg(shape=(shape[1], shape[2]))
+        psf = psf + tissue_background(
+            tissue2d=[by_fl[panel.Markers[k].fluorophore] for k in panel.names], levels=tbg,
+            det=det, opt=opt, tape=tape)
     n_ch = len(panel.names)
     if with_artifacts:
         # cycle misregistration: group the channels into imaging cycles and shift each cycle on
         # the already-noisy frame, before quantise. The reference cycle (DAPI) never moves.
+        # DAPI is the registration reference wherever the (possibly permuted) panel put it
+        ref = panel.names.index(DAPI_NAME) if DAPI_NAME in panel.names else 0
         tape.drawCycles(n_ch=n_ch, group_sizes=cfg.CYCLE["group_sizes"],
-                        ref_group_size=cfg.CYCLE["ref_group_size"])
+                        ref_group_size=cfg.CYCLE["ref_group_size"], ref_channel=ref)
         offsets = (float(world["AR"].Cycle.SHIFT_PX.v) * tape.eps_cycle).astype(np.float32)
         cyc_mode = "constant" if tape.u_edge_mode < cfg.CYCLE["p_black_bars"] else "reflect"
         adu = detector(psf, panel, det, opt, tape, panel.names, quantise=True,

@@ -435,6 +435,25 @@ class PanelMarker(ParamHolder):
         note="art aff",
         comment="how strongly this marker's antibody binds artifacts",
     )
+    tissue_bg: P = P(
+        0.0,
+        60.0,
+        0.05,
+        0.0,
+        "tissue bg",
+        note="tissue bg",
+        comment="brightness of the light this channel picks up from ALL tissue, expressing or "
+        "not, in the same units as an expression level (x E_PER_UNIT = e- per px of solid "
+        "tissue). It stands for everything the blank cycle does NOT remove -- nonspecific "
+        "antibody binding plus the unsubtracted share of tissue autofluorescence -- which after "
+        "backsub are indistinguishable, so they are one knob. It is projected through the same "
+        "PSF as the markers and textured by Detector.TBG_TEX_*, so it follows the cells. 0 = the "
+        "old generator (a non-expressed channel is pure clipped read noise: ~50 ADU levels and "
+        "~70% zeros inside tissue, against 0-9% zeros on the real staged slide). 3 ~ 180 ADU in "
+        "solid tissue, the median real backsub channel. On DAPI this is the blue tissue "
+        "autofluorescence that makes real myocardium DAPI read 0.6-0.7 off/on-nucleus. Not "
+        "fitted: orthogonal to expression, which adds on top only in expressing cells.",
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -1128,6 +1147,42 @@ class Detector(ParamHolder):
         comment="Gaussian sigma (px) applied to the read-noise fields (variance-preserving) so the "
         "empty floor is slightly spatially correlated rather than pure white; 0.5 ~ the lag-1 0.15 "
         "measured on the staged slide, 0 = white. Only active under BG_SUBTRACT.",
+    )
+    TBG_TEX_UM: P = P(
+        0.3,
+        10.0,
+        0.1,
+        1.5,
+        "tissue bg texture",
+        note="tbg tex um",
+        comment="correlation length (um) of the texture on the tissue background "
+        "(PanelMarker.tissue_bg). ONE field shared by every channel, because it is the tissue's "
+        "own structure (myofibrils, organelles, ECM) that every wavelength sees. 1.5 um ~ the "
+        "sarcomere-scale mottling of real myocardium DAPI; much above the cell size it degenerates "
+        "into a flat-field. Orthogonal to TBG_TEX_CV (contrast) and to AF_SCALE_UM, which is the "
+        "untextured slide-wide AF that the blank does subtract.",
+    )
+    TBG_TEX_CV: P = P(
+        0.0,
+        1.5,
+        0.05,
+        0.5,
+        "tissue bg contrast",
+        note="tbg tex cv",
+        comment="relative SD of that texture: 0 = a smooth tissue silhouette, 0.5 = clearly "
+        "mottled, > 1 rectifies at 0 into speckle. Orthogonal to the level, which is per channel.",
+    )
+    DAPI_OFFSET_ADU: P = P(
+        0.0,
+        2000.0,
+        1.0,
+        10.0,
+        "dapi offset",
+        note="dapi offset",
+        comment="black level left in the DAPI channel of the STAGED output. DAPI is never "
+        "background-subtracted, but the staged image is offset-corrected: bare glass reads 6-20 "
+        "ADU on the real slide (median ~10), not the 100 ADU camera pedestal. Only used under "
+        "BG_SUBTRACT; with BG_SUBTRACT 0 the DAPI keeps OFFSET_ADU like every channel.",
     )
     BIT_DEPTH: int = 16
 
@@ -1913,4 +1968,7 @@ DEVICE_DETECTOR = Detector(
     HOT_RATE=7e-5,
     HOT_E=500.0,
     READ_SMOOTH_PX=0.5,
+    TBG_TEX_UM=1.5,
+    TBG_TEX_CV=0.5,
+    DAPI_OFFSET_ADU=10.0,
 )
