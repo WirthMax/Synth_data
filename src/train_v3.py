@@ -50,37 +50,70 @@ def build_seeds(model, tgt, p_teacher, gen, device):
 
 
 def train_step(model, opt, tile, present, tgt, step, total_steps, gen, device="cpu",
-               family_weights=None):
+               family_weights=None, accum=(0, 1)):
+    """One forward/backward. `accum` = (i, n): micro-batch i of n accumulated into one optimiser
+    step -- the gradient is zeroed before i = 0, the loss scaled by 1/n, and the step (with the
+    clip) taken after i = n-1. A 512 px region fits the GPU one at a time, so a batch of regions is
+    accumulated; (0, 1) is the plain step."""
+    i_acc, n_acc = accum
     model.train()
     tgt = move_targets(tgt, device)
     sched = schedule(step, total_steps)
     seeds, n_seeds = build_seeds(model, tgt, sched["p_teacher"], gen, device)
     out = model(tile.to(device), present=present.to(device), strength=tgt["strength"],
-                seeds=seeds, n_seeds=n_seeds)
+                seeds=seeds, n_seeds=n_seeds, ref=tgt.get("ref"))
     for b in range(len(tgt["type"])):
         tgt["type"][b]["seed_frac"] = seed_frac_from(
             out["seeds"][b], tgt["type"][b]["Mgt"], model.K)
     total, log = total_loss(out, tgt, step, total_steps, family_weights=family_weights)
-    opt.zero_grad()
-    total.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    opt.step()
+    if i_acc == 0:
+        opt.zero_grad()
+    (total / n_acc).backward()
+    if i_acc == n_acc - 1:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
     log["loss/total"] = float(total)
     return log
 
 
+# visible-cell bins for the instance metrics: a per-tile mean is dominated by the many sparse tiles,
+# and hid that the query head falls from F1 0.74 (1-10 cells) to 0.18 (> 100 cells) -- the regime
+# confluent real tissue sits in. Bin edges are inclusive upper bounds; 0 = empty tiles.
+DENSITY_BINS = ((0, 0), (1, 10), (11, 50), (51, 100), (101, 10 ** 9))
+
+
+def density_bin(n):
+    return next(i for i, (lo, hi) in enumerate(DENSITY_BINS) if lo <= n <= hi)
+
+
+def eval_tags(model, B, M, seed, device):
+    """Seeded marker tags for evaluation. The model draws fresh random tags on every forward, so the
+    same weights scored +-0.03-0.05 cell F1 apart between rounds; fixing them per batch makes the
+    eval a function of the weights alone."""
+    import math
+    g = torch.Generator().manual_seed(int(seed))
+    return (torch.randn(B, M, model.d_tag, generator=g) / math.sqrt(model.d_tag)).to(device)
+
+
 @torch.no_grad()
-def evaluate_v3(model, tile, present, tgt, device="cpu"):
+def evaluate_v3(model, tile, present, tgt, device="cpu", tag_seed=None, decode=None):
     """Plan 6.2 diagnostics on one (already collated) batch, with inference-style matching
-    (w_seed = 0, FPS seeds). Returns a dict of scalar means over the batch."""
+    (w_seed = 0, FPS seeds). Returns a dict of scalar means over the batch, plus `_per_tile`: one
+    record per sample (visible cells, decoded cells, query-head cell / nucleus F1) that the caller
+    pools over the WHOLE eval set into density bins and a signed count error. `tag_seed` fixes the
+    marker tags (None = fresh random tags, the old behaviour)."""
     model.eval()
     tgt = move_targets(tgt, device)
-    out = model(tile.to(device), present=present.to(device), strength=tgt["strength"])  # FPS seeds
+    B0, M0 = tile.shape[:2]
+    tags = None if tag_seed is None else eval_tags(model, B0, M0, tag_seed, device)
+    out = model(tile.to(device), present=present.to(device), strength=tgt["strength"],
+                tags=tags, ref=tgt.get("ref"))                                      # FPS seeds
     w0 = MatchWeights(seed=0.0)
     B = len(tgt["type"])
     acc = dict(recovered_rate=[], type_count_err=[], mu_nmse=[], compartment_acc=[],
                noise_nmse=[], global_nmse=[], positivity_acc=[], expr_nmse=[], geom_nmse=[],
                cell_iou=[], mean_match_cost=[], duplicate_rate=[])
+    per_tile = []
     slots = out["slots"][-1]
     for b in range(B):
         t = tgt["type"][b]
@@ -136,12 +169,26 @@ def evaluate_v3(model, tile, present, tgt, device="cpu"):
                                        device=device)
                 acc.setdefault("cell_f1", []).append(match(gi, pc)["f1"])
                 acc.setdefault("nuc_f1", []).append(match(gn, pn)["f1"])
-            # the query head, scored the same way (and its per-cell typing against the slot match)
-            if out.get("inst") is not None:
-                qc, qn, props = decode_queries(out["inst"], b)
-                acc.setdefault("q_cell_f1", []).append(match(gi, qc)["f1"])
-                acc.setdefault("q_nuc_f1", []).append(match(gn, qn)["f1"])
-                acc.setdefault("q_count_err", []).append(abs(int(qc.max()) - int(gi.max())))
+
+    # the query head, scored per WINDOW (one per sample on a tile; the covering grid of a region,
+    # each against the truth cut to it, so a per-window record means what a per-tile one did and
+    # the density bins stay "cells per 52 um"). Slivers the window edge cuts off a cell are taken
+    # out of the truth, as in the loss (losses_v3.window_targets).
+    if out.get("inst") is not None and "inst" in tgt["dense"]:
+        from losses_v3 import window_targets
+        S = out["inst"]["cell"].shape[-1]
+        for i, (b, y0, x0) in enumerate(out["inst"]["win"].tolist()):
+            g, nu, _, _ = window_targets(tgt["dense"]["inst"][b], tgt["dense"]["nucleus"][b] > 0.5,
+                                         tgt["dense"]["ignore"][b], {}, y0, x0, S)
+            gi = g.cpu().numpy()
+            gn = np.where(nu.cpu().numpy(), gi, 0)
+            qc, qn, props = decode_queries(out["inst"], i, **(decode or {}))
+            mc, mn = match(gi, qc), match(gn, qn)
+            acc.setdefault("q_cell_f1", []).append(mc["f1"])
+            acc.setdefault("q_nuc_f1", []).append(mn["f1"])
+            acc.setdefault("q_count_err", []).append(abs(mc["n_pred"] - mc["n_gt"]))
+            per_tile.append(dict(n_gt=mc["n_gt"], n_pred=mc["n_pred"], cell_f1=mc["f1"],
+                                 nuc_f1=mn["f1"], cell_prec=mc["prec"], cell_rec=mc["rec"]))
 
     # localisation mu: regression quality, plus a derived-compartment accuracy for continuity with
     # the old metric (threshold predicted and true mu into nuclear/cyto/membrane). Constants from
@@ -167,4 +214,42 @@ def evaluate_v3(model, tile, present, tgt, device="cpu"):
     gmask = g["mask"].bool() if "mask" in g else torch.ones_like(g["u"], dtype=torch.bool)
     gpred = torch.sigmoid(out["global_mu"])
     acc["global_nmse"] = [float(((gpred - g["u"]) ** 2)[gmask].mean())]
-    return {k: float(np.mean(v)) for k, v in acc.items()}
+    # a metric with no referent in this batch (the matching metrics of an EMPTY tile) is left out,
+    # not reported as nan: at batch 1 (a 512 px region) an empty region would otherwise turn the
+    # pooled mean, and with it the orchestrator's composite score, into nan for good
+    res = {k: float(np.mean(v)) for k, v in acc.items() if len(v)}
+    res["_per_tile"] = per_tile
+    return res
+
+
+def pool_instance_metrics(per_tile):
+    """Whole-eval-set instance metrics from the `_per_tile` records of every batch:
+    - q_count_lr: mean SIGNED log((pred + 1) / (true + 1)); > 0 = over-segmentation. The old
+      `q_count_err` was unsigned, so over- and under-calling looked the same.
+    - q_count_alr: mean |log ratio|, the scale-free error the composite can use;
+    - q_cell_f1_b{i} / q_nuc_f1_b{i}: F1 per visible-cell bin (DENSITY_BINS), with the bin's tile
+      count n_b{i} and its signed count error q_count_lr_b{i};
+    - q_cell_f1_macro / q_nuc_f1_macro: the mean over the NON-EMPTY bins, so dense tissue counts as
+      much as sparse tissue however rare it is in the prior."""
+    if not per_tile:
+        return {}
+    out = {}
+    lr = np.array([np.log((r["n_pred"] + 1) / (r["n_gt"] + 1)) for r in per_tile])
+    out["q_count_lr"], out["q_count_alr"] = float(lr.mean()), float(np.abs(lr).mean())
+    bins = np.array([density_bin(r["n_gt"]) for r in per_tile])
+    cf = np.array([r["cell_f1"] for r in per_tile])
+    nf = np.array([r["nuc_f1"] for r in per_tile])
+    mc, mn = [], []
+    for i in range(len(DENSITY_BINS)):
+        sel = bins == i
+        out[f"n_b{i}"] = int(sel.sum())
+        if sel.any():
+            out[f"q_cell_f1_b{i}"] = float(cf[sel].mean())
+            out[f"q_nuc_f1_b{i}"] = float(nf[sel].mean())
+            out[f"q_count_lr_b{i}"] = float(lr[sel].mean())
+            if i > 0:                       # the macro average is over tiles WITH cells
+                mc.append(out[f"q_cell_f1_b{i}"])
+                mn.append(out[f"q_nuc_f1_b{i}"])
+    if mc:
+        out["q_cell_f1_macro"], out["q_nuc_f1_macro"] = float(np.mean(mc)), float(np.mean(mn))
+    return out

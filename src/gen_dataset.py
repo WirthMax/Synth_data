@@ -2,7 +2,7 @@ import argparse, copy, json, time, os, re
 import numpy as np
 
 from scene import build_tissue_V2, artifact_priority, build_training_mask
-from render import render_image, to_rgb
+from render import render_image, to_rgb, matrix_volumes
 from tape import Tape
 from plot import plot_surface_xyz_inline, plot_surface_xyz_html, plot_surface_rgb_html, ortho, ortho_rgb, tau_cmap, NormalizeData
 from optics import kryostat, psf_project, mask_collapse, detector, tissue_background
@@ -216,26 +216,35 @@ def render_frame(world, seed, pool_bank=POOL_BANK, with_artifacts=False):
     """
     panel, types, tg, det, arch = (world["PANEL"], world["TYPES"], world["TG"], world["DET"],
                                    world["ARCH"])
-    opt = Optics(um_per_px=UM_PER_VOX, um_per_pz=UM_PER_VOX * Z_RATIO)
-    need = panel.n_pools()
+    # the objective and the focal plane are per-tile nuisance under the wide prior (world["OPT"]);
+    # a world without it images through the default objective, in focus
+    opt = Optics(um_per_px=UM_PER_VOX, um_per_pz=UM_PER_VOX * Z_RATIO, **(world.get("OPT") or {}))
+    bg = world.get("BG")
+    need = panel.n_pools() + (sum(len(m.noise_components) for m in bg["markers"]) if bg else 0)
     n_pools = need if not pool_bank else min(int(pool_bank), need)
 
+    # the field and its candidate pool are read at CALL time: cfg.set_field may have resized them
+    # after this module was imported (a 512 px region, run_v3.py gen --field)
+    n_cand, shape = cfg.N_CAND, cfg.TISSUE_VOL
     tape = Tape(seed=int(seed), size=SIZE, K=K)
-    tape.draw(tile=TILE, n_cand=N_CAND, Pool=n_pools)
+    tape.draw(tile=TILE, n_cand=n_cand, Pool=n_pools)
 
-    shape = TISSUE_VOL
-    tape.draw3d(vol=CELL_VOL, n_cand=N_CAND, Pool=n_pools, l_min=L_MIN, L=L)
+    # the single-cell SANDBOX bank is not used by a tissue render (drawTissueDir redraws the
+    # harmonics and the texture fields at tissue shape), so it is drawn at a token size: at the
+    # sandbox's 128^3 x pools it was a second of pure RNG per frame, a fifth of the render
+    tape.draw3d(vol=(2, 2, 2), n_cand=n_cand, Pool=1, l_min=L_MIN, L=L)
     n_struct = len(arch.Structures)
-    tape.drawTissueDir(shape=shape, n_cand=N_CAND, Pool=n_pools, n_struct=n_struct,
+    tape.drawTissueDir(shape=shape, n_cand=n_cand, Pool=n_pools, n_struct=n_struct,
                        n_inst=32 * n_struct)
     if with_artifacts:
         tape.drawArtifacts(shape=shape, **cfg.ARTIFACTS)
+    tape.drawExpr(n_cand=n_cand, n_ch=len(panel.names) + (len(bg["markers"]) if bg else 0))
 
     vols, labels, nuc_labels3d, _tau_img, types_by_id, info = build_tissue_V2(
         tape=tape, ARCH=arch, TG=tg, shape=shape, base_geom=world["CELL"],
         spacing=SPACING, Panel=panel, CellTypes=types, Fractions=world["FRACTIONS"],
         um_per_vox=UM_PER_VOX, L=L, l_min=L_MIN, pool_bank=pool_bank,
-        compositions=world.get("COMPOSITIONS"))
+        compositions=world.get("COMPOSITIONS"), background=bg)
 
     sub, sub_z = kryostat(labels, opt)
 
@@ -267,14 +276,33 @@ def render_frame(world, seed, pool_bank=POOL_BANK, with_artifacts=False):
     # tissue background: every channel sees all tissue at its own tissue_bg level (0 = off, and the
     # whole block is skipped so a panel without it renders bit-identically to before)
     tbg = [float(panel.Markers[k].tissue_bg.v) for k in panel.names]
-    if any(l > 0 for l in tbg):
-        occ_sub, occ_z = kryostat((labels > 0).astype(np.float32), opt)
-        by_fl = {}
-        for k in panel.names:
-            fl = panel.Markers[k].fluorophore
-            if fl not in by_fl:
-                by_fl[fl] = (lift_project(occ_sub, occ_z, shift, n_ext, opt, fl) if with_artifacts
-                             else psf_project(occ_sub, occ_z, opt, fl))
+    dyes_used = list(dict.fromkeys(panel.Markers[k].fluorophore for k in panel.names))
+
+    def _project(vol):
+        """One volume through the section and every dye's PSF -> {dye: 2D}."""
+        sub_v, z_v = kryostat(vol, opt)
+        return {fl: (lift_project(sub_v, z_v, shift, n_ext, opt, fl) if with_artifacts
+                     else psf_project(sub_v, z_v, opt, fl)) for fl in dyes_used}
+
+    if bg is not None:
+        # the shared signal: hidden per-cell patterns mixed per channel at its tissue_bg level,
+        # plus the extracellular matrix at its own per-channel level -- see sample_background
+        bgp = [_project(v) for v in info["bg_vols"]]
+        tape.drawMatrix(shape=shape, n_field=max(len(bg["matrix"]), 1))
+        matp = [_project(v) for v in matrix_volumes(
+            tape=tape, matrix=bg["matrix"], labels=labels, support=info["support"],
+            edge_dist=info["edge_dist"], spacing=SPACING, um_per_vox=UM_PER_VOX)]
+        tape.drawTissueBg(shape=(shape[1], shape[2]))
+        fl_of = [panel.Markers[k].fluorophore for k in panel.names]
+        psf = psf + tissue_background(
+            tissue2d=[sum(float(w) * bgp[j][fl] for j, w in enumerate(bg["mix"][k]))
+                      for k, fl in zip(panel.names, fl_of)],
+            levels=tbg, det=det, opt=opt, tape=tape)
+        psf = psf + np.stack([sum(float(lv) * matp[j][fl]
+                                  for j, lv in enumerate(bg["matrix_level"][k]))
+                              for k, fl in zip(panel.names, fl_of)], -1).astype(np.float32)
+    elif any(l > 0 for l in tbg):
+        by_fl = _project((labels > 0).astype(np.float32))
         tape.drawTissueBg(shape=(shape[1], shape[2]))
         psf = psf + tissue_background(
             tissue2d=[by_fl[panel.Markers[k].fluorophore] for k in panel.names], levels=tbg,
@@ -356,11 +384,35 @@ def draw_one(i, max_retries=5):
                  f"with a perturbed seed", flush=True)
     raise RuntimeError(f"sample {i} failed after {max_retries} attempts") from last_err
 
+def _world_for_stratum(rng_seed, strata, u, curriculum, max_draws=60):
+    """A flexible world whose EXPECTED density lands in a requested stratum. `strata` is the wanted
+    share of each visible-cell bin (flexible_types.DENSITY_EDGES: empty, 1-10, 11-50, 51-100,
+    > 100); the frozen uniform `u` picks this sample's bin from it, and worlds are redrawn -- theta
+    only, nothing rendered, a few ms each -- until one falls in that bin. Everything else about the
+    world stays the unconditioned prior, so this reweights density and nothing else. The rarest bin
+    is ~10% of the prior, so 60 draws miss it once in ~500; the last draw is then used as it is."""
+    import flexible_types as ft
+    p = np.asarray(strata, float)
+    want = int(np.searchsorted(np.cumsum(p / p.sum()), u))
+    world = None
+    for k in range(max_draws):
+        world = ft.build_flexible_world(np.random.default_rng([int(rng_seed), k]),
+                                        curriculum=curriculum, dyes=cfg.DYES,
+                                        detector=Detector(**cfg.DETECTOR))
+        if ft.density_stratum(world) == want:
+            break
+    return world
+
+
 def draw_flexible(i, seed, curriculum=None, with_artifacts=False, pool_bank=POOL_BANK,
-                  max_retries=5):
+                  max_retries=20, strata=None):
     """One flexible-mode sample (plan Phase 3): a freshly drawn panel / lineage type set /
     compositions, rendered through the same pipeline as fixed mode, returning theta v3 instead of
     the flat u vector. Mirrors `draw_one`'s bounded-retry on an infeasible architecture draw.
+
+    `strata` (five shares, or None for the plain prior) steers the density mix of a dataset: see
+    `_world_for_stratum`. The rounds orchestrator uses it to spend more tiles where the model is
+    worst.
 
     Returns (i, img, theta_v3_flat, mask, geojson, cyc, frame_labels). theta_v3_flat is the flat
     numpy dict from flexible_types.theta_v3 -- directly np.savez-able; persisting it as dataset
@@ -371,9 +423,13 @@ def draw_flexible(i, seed, curriculum=None, with_artifacts=False, pool_bank=POOL
     for attempt in range(max_retries):
         offset = attempt * 1_000_000_000
         try:
-            world = ft.build_flexible_world(
-                np.random.default_rng(seed + 500_000 + i + offset),
-                curriculum=curriculum, dyes=cfg.DYES, detector=Detector(**cfg.DETECTOR))
+            if strata is None:
+                world = ft.build_flexible_world(
+                    np.random.default_rng(seed + 500_000 + i + offset),
+                    curriculum=curriculum, dyes=cfg.DYES, detector=Detector(**cfg.DETECTOR))
+            else:
+                u = float(np.random.default_rng([seed + i, 911]).random())
+                world = _world_for_stratum(seed + 500_000 + i + offset, strata, u, curriculum)
             img, mask, geojson, cyc, frame_labels = render_frame(
                 world, seed=seed + 10_000_000 + i + offset,
                 pool_bank=pool_bank, with_artifacts=with_artifacts)

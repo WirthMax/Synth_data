@@ -166,9 +166,13 @@ def flow_to_instances(flow, fg, merge_radius=2, min_size=15, n_iter=12, step=1.0
 def match(gt, pred, thr=0.5):
     """Instance scores at IoU > thr. Above 0.5 a match is unique, so counting the pairs over the
     threshold IS the optimal assignment -- no Hungarian needed. Returns precision / recall / F1, the
-    mean IoU of the matched pairs and both counts."""
+    mean IoU of the matched pairs and both counts. An empty tile with an empty prediction is a
+    PERFECT answer (F1 = 1); it used to score 0, which punished the empty tiles (~10% of the eval
+    set) for being right."""
     gt, pred = relabel(gt), relabel(pred)
     ng, npd = int(gt.max()), int(pred.max())
+    if ng == 0 and npd == 0:
+        return dict(n_gt=0, n_pred=0, prec=1.0, rec=1.0, f1=1.0, miou=1.0)
     C = np.bincount(gt.ravel().astype(np.int64) * (npd + 1) + pred.ravel(),
                     minlength=(ng + 1) * (npd + 1)).reshape(ng + 1, npd + 1)
     iou = C / (C.sum(1, keepdims=True) + C.sum(0, keepdims=True) - C + 1e-12)

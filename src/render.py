@@ -63,11 +63,53 @@ def boundary_falloff(d, edge_softness=0.06, edge_level=0.5):
     return 1.0 / (1.0 + np.exp(np.clip((d - c) / s, -700.0, 700.0)))
 
 
-def pool_image(c, cell, tau, ctx):
-    """One pool = its own localisation x its own texture, normalised to in-cell mean 1."""
+def loc_norm(c, nuc_frac, radius_vox=None, n=96):
+    """The brightness a pool's localisation band has WHERE THE MARKER IS, on an ideal whole cell:
+    the band-weighted mean of the band, sum(loc^2 dV) / sum(loc dV), over a sphere of radius 1 with
+    a concentric nucleus of radius `nuc_frac` (tau = r / nuc_frac - 1 inside the nucleus, the
+    fraction of the way from envelope to membrane outside it; dV = 3 r^2 dr). ~1 for a flat-topped
+    band, ~0.7 for a soft one. Dividing a pool by it makes a type's LEVEL the marker's mean
+    brightness inside its own compartment.
+
+    Two things this replaces, both wrong for tissue:
+    - normalising by the mean over the voxels a cell happens to have in the block. A cap with no
+      nucleus in it has loc ~ 5e-4 everywhere for a nuclear marker, and dividing by that in-patch
+      mean painted the nuclear marker over the whole cap at full expression. Against the ideal
+      cell a cut cell simply shows what its tau says it should -- there, almost nothing.
+    - normalising to the mean over the WHOLE CELL. Then a compartment's brightness scaled with
+      1 / its volume share: the same DAPI level was 2x brighter per nucleus voxel at
+      NUC_FRAC 0.8 and 600x at 0.12, so big cells with small nuclei saturated the frame. A stain
+      is a concentration; the level now says how bright the stained compartment is.
+
+    `radius_vox` (the cell's SHORT semi-axis in voxels) quantises the distance to the membrane to
+    whole voxels, as the voxelised territory does -- the outermost voxel layer is tau = 1 however
+    thin the band, so even a hairline membrane band has somewhere to be."""
+    r = (np.arange(n) + 0.5) / n
+    nf = float(np.clip(nuc_frac, 1e-3, 1.0 - 1e-3))
+    dn = np.maximum(r - nf, 0.0)
+    de = 1.0 - r
+    if radius_vox is not None and radius_vox > 0:
+        de = np.floor(de * float(radius_vox)) / float(radius_vox)
+    tau = np.where(r < nf, r / nf - 1.0, dn / np.maximum(dn + de, 1e-6))
     loc = localization_function(tau, mu=c.mu.v, width=c.width.v, sharp=c.sharp.v)
-    f = loc * c.field_fct(ctx)
-    return f / (f[cell].mean() + 1e-12)
+    w = 3.0 * r * r
+    den = float((loc * w).sum())
+    return float((loc * loc * w).sum() / den) if den > 1e-9 else 1.0
+
+
+def pool_image(c, cell, tau, ctx, nuc_frac=None, radius_vox=None):
+    """One pool = its own localisation x its own texture, normalised to in-cell mean 1.
+
+    Sandbox (nuc_frac None): normalised to mean 1 over the cell's own voxels, exact when the
+    whole cell is in the volume. Tissue (nuc_frac given): the band is normalised to mean ~1 INSIDE
+    ITS OWN COMPARTMENT on an ideal whole cell (`loc_norm`) and the texture to its mean over the
+    patch, so a cell cut anywhere shows the brightness its tau calls for -- see loc_norm."""
+    loc = localization_function(tau, mu=c.mu.v, width=c.width.v, sharp=c.sharp.v)
+    tex = c.field_fct(ctx)
+    if nuc_frac is None:
+        f = loc * tex
+        return f / (f[cell].mean() + 1e-12)
+    return loc * tex / (max(loc_norm(c, nuc_frac, radius_vox), 1e-3) * (float(tex.mean()) + 1e-12))
 
 
 @dataclass
@@ -102,7 +144,7 @@ def _pool_field(bank_field, j, n_bank, shift_seed):
 
 def render_marker(
     tape, marker, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0, pool_offset=0,
-    pool_bank=None, shift_seed=None
+    pool_bank=None, shift_seed=None, nuc_frac=None, radius_vox=None
 ):
     """amp * normalise( sum_k w_k * normalise(loc_k x tex_k) x polarity x env(d) ).
 
@@ -115,6 +157,11 @@ def render_marker(
     shared across every frame via a fixed literal. Pass an explicit int only to reproduce old
     (pre-diversification) renders. When the tape itself has no integer seed (cfg.SEED=None, i.e.
     a fresh-entropy tape), there is nothing to diversify against, so fall back to 0.
+
+    `nuc_frac` switches the normalisation from "mean over this mask is amp" (the sandbox, where the
+    mask is the whole cell) to "mean inside the marker's own compartment is amp" (tissue, where the
+    mask is the part of the cell's territory inside the block -- possibly a cap with no nucleus in
+    it). See `loc_norm`. In that mode nothing is renormalised over the mask afterwards.
     """
     if shift_seed is None:
         shift_seed = int(tape.seed) if tape.seed is not None else 0
@@ -144,21 +191,58 @@ def render_marker(
             fperp2=fperp2,
             um_per_vox=um_per_vox,
         )
-        out += c.w.v * pool_image(c, mask, tau, ctx)
+        out += c.w.v * pool_image(c, mask, tau, ctx, nuc_frac=nuc_frac, radius_vox=radius_vox)
         wsum += c.w.v
     out = out / wsum if wsum > 0 else mask.astype(float)
 
     if marker.polarity.v:
         pd = np.asarray([p.v for p in marker.pol_dir], np.float32)
         pd = pd / (np.linalg.norm(pd) + 1e-30)
-        out = out * np.exp(np.float32(marker.polarity.v) * (phi @ pd))
+        kap = float(marker.polarity.v)
+        out = out * np.exp(np.float32(kap) * (phi @ pd))
+        if nuc_frac is not None:
+            # mean of exp(kappa cos) over the sphere is sinh(kappa) / kappa: divide it out, so
+            # polarity moves the marker around the cell without making the cell brighter
+            out = out / (np.sinh(abs(kap)) / max(abs(kap), 1e-6))
 
     # hard by default: the soft rim in a real image is made by the optics, and psf_project
     # makes it. Anything but 0 here is blur invented before the microscope gets a look in.
     out = out * (boundary_falloff(d, edge_softness) if edge_softness > 0 else mask)
 
+    if nuc_frac is not None:
+        return (marker.amp.v * out).astype(np.float32)
     denom = out.sum() / max(int(mask.sum()), 1)
     return (marker.amp.v * out / (denom + 1e-12)).astype(np.float32)
+
+def matrix_volumes(tape, matrix, labels, support, edge_dist, spacing, um_per_vox):
+    """The extracellular matrix of one tile, one volume per pattern in `matrix`
+    (flexible_types.sample_background). A pattern is a texture -- fibrous, punctate, reticular --
+    laid over everything inside the tissue support that no cell claimed (the interstitium), plus,
+    if its `peri` is above 0, a band that decays over `peri_um` inward from every cell boundary:
+    the basement membrane and the capillary bed that outline muscle cells in a real section. Its
+    grain runs along the pattern's own in-plane `azim`. Each texture is normalised to mean 1 over
+    the block, so a channel's matrix level is its mean brightness in open matrix.
+
+    The textures come from tape.matrix_noise / matrix_gate (Tape.drawMatrix): frozen, like
+    everything else; the parameters only shape and gate them."""
+    shape = labels.shape
+    gap = (support & (labels == 0)).astype(np.float32)
+    cells = labels > 0
+    out = []
+    for j, mt in enumerate(matrix):
+        f2, fpar2, fperp2 = _freq(shape, spacing, 90.0, float(mt["azim"]))
+        n_f = tape["matrix_noise"].shape[0]
+        ctx = NoiseCtx(noise=tape["matrix_noise"][j % n_f], gate=tape["matrix_gate"][j % n_f],
+                       f2=f2, fpar2=fpar2, fperp2=fperp2, um_per_vox=um_per_vox)
+        tex = np.asarray(mt["comp"].field_fct(ctx), np.float32)
+        tex = tex / (float(tex.mean()) + 1e-12)
+        occ = gap
+        if mt["peri"] > 0.0:
+            w = max(float(mt["peri_um"]) / float(um_per_vox), 1e-3)
+            occ = occ + np.float32(mt["peri"]) * np.exp(-edge_dist / w) * cells
+        out.append((tex * occ).astype(np.float32))
+    return out
+
 
 def render_image(tape, panel, cell, spacing, geom, um_per_vox=1.0, edge_softness=0.0,
                  expression=None, pool_offset=0, pool_bank=None, shift_seed=None):

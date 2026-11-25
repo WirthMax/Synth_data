@@ -19,13 +19,34 @@ L = 4
 # None = a fresh tissue every run; set an int to reproduce one
 SEED = None
 # candidate cells drawn once; thinning selects from these
-N_CAND = 1500
+N_CAND = 2500
 # 2D sandbox size
 SIZE = 201
 # 2D tissue tile
 TILE = 256
 # Fourier modes for the 2D boundary
 K = 20
+
+# the reference tile edge every density statement in this file is made for (A = 160^2 px in
+# flexible_types._expected_visible_cells, the strata edges, MIN_SPACING vs the query cap)
+FIELD_REF = 160
+
+
+def set_field(n):
+    """Render a larger (or smaller) FIELD than the 160 px tile: an n x n px block, i.e. n x 0.325 um
+    on a side (512 px = 166 um, 10x the area of a tile). The candidate pool grows with the AREA, so
+    the seeds are exactly as dense as on a tile -- without it a 512 px field would have a tenth of
+    the cells. Everything that depends on the field reads TISSUE_VOL / N_CAND at call time, so this
+    must run before the first render, once per process (`run_v3.py gen --field` does it in every
+    worker). n must be divisible by 32 for the model's strides. set_field(160) is the old tile,
+    bit-identical."""
+    global TISSUE_VOL, N_CAND
+    n = int(n)
+    if n % 32:
+        raise ValueError(f"field {n} px is not divisible by 32 (the model's coarsest stride) -- "
+                         f"use e.g. 160, 384, 512")
+    TISSUE_VOL = (TISSUE_VOL[0], n, n)
+    N_CAND = int(round(2500 * n * n / FIELD_REF ** 2))
 
 # frozen noise fields
 N_POOLS = 12
@@ -130,7 +151,12 @@ CYCLE = dict(group_sizes=(1, 2, 3), ref_group_size=1, p_black_bars=0.5)
 # in a tile if it has at least min_visible_cells visible cells. Invisible cells and non-present
 # types become the IGNORE label (255) in type_map, so no loss is charged where there is too little
 # evidence to learn from.
-VIS = dict(min_area_px=15, min_visible_cells=3)
+# min_frac (2026-11-16): a cell must also show at least this share of its own nominal
+# cross-section, pi x (short semi-axis)^2. The section is now cut from bulk, so every cell is also
+# met as a thin cap above or below its body: a 20 px sliver of a 20 um cell is not a cell anyone
+# would outline, and calling it one taught the head to fragment. Such slivers are IGNORE, not
+# background -- they are still tissue and still lit.
+VIS = dict(min_area_px=15, min_visible_cells=3, min_frac=0.08)
 # context = where a cell sits. Context 0 is always background tissue; the structure KINDS below get
 # indices 1, 2, ... (fixed across samples so C is constant for the model). Add a kind here when a
 # new BaseStructure subclass is introduced.
@@ -155,7 +181,12 @@ MU_LO, MU_HI = -0.9, 1.0
 # MARKER expression range only (flexible_types.expression_range). 1.0 reproduces the old prior
 # bit-for-bit. VERIFY: a later check put real marker medians at 100-700 against ~1.7k for gain-10
 # renders, so 10 may overshoot.
-EXPR_GAIN = 10.0
+# 2026-11-16: 30. A level is now the mean brightness INSIDE the marker's compartment
+# (render.loc_norm), not the cell mean, so membrane and nuclear markers lost the 1 / volume-share
+# boost they had (x2 to x600). 30 puts the expression range at 0.9-270 units = 54 ADU to 16k ADU in
+# the stained compartment, against real per-channel p99.5 of 50 ADU (dead stains) to 60k (IgG,
+# CD36, desmin). VERIFY against more slides.
+EXPR_GAIN = 30.0
 
 # Tissue background prior (PanelMarker.tissue_bg, drawn per channel per sample in flexible mode,
 # log-uniform). The CALIBRATED centre, against 5 crops of the staged myocarditis slide, was marker
@@ -181,7 +212,18 @@ TISSUE_BG = dict(marker=(0.1, 60.0), dapi=(0.3, 60.0))
 # 8 -> ~2-18k, 30 -> ~4-64k with up to 6% saturation. (0.15, 40.0) spans the weak cycle-1 look up to
 # a saturating stain. Synthetic off/on is 0.003-0.014 at the same estimator -- slightly SHARPER than
 # real; the DAPI tissue_bg range (TISSUE_BG["dapi"]) is what lifts the floor. VERIFY on more tissues.
-DAPI_BRIGHT = (0.15, 40.0)
+# 2026-11-16: (10, 800), same target, new units. The level used to be the CELL mean, so the nucleus
+# itself was brighter by 1 / NUC_FRAC^3 (x2 at 0.8, x600 at 0.12) -- which is how 40 reached 64k ADU.
+# It is now the brightness of the nucleus itself (render.loc_norm): 10-800 units x 60 ADU = 0.6k-48k
+# ADU, the measured span of real nuclei, whatever the nucleus fraction. A tile draws one centre in
+# that range and its types sit within DAPI_TYPE_DECADES of it (real nuclei differ ~10x inside one
+# tile, not the 80x two independent draws gave). DAPI_CONTRAST is the counterstain's tissue
+# background as a fraction of that centre: 0.01 is a clean re-stain (real off/on 0.02-0.06); 0.5,
+# with the background's own texture on top, reaches the cycle-1 stain that is mostly blue
+# autofluorescence (real 0.6-0.74). At 0.8 the texture peaks simply buried the nuclei.
+DAPI_BRIGHT = (10.0, 800.0)
+DAPI_TYPE_DECADES = 1.0
+DAPI_CONTRAST = (0.01, 0.5)
 
 # WHICH prior build_flexible_world draws from. "wide" (the default) is everything below on top of
 # the calibrated generator; "run12" reproduces, bit-for-bit, the distribution the run12 checkpoint
@@ -204,15 +246,71 @@ WIDE_PRIOR = dict(
     # cardiomyocyte), the spacing is that scale x SPACING_RATIO (log-uniform; ~1 = squeezed, confluent,
     # ~3 = loose), clipped to the class MIN_DIST bounds, and every root type's RADIUS is the tile scale
     # x exp(TYPE_RADIUS_SD x N(0,1)) -- so a tile can still mix small and big types around its scale.
-    CELL_RADIUS=(4.0, 48.0), SPACING_RATIO=(1.0, 3.0), TYPE_RADIUS_SD=0.35,
-    # cell shape: ELONG was [1, 7]; real cardiomyocytes reach ~10 at this FOV, and < 1 is oblate
-    ELONG=(0.6, 12.0),
+    # 2026-11-16: the tile scale starts at 8 vox (2.6 um radius, a 5 um cell -- nothing nucleated is
+    # smaller); the class RADIUS bounds, and so the theta normalisation, are unchanged.
+    CELL_RADIUS=(8.0, 48.0), SPACING_RATIO=(1.0, 3.0), TYPE_RADIUS_SD=0.35,
+    # CONFLUENCE is drawn as a regime, not left to chance. Measured on the run13 eval set the old
+    # independent draws (spacing 1-3 R, GROW 1-3) left a median 30% of the frame labelled and most
+    # cells as free blobs on black; real tissue tiles are ~100% tissue. A CONFLUENT tile (share
+    # p_confluent) draws spacing = R x CONFLUENT_RATIO and GROW >= GROW_FILL x that ratio, which is
+    # what fills the gaps (a Voronoi cell's far corner is ~2 seed spacings out); the rest are LOOSE
+    # (the old draw: free shapes with gaps). MIN_SPACING keeps the densest tile under the query cap:
+    # 9 vox = 2.9 um spacing is ~130 visible cells in a 52 um frame.
+    p_confluent=0.65, CONFLUENT_RATIO=(0.7, 1.4), GROW_FILL=2.0, p_full_cover=0.6, MIN_SPACING=9.0,
+    # mixed sizes: a root type other than the first ignores the tile scale with this probability
+    # (radius log-uniform over CELL_RADIUS), and the spacing follows each cell's own radius by
+    # TissueGeometry.SIZE_COUPLE -- big cells with small interstitial ones between them
+    p_free_radius=0.3, SIZE_COUPLE=(0.3, 1.0),
+    # the section is cut from bulk: TissueGeometry.SLAB = block + 2 x SLAB_REACH x the longest
+    # semi-axis of the biggest type, capped (candidates are finite: at SLAB_MAX only cells of
+    # radius >~ 20 vox still pack to saturation, which is exactly when a slab that deep is asked for)
+    SLAB_REACH=1.5, SLAB_MAX=400.0,
+    # cell shape. ELONG is now the TRUE long:short ratio (scene._stretch): 40% of types near-round,
+    # the rest log-uniform up to 10 (a 4.6 R x 0.46 R rod); a few oblate
+    ELONG=(0.5, 10.0), p_round=0.4, ROUND_ELONG=(0.8, 1.6),
+    # the nucleus is sized in MICRONS and NUC_FRAC derived from it: drawn as a fraction of the cell
+    # (0.1-0.8 of 1.3-15.6 um) nuclei ran from 0.13 to 12 um radius. 1.6-5 um spans a lymphocyte
+    # to a large cardiomyocyte or tumour nucleus, so a big cell gets a SMALL nucleus fraction.
+    NUC_RADIUS_UM=(1.6, 5.0), NUC_ELONG=(1.0, 3.2), p_nuc_round=0.3, NUC_ROUGH=(0.02, 0.35),
+    NUC_BETA=(1.5, 5.0), RIM=(0.0, 1.5),
+    # grain: with p_axis a tile has one direction every aligned type follows (in plane or through
+    # it), strength AXIS_ALIGN; a type's own ALIGN is 1 with p_type_aligned, else uniform
+    p_axis=0.5, AXIS_ALIGN=(0.5, 1.0), p_type_aligned=0.5,
+    # panel content. The share of NUCLEAR markers is drawn per tile: with mu uniform over the tau
+    # axis 42% of every panel was nuclear, so a nucleus showed in a dozen channels and the model
+    # never needed to know which one was the counterstain; a real panel has 2-3 of 47. A marker is
+    # UBIQUITOUS (positive in most types -- organelle and structural markers) with p_ubiquitous,
+    # otherwise each type is positive with a per-marker probability from P_POS. p_ecm is the
+    # per-tile share of EXTRACELLULAR markers (no type expresses them; they light the matrix).
+    p_nuclear=(0.0, 0.5), p_ubiquitous=0.12, P_POS=(0.05, 0.45), UBIQ_POS=(0.7, 1.0),
+    p_ecm=(0.0, 0.15),
+    # within-type spread, polarity, band width
+    CELL_CV=(0.0, 0.7), DAPI_CELL_CV=(0.0, 0.7), p_polar=0.25, POLARITY=(-1.5, 1.5),
+    BAND_WIDTH_SD=0.5, BAND_SHARP_SD=0.3,
+    # the shared background: n_bg hidden patterns every channel mixes (see
+    # flexible_types.sample_background), a type's level on each lognormal with BG_TYPE_SD, and
+    # n_matrix extracellular textures. MATRIX_REL is the matrix brightness of an ordinary channel
+    # relative to its cell background; ECM_LEVEL the matrix brightness of an extracellular marker.
+    # BG_TEXTURE_S caps the shared patterns' texture strength: at the antibody range (up to 2,
+    # exp(2 z)) they were a field of hot blobs, where real unspecific signal is a mild relief.
+    BG_TEXTURE_S=(0.15, 0.9),
+    n_bg=(1, 3), BG_TYPE_SD=0.7, BG_CELL_CV=(0.0, 0.5), n_matrix=(1, 3), MATRIX_REL=(0.03, 2.0),
+    ECM_LEVEL=(1.0, 60.0), p_peri=0.5, PERI=(0.3, 1.5), PERI_UM=(0.3, 1.5),
+    # optics, per tile. The objective is not known (# VERIFY): the MACSima literature says 20x/0.75,
+    # the first calibration here assumed 0.45, so NA is a nuisance drawn from a bank (a bank, not a
+    # range, so the PSF kernels cache). FOCUS_UM is where the focal plane sits relative to the
+    # section centre; most tiles are in focus.
+    NA=(0.45, 0.55, 0.65, 0.75, 0.85, 0.95), FOCUS_UM=(-1.5, -0.75, 0.0, 0.0, 0.0, 0.0, 0.75, 1.5),
     # panel: the real slide has 48 channels, beyond the old 40 ceiling; background-only share per tile
     m_range=(6, 56), p_background=(0.0, 0.6),
     # marker texture: each antibody component's texture scalars uniform over their CLASS bounds (they
     # were never sampled -- every marker of a kind had the default texture); `s` floored so a texture
     # never vanishes outright, `w` of the extra components so multi-component mixes vary too
-    texture_keys=("scale", "clust", "fill", "soft"), texture_s=(0.2, 2.0), texture_w=(0.2, 1.0),
+    # 2026-11-16: coherence / lam / length too, so Network and Sheet reach the crisp reticular and
+    # striated looks (coherence -> 1 is a narrow-band, periodic field) real organelle markers have
+    texture_keys=("scale", "clust", "fill", "soft", "coherence", "lam", "length"),
+    texture_log_keys=("scale", "clust", "lam", "length"),
+    texture_s=(0.2, 2.0), texture_w=(0.2, 1.0),
     # the camera / staining run, per tile: everything the instrument and the backsub do differently
     # from slide to slide. Not theta (DET is pinned) -- nuisance the model must be invariant to.
     DET=dict(E_PER_UNIT=(60.0, 300.0), READ_E=(8.0, 40.0), DARK_E=(0.0, 20.0),

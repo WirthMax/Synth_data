@@ -62,7 +62,9 @@ def psf_project(slice_vol, z_um, optics, fluorophore = None, weights = None):
     # the dye is a property of the marker, so the caller hands it over directly
     wavelength_um = optics.wavelength_um if fluorophore is None else FLUOROPHORES[fluorophore]
     w = quad_weights(nz) if weights is None else np.asarray(weights, float)
-    nxy = psf_support_px(opt = optics, thickness_um = float(np.ptp(z_um)) + optics.um_per_pz)
+    # the widest PSF is the plane furthest from focus: half the slab plus the focal offset
+    nxy = psf_support_px(opt = optics, thickness_um = float(np.ptp(z_um)) + optics.um_per_pz
+                         + 2.0 * abs(float(optics.focal_um)))
     ks = psf_kernels(opt = optics, nxy = nxy, wavelength_um = wavelength_um, z_um = z_um)
     out = np.zeros(slice_vol.shape[1:], np.float32)
     for i in range(nz):
@@ -166,9 +168,11 @@ def illumination(shape, illum_cv, vignette, tape):
 
 def tissue_background(tissue2d, levels, det, opt, tape):
     """The light every channel picks up from tissue whether or not its antibody is there: per
-    channel k, levels[k] x the PSF-projected tissue occupancy (in [0, 1], one map per dye in
-    `tissue2d`) x one shared texture. The texture is the tissue's own structure, so every channel
-    gets the SAME mottling at its own brightness -- which is what makes an unexpressed real channel
+    channel k, levels[k] x that channel's PSF-projected shared-signal map `tissue2d[k]` x one
+    shared mottling texture. The map is the channel's own mix of the tile's hidden background
+    patterns (flexible_types.sample_background; mean ~1 inside a cell of an average type) -- or,
+    for a world without one, the plain tissue occupancy in [0, 1], the old model. Every channel
+    gets the SAME mottling at its own brightness, which is what makes an unexpressed real channel
     look like faint tissue instead of a black frame. Added to the clean projection BEFORE the camera,
     so it carries shot noise and survives backsub like any signal. Returns (H, W, C), clean units."""
     tissue2d = [np.asarray(t, np.float32) for t in tissue2d]

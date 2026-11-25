@@ -179,11 +179,19 @@ def rotation_matrix(polar_deg=0.0, azim_deg=0.0, roll_deg=0.0):
 
 
 def _stretch(elong):
-    """Volume-preserving ellipsoid semi-axes: `elong` along body-z, elong^-1/2 across.
-    The product A * B^2 = 1 always, so elongation cannot leak into cell size.
+    """Volume-preserving ellipsoid semi-axes for an aspect ratio `elong` = LONG : SHORT.
+    A = elong^(2/3) along body-z, B = elong^(-1/3) across, so A / B = elong exactly and
+    A * B^2 = 1 always: elongation cannot leak into cell size.
+
+    RENAMED MEANING (2026-11-16): this used to return (elong, elong^-1/2), so the realised
+    long:short ratio was elong^1.5 -- ELONG 7 was a 18.5:1 needle and the wide prior's median type
+    (ELONG ~6) had a cross-section radius of 0.41 R. Measured on the run13 eval set: median cell
+    section diameter 4.7 um, smaller than a real nucleus. A stored ELONG from before that date
+    means elong^1.5 in the new units.
     """
-    A = float(elong)
-    B = A ** -0.5
+    e = float(elong)
+    A = e ** (2.0 / 3.0)
+    B = e ** (-1.0 / 3.0)
     return np.array([B, B, A])
 
 def body_frame(grid, rot, centre = (0.0, 0.0, 0.0), elong=1.0):
@@ -218,18 +226,28 @@ def centred_grid_3d(shape, spacing=1.0):
     return np.stack([X, Y, Z], -1)
 
 
-def patch_grid(centre_xyz, reach, shape):
-    """Box of half-width `reach` around a centre, clipped to the volume."""
+def patch_grid(centre_xyz, reach, shape, spacing=None):
+    """Box of half-width `reach` around a centre, clipped to the volume. `reach` is in LATERAL
+    voxels; with `spacing` (sz, sy, sx) it is converted to plane indices per axis, so a centre that
+    sits outside the block in z (a cell cut far from its middle) gets an EMPTY z-slice when its body
+    cannot reach the block, instead of the whole stack. spacing=None is the old isotropic box."""
     nz, ny, nx = shape
     cx, cy, cz = centre_xyz
-    return (slice(max(0, int(cz) - reach), min(nz, int(cz) + reach + 1)),
-            slice(max(0, int(cy) - reach), min(ny, int(cy) + reach + 1)),
-            slice(max(0, int(cx) - reach), min(nx, int(cx) + reach + 1)))
+    if spacing is None:
+        rz = ry = rx = reach
+    else:
+        sz, sy, sx = spacing
+        rz, ry, rx = (int(np.ceil(reach / max(float(s), 1e-6))) + 1 for s in (sz, sy, sx))
+    cz, cy, cx = int(np.floor(cz)), int(np.floor(cy)), int(np.floor(cx))
+    return (slice(max(0, cz - rz), min(nz, cz + rz + 1)),
+            slice(max(0, cy - ry), min(ny, cy + ry + 1)),
+            slice(max(0, cx - rx), min(nx, cx + rx + 1)))
 
 
 def reach_px(R, rough, elong = 1.0, grow=1.0, pad=2):
-    """Furthest pixel this cell can claim, in image vox"""
-    return int(np.ceil(R * grow * max(elong, 1.0 / elong) * np.exp(3.0 * rough))) + pad
+    """Furthest pixel this cell can claim, in image vox: the longest semi-axis of the stretched
+    body (see _stretch), grown, with 3 SD of roughness on top."""
+    return int(np.ceil(R * grow * float(_stretch(elong).max()) * np.exp(3.0 * rough))) + pad
 
 
 def mix_harmonics(sh, sh2, corr):
@@ -351,7 +369,50 @@ def cell_fields(rho_c, phi_c, r_c, rho_n=None, phi_n=None, r_n=None, rim=1.5, gr
     out["tau"] = np.where(psi_n < 0.0,
                           rho_n / np.maximum(r_n, 1e-6) - 1.0,
                           psi_n / np.maximum(psi_n - psi_c, 1e-6))
+    # the clipped nuclear signed distance and the in-nucleus radial fraction, so a caller can build
+    # tau against a DIFFERENT outer surface (the realised territory, see territory_tau) while the
+    # nuclear edge stays this exact curve
+    out["psi_n"] = psi_n
+    out["nuc_r"] = rho_n / np.maximum(r_n, 1e-6)
     return out
+
+
+def territory_edge_distance(labels, spacing):
+    """Distance (lateral voxels) from every voxel to the nearest CELL BOUNDARY actually realised in
+    the packed tissue: a voxel is a boundary voxel if any of its six neighbours carries another
+    label (another cell, or the gap), and gets distance 0.
+
+    This is where the plasma membrane really is. The grown contour (r_c x GROW) is only where the
+    cell WOULD end if nothing stopped it; in confluent tissue a neighbour stops it long before, so
+    a marker localised at tau = 1 on the grown contour lit nothing at cell-cell contacts and
+    same-type neighbours were separated by their nuclei alone -- the model then learned "cell =
+    region around a nucleus". The block faces are NOT boundaries: a cell cut by the edge of the
+    volume continues outside it, so no membrane is drawn along the tile border. One EDT for the
+    whole block (~10 ms); every cell reads its own patch of it."""
+    edge = np.zeros(labels.shape, bool)
+    for ax in range(labels.ndim):
+        a = [slice(None)] * labels.ndim
+        b = [slice(None)] * labels.ndim
+        a[ax], b[ax] = slice(1, None), slice(None, -1)
+        diff = labels[tuple(a)] != labels[tuple(b)]
+        edge[tuple(a)] |= diff
+        edge[tuple(b)] |= diff
+    if not edge.any():
+        return np.full(labels.shape, 1e6, np.float32)
+    return ndi.distance_transform_edt(~edge, sampling=spacing).astype(np.float32)
+
+
+def territory_tau(f, edge_dist):
+    """tau against the REALISED territory: inside the nucleus the usual radial fraction - 1 (so
+    -1 at the centre, 0 at the envelope); outside it the fraction of the way from the nuclear
+    envelope to the nearest territory boundary, dn / (dn + de) -- 0 at the envelope, exactly 1 on
+    the boundary voxels, wherever the neighbours put them. `f` is a cell_fields dict stamped at
+    grow = 1 (so its nuclear edge is the labelled one); `edge_dist` the matching patch of
+    territory_edge_distance."""
+    psi_n = f["psi_n"]
+    dn = np.maximum(psi_n, 0.0)
+    return np.where(psi_n < 0.0, f["nuc_r"] - 1.0,
+                    dn / np.maximum(dn + edge_dist, 1e-6)).astype(np.float32)
 
 
 # The grow-independent per-cell fit: boundaries, the offset direction, the nucleus centre and its
@@ -503,24 +564,50 @@ def vox_to_world(pts_xyz, shape, spacing):
     return (np.asarray(pts_xyz, float)
             - np.array([(nx - 1) / 2, (ny - 1) / 2, (nz - 1) / 2])) * np.array([sx, sy, sz])
 
+def nuc_elong_fit(nuc_elong, elong, nuc_frac, slack=0.85):
+    """The nucleus's own aspect ratio, pulled just far enough toward the cell's that the stretched
+    nucleus still fits inside the stretched cell. Both bodies are volume-preserving ellipsoid
+    stretches of their star shapes along the SAME axis, so a nucleus more elongated than its cell
+    pokes out at the poles by (e_n / E)^(2/3), and a rounder one out of the flanks by
+    (E / e_n)^(1/3); the containment fit in `_cell_fit` compares the two un-stretched radii and
+    cannot see either. With c = slack / nuc_frac the room available, the admissible range is
+    [E / c^3, E x c^1.5]: at nuc_frac 0.25 that is E/39 .. 6.3 E (free), at nuc_frac 0.7 only
+    E/1.8 .. 1.3 E -- a nucleus that fills its cell must share its shape. A smooth clamp of the
+    declared value, never a redraw."""
+    c = max(float(slack) / max(float(nuc_frac), 1e-6), 1.0)
+    return float(np.clip(nuc_elong, elong / c ** 3, elong * c ** 1.5))
+
+
 def cell_geometry(base, ttape, i, tg, n_dir=None, S=0.0, align=0.0):
     """This cell's own geometry: the type's shape plus its frozen size / orientation draws.
+
+    The long axis starts ISOTROPIC on the sphere (cos(polar) uniform; it used to be uniform in the
+    polar ANGLE, which piles axes up along +-z, so twice as many cells as there should be were seen
+    end-on). It is then turned toward the tile's grain (TissueGeometry.AXIS_*, by AXIS_ALIGN x the
+    type's ALIGN) and, inside a structure, on toward the local director.
     """
     r = float(np.clip(base.RADIUS.v * np.exp(tg.SIZE_SIGMA.v * ttape["z_size"][i]),
                       base.RADIUS.lo, base.RADIUS.hi))
     nf = float(np.clip(base.NUC_FRAC.v * np.exp(tg.NUC_FRAC_SIGMA.v * ttape["z_nucfrac"][i]),
                        base.NUC_FRAC.lo, base.NUC_FRAC.hi))
     o = ttape["u_orient3"][i]
-    
-    polar, azim = 180.0 * o[0], 360.0 * o[1]
+
+    p, z = np.arccos(np.clip(1.0 - 2.0 * float(o[0]), -1.0, 1.0)), 2.0 * np.pi * float(o[1])
+    d = np.array([np.sin(p) * np.cos(z), np.sin(p) * np.sin(z), np.cos(p)])
+    t_align = float(getattr(tg, "AXIS_ALIGN", None).v) * float(base.ALIGN.v) \
+        if getattr(tg, "AXIS_ALIGN", None) is not None else 0.0
+    if t_align > 0.0:
+        tp, tz = np.deg2rad(float(tg.AXIS_POLAR_DEG.v)), np.deg2rad(float(tg.AXIS_AZIM_DEG.v))
+        d = tdir.slerp_axis(d, np.array([np.sin(tp) * np.cos(tz), np.sin(tp) * np.sin(tz),
+                                         np.cos(tp)]), t_align)
     a = float(align) * float(S)
     if n_dir is not None and a > 0.0:
-        p, z = np.deg2rad(polar), np.deg2rad(azim)
-        d = np.array([np.sin(p) * np.cos(z), np.sin(p) * np.sin(z), np.cos(p)])
         d = tdir.slerp_axis(d, n_dir, a)
-        polar = float(np.rad2deg(np.arccos(np.clip(d[2], -1.0, 1.0))))
-        azim = float(np.rad2deg(np.arctan2(d[1], d[0])) % 360.0)
-    return dataclasses.replace(base, RADIUS=r, NUC_FRAC=nf, POLAR_DEG=float(polar),
+    polar = float(np.rad2deg(np.arccos(np.clip(d[2], -1.0, 1.0))))
+    azim = float(np.rad2deg(np.arctan2(d[1], d[0])) % 360.0)
+    ne = float(np.clip(nuc_elong_fit(base.NUC_ELONG.v, base.ELONG.v, nf),
+                       base.NUC_ELONG.lo, base.NUC_ELONG.hi))
+    return dataclasses.replace(base, RADIUS=r, NUC_FRAC=nf, NUC_ELONG=ne, POLAR_DEG=float(polar),
                                AZIM_DEG=float(azim), ROLL_DEG=float(360.0 * o[2]))
 
 def thin(pts, order, min_dist):
@@ -596,17 +683,23 @@ def assign_types(info, tape, CellTypes, fractions, rule=None, compositions=None)
     for n in info["labels_present"]:
         i = info["cand_idx"][n]
         feat = {}
-        if field is None or fmap is None:
-            cuts = flat
-        elif compositions is not None:
-            feat = fmap[n]
-            m = np.asarray(feat["m"], float)                       # membership per structure
+        if compositions is not None:
+            # a structure-free tile is ALL background context, so its cells follow pi[0]. This
+            # branch used to sit behind `field is None -> flat`, so every structure-free tile
+            # (a quarter of the prior) was typed uniformly while theta said Dirichlet(pi[0]).
             w = np.zeros(n_ctx)
-            np.add.at(w, s2c, m)                                   # pool instances into their kind
-            w[0] += max(0.0, 1.0 - float(m.sum()))                 # the rest is background
+            if field is not None and fmap is not None:
+                feat = fmap[n]
+                m = np.asarray(feat["m"], float)                   # membership per structure
+                np.add.at(w, s2c, m)                               # pool instances into their kind
+                w[0] += max(0.0, 1.0 - float(m.sum()))             # the rest is background
+            else:
+                w[0] = 1.0
             w = w / (w.sum() + 1e-12)
             p = w @ pi
             cuts = np.cumsum(p / (p.sum() + 1e-12))
+        elif field is None or fmap is None:
+            cuts = flat
         else:
             feat = fmap[n]
             tilt = feat["m"] @ lw if lw is not None and len(lw) else 0.0
@@ -616,7 +709,7 @@ def assign_types(info, tape, CellTypes, fractions, rule=None, compositions=None)
                 for t in type_names])
             q = f * np.exp(tilt + aff)
             cuts = np.cumsum(q / q.sum())
-        base = type_names[int(np.searchsorted(cuts, tape["u_type"][i]))]
+        base = type_names[min(int(np.searchsorted(cuts, tape["u_type"][i])), len(type_names) - 1)]
         ctx = CellContext(label=n, index=i, centre=info["centres_vox"][n],
                           neigh_labels=info["neighbours"][n], types=types, feat=feat)
         types[int(n)] = base if rule is None else rule(ctx, base)
@@ -626,42 +719,128 @@ class TapeDict(dict):
     """dict that also allows attribute access, so it works wherever a Tape does."""
     __getattr__ = dict.__getitem__
 
+def seed_positions(tape, TG, shape, spacing):
+    """Candidate cell centres as (x, y, z) plane INDICES, with z stretched over the seeded slab.
+
+    The block is only the few planes the section is cut from; the tissue it is cut OUT of is much
+    thicker. The tape's frozen z draw (uniform over the block) is therefore mapped, linearly, onto
+    a slab TG.SLAB lateral-voxels thick centred on the block, so most centres sit ABOVE or BELOW
+    the block and their cells enter it as caps and off-centre cuts -- including the profiles that
+    show cytoplasm but no nucleus, which are the majority for any cell much bigger than the
+    section (a 20 um cardiomyocyte cut by a 4 um section shows its nucleus about one time in
+    three). Until 2026-11-16 every centre sat inside the 7.8 um block, so every cell bigger than
+    that showed its nucleus and the model learned that a cell IS the region around a nucleus.
+    A z index outside [0, nz) is legal and means exactly that. SLAB = nz x sz reproduces the old
+    seeding up to a half-plane shift. Returns (xyz index coords, physical coords in lateral voxels)."""
+    nz = shape[0]
+    sz, sy, sx = spacing
+    xyz = np.array(tape["xyz"], float)
+    slab = float(TG.SLAB.v) if getattr(TG, "SLAB", None) is not None else nz * sz
+    xyz[:, 2] = (xyz[:, 2] / nz - 0.5) * slab / sz + (nz - 1) / 2.0
+    return xyz, xyz * np.array([sx, sy, sz], float)
+
+
+def grain_metric(pts_w, TG, CellTypes):
+    """Candidate positions in the metric the hard-core thinning should use when the tile has a
+    grain. Parallel rods cannot sit closer side by side than their width, but must be allowed to
+    sit a whole length apart end to end: the exclusion zone is the cell's own ellipsoid, not a
+    sphere. So space is squeezed by E^(2/3) along the tile axis and stretched by E^(1/3) across it
+    (volume-preserving, like scene._stretch) and the usual spherical thinning then excludes an
+    ellipsoid of aspect E. E is the geometric mean of ELONG^(AXIS_ALIGN x type ALIGN) over the
+    types: a type that ignores the grain, or a tile without one, contributes exactly 1.
+    Without this, rods aligned THROUGH the section were thinned as spheres of their equivalent
+    radius -- measured: 442 cross-sections of 2.8 um in one tile, each rod overlapping a dozen
+    others along its length."""
+    a = float(TG.AXIS_ALIGN.v) if getattr(TG, "AXIS_ALIGN", None) is not None else 0.0
+    if a <= 0.0 or not CellTypes:
+        return pts_w
+    le = [a * float(ct.Geometry.ALIGN.v) * np.log(max(float(ct.Geometry.ELONG.v), 1.0))
+          for ct in CellTypes.values() if getattr(ct, "Geometry", None) is not None]
+    e = float(np.exp(np.mean(le))) if le else 1.0
+    if e <= 1.0 + 1e-6:
+        return pts_w
+    tp, tz = np.deg2rad(float(TG.AXIS_POLAR_DEG.v)), np.deg2rad(float(TG.AXIS_AZIM_DEG.v))
+    n = np.array([np.sin(tp) * np.cos(tz), np.sin(tp) * np.sin(tz), np.cos(tp)])
+    along = pts_w @ n
+    across = pts_w - along[:, None] * n
+    return across * e ** (1.0 / 3.0) + (along * e ** (-2.0 / 3.0))[:, None] * n
+
+
+def candidate_types(compositions, fc_all, u_type):
+    """The type index every CANDIDATE would take, by exactly the rule assign_types applies to the
+    survivors (same context membership, same frozen uniform) -- so a per-type spacing can be used
+    for the thinning itself without the typing ever disagreeing with it afterwards."""
+    pi = np.asarray(compositions["pi"], float)
+    s2c = np.asarray(compositions["struct_to_ctx"], int)
+    n = len(u_type)
+    w = np.zeros((n, pi.shape[0]))
+    if fc_all is not None and len(s2c):
+        m = np.asarray(fc_all["m"], float)                       # (n_struct, n)
+        for j, c in enumerate(s2c):
+            w[:, c] += m[j]
+        w[:, 0] += np.maximum(0.0, 1.0 - m.sum(0))
+    else:
+        w[:, 0] = 1.0
+    w = w / (w.sum(1, keepdims=True) + 1e-12)
+    pr = w @ pi
+    cuts = np.cumsum(pr / (pr.sum(1, keepdims=True) + 1e-12), axis=1)
+    k = (cuts < np.asarray(u_type, float)[:, None]).sum(1)
+    return np.minimum(k, pi.shape[1] - 1)
+
+
 def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes, Fractions,
-                 um_per_vox, L=4, l_min=2, rule=None, pool_bank=None, compositions=None):
+                 um_per_vox, L=4, l_min=2, rule=None, pool_bank=None, compositions=None,
+                 background=None):
     """Tissue in three phases: TYPE ASSIGNMENT, then geometry, then appearance.
 
     `compositions` (plan 3.4, flexible mode) switches type assignment from the Fractions/Profile
     prior to a per-context composition; see `assign_types`. None keeps the old behaviour exactly.
+
+    `background` is the tile's hidden shared signal (flexible_types.sample_background): markers no
+    channel OWNS but every channel sees a share of. Each is rendered per cell like a real marker,
+    at the cell type's own level, and the volumes come back under info["bg_vols"].
     """
     import tissue_structures as ts
-    
+
     sup, field, report = ts.build_architecture(tape, ARCH, TG, shape, spacing, um_per_vox,
                                                    L=L, l_min=l_min)
     # field is None on the structure-free path (no director, uniform thinning)
     psi = field["psi"] if field is not None else None
     thr = field["thr"] if field is not None else None
     nz, ny, nx = shape
+    xyz, pts_w = seed_positions(tape, TG, shape, spacing)
 
     fc_all = None
     if field is not None and ARCH.Structures:
-        fc_all = tdir.sample_field(field, tape["xyz"][:, 0], tape["xyz"][:, 1], tape["xyz"][:, 2])
+        fc_all = tdir.sample_field(field, xyz[:, 0], xyz[:, 1], xyz[:, 2])
+    radii = np.full(len(xyz), float(TG.MIN_DIST.v))
     if fc_all is not None:
         log_dens = np.array([np.log(max(float(st.DENSITY.v), 1e-6)) for st in ARCH.Structures])
         tilt = log_dens @ fc_all["m"]                            # (n_cand,), background = 0
-        radii = TG.MIN_DIST.v * np.exp(-(1.0 / 3.0) * tilt)
-        keep = thin_density(tape["xyz"], tape["order"], radii)
-    else:
-        keep = thin(tape["xyz"], tape["order"], TG.MIN_DIST.v)
-    cx, cy, cz = tape["xyz"][keep].T
-    keep = keep[sup[np.clip(cz.astype(int), 0, nz - 1),
+        radii = radii * np.exp(-(1.0 / 3.0) * tilt)
+    # spacing follows the cell's own size: a big type keeps its neighbours further away than a
+    # small one, so a tile can hold 20 um cells with 6 um cells between them. With one spacing for
+    # all (SIZE_COUPLE 0) every realised cell is about MIN_DIST across whatever its RADIUS says.
+    couple = float(TG.SIZE_COUPLE.v) if getattr(TG, "SIZE_COUPLE", None) is not None else 0.0
+    if couple > 0.0 and compositions is not None and len(CellTypes) > 1:
+        k_all = candidate_types(compositions, fc_all, tape["u_type"])
+        logr = np.log(np.array([max(float(ct.Geometry.RADIUS.v), 1e-6)
+                                for ct in CellTypes.values()]))[k_all]
+        # centred on the candidates' own mean, so MIN_DIST stays the TYPICAL spacing
+        radii = radii * np.clip(np.exp(couple * (logr - logr.mean())), 0.35, 3.0)
+    # hard-core thinning in PHYSICAL units: in plane indices the 4x coarser z let two centres
+    # stack 1.3 um apart, which is what forced a monolayer
+    keep = thin_density(grain_metric(pts_w, TG, CellTypes), tape["order"], radii)
+    cx, cy, cz = xyz[keep].T
+    keep = keep[sup[np.clip(np.floor(cz).astype(int), 0, nz - 1),
                     np.clip(cy.astype(int), 0, ny - 1),
                     np.clip(cx.astype(int), 0, nx - 1)]]
 
-    cvox_all = tape["xyz"][keep]
+    cvox_all = xyz[keep]
 
     if field is not None and ARCH.Structures and len(keep):
         cxs, cys, czs = cvox_all.T
-        surv_lbl = field["labels"][np.clip(czs.astype(int), 0, nz - 1),
+        surv_lbl = field["labels"][np.clip(np.floor(czs).astype(int), 0, nz - 1),
                                     np.clip(cys.astype(int), 0, ny - 1),
                                     np.clip(cxs.astype(int), 0, nx - 1)]
         for i, name in enumerate(field["struct_names"]):
@@ -675,9 +854,9 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
             d["starved"] = bool(d["requested"] > 1.0 and d["raw_in_territory"] > 0
                                  and d["survivors"] / d["raw_in_territory"] > 0.9)
 
-    tree_all = cKDTree(cvox_all)
+    tree_all = cKDTree(pts_w[keep]) if len(keep) else None
     lbl_all = list(range(1, len(keep) + 1))
-    neigh_all = {n: [j + 1 for j in tree_all.query_ball_point(cvox_all[n - 1], TG.NEIGH_RADIUS.v)
+    neigh_all = {n: [j + 1 for j in tree_all.query_ball_point(pts_w[keep[n - 1]], TG.NEIGH_RADIUS.v)
                      if j + 1 != n] for n in lbl_all}
     pre = dict(labels_present=lbl_all, cand_idx={n: int(keep[n - 1]) for n in lbl_all},
                centres_vox={n: cvox_all[n - 1] for n in lbl_all}, neighbours=neigh_all,
@@ -688,8 +867,7 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
         # 3-D Q needs six interpolations per cell plus one per structure, so sampling per cell in
         # two separate places would be thousands of tiny map_coordinates calls at the cell counts
         # a small MIN_DIST produces.
-        fc = ({k: v[..., keep] for k, v in fc_all.items()} if fc_all is not None
-              else tdir.sample_field(field, cvox_all[:, 0], cvox_all[:, 1], cvox_all[:, 2]))
+        fc = {k: v[..., keep] for k, v in fc_all.items()}
         feat_names = list(field.get("features", {}))          # e.g. ["S", "ring"]
         feat = {n: {"n": fc["n"][:, n - 1], "theta": float(fc["theta"][n - 1]),
                     "m": fc["m"][:, n - 1],
@@ -719,7 +897,6 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
     best = np.full(shape, np.inf, np.float32)
     labels = np.zeros(shape, np.int32)
     nuc_labels = np.zeros(shape, np.int32)
-    tau_img = np.zeros(shape, np.float32)
     geoms, slices, centres_w, fits = {}, {}, {}, {}
     g_align = float(ARCH.ALIGN.v) if ARCH is not None else 0.0
 
@@ -737,23 +914,25 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
                           S=(fn["S"] if fn is not None else 0.0),
                           align=g_align * float(tgeom.ALIGN.v)
                           * (s_align(fn) if s_align is not None else 1.0))
-        sl = patch_grid(tape["xyz"][i],
-                         reach_px(R=g.RADIUS.v, rough=g.ROUGH.v, elong=g.ELONG.v, grow=TG.GROW.v), 
-                         shape)
+        sl = patch_grid(xyz[i],
+                         reach_px(R=g.RADIUS.v, rough=g.ROUGH.v, elong=g.ELONG.v, grow=TG.GROW.v),
+                         shape, spacing=spacing)
+        # a centre far above or below the block whose body cannot reach it: not in this section
         if any(s.stop - s.start <= 0 for s in sl):
             continue
-        cw = vox_to_world(tape["xyz"][i], shape, spacing)
+        cw = vox_to_world(xyz[i], shape, spacing)
         f = stamp_cell(tape, i, g, grid, sl, cw, L = L, l_min = l_min, grow=1.0)
 
-        # tesselation to decide which cell is closest to each pixel 
+        # tesselation to decide which cell is closest to each pixel
         win = (f["d"] < best[sl]) & (f["d"] <= TG.GROW.v) & sup[sl]
+        if not win.any():
+            continue
         best[sl] = np.where(win, f["d"], best[sl])
         labels[sl] = np.where(win, n, labels[sl])
-        tau_img[sl] = np.where(win, f["tau"], tau_img[sl])
         nuc_labels[sl] = np.where(win, f["nuc"] * n, nuc_labels[sl])
         geoms[n], slices[n], centres_w[n], fits[n] = g, sl, cw, f["fit"]
-        
-    # keep only the piece holding the seed; a two-piece "cell" is a wrong annotation
+
+    # keep only the piece holding the most volume; a two-piece "cell" is a wrong annotation
     orphan = 0
     for n, slc in enumerate(ndi.find_objects(labels), start=1):
         if slc is None:
@@ -765,19 +944,16 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
             drop = m & (cc != main)
             labels[slc][drop] = 0
             nuc_labels[slc][drop] = 0
-            tau_img[slc][drop] = 0.0
             orphan += int(drop.sum())
-    
-    present = sorted(set(np.unique(labels)) - {0})
-    cvox = tape["xyz"][keep]
-    tree = cKDTree(cvox)
-    neigh = {n: [j + 1 for j in tree.query_ball_point(cvox[n - 1], TG.NEIGH_RADIUS.v)
-                 if j + 1 != n] for n in present}
-    neigh = {n: [j for j in v if j in neigh] for n, v in neigh.items()}
+
+    present = sorted(set(np.unique(labels).tolist()) - {0})
+    neigh = {n: neigh_all[n] for n in present}
+    pset = set(present)
+    neigh = {n: [j for j in v if j in pset] for n, v in neigh.items()}
 
     info = dict(labels_present=present, cand_idx={n: int(keep[n - 1]) for n in present},
         geoms=geoms, slices=slices, centres_w=centres_w, fits=fits,
-        centres_vox={n: cvox[n - 1] for n in present},
+        centres_vox={n: cvox_all[n - 1] for n in present},
         neighbours=neigh, support=sup, orphan_vox=orphan,
         packing=float((labels > 0).sum() / max(sup.sum(), 1)),
         # the field, the potential behind it, and the ledger's realised fractions, so a caller
@@ -791,33 +967,69 @@ def build_tissue_V2(tape, ARCH, TG, shape, base_geom, spacing, Panel, CellTypes,
     # still means "the type of every cell in the label image", exactly as it always did
     types = {n: types_all[n] for n in present}
 
+    # --- appearance. The cell IS its realised territory: tau runs from the nuclear envelope to the
+    # territory boundary (territory_tau), and brightness is normalised against an ideal whole cell
+    # (render.loc_norm), never against the piece of it that happens to lie in the block.
+    edge_dist = territory_edge_distance(labels, spacing)
+    tau_img = np.zeros(shape, np.float32)
     names = list(Panel.Markers)
     out = {m: np.zeros(shape, np.float32) for m in names}
+    bg_markers = list(background["markers"]) if background else []
+    bg_vols = [np.zeros(shape, np.float32) for _ in bg_markers]
+    z_expr = getattr(tape, "z_expr", None)
+    boxes = ndi.find_objects(labels)
 
     for n in info["labels_present"]:
         ctype = CellTypes[types[n]]
-        g, sl = info["geoms"][n], info["slices"][n]
+        g = info["geoms"][n]
+        # the territory's own bounding box, not the reach box: at GROW 3 the reach box is up to
+        # 27x the territory, and every texture below is an FFT over the patch
+        sl = boxes[n - 1]
         win = labels[sl] == n
         if not win.any():
             continue
-        # the packed body, so a marker fills the claimed territory, not just the free shape
-        f = stamp_cell(tape, info["cand_idx"][n], g, grid, sl, info["centres_w"][n],
-                          grow=TG.GROW.v, L=L, l_min=l_min, fit=info["fits"][n])
+        i_c = info["cand_idx"][n]
+        f = dict(stamp_cell(tape, i_c, g, grid, sl, info["centres_w"][n],
+                            grow=1.0, L=L, l_min=l_min, fit=info["fits"][n]))
+        f["tau"] = territory_tau(f, edge_dist[sl])
+        f["cell"] = win
+        tau_img[sl] = np.where(win, f["tau"], tau_img[sl])
         ptape = TapeDict(texture_noise=tape["texture_noise"][(slice(None),) + sl],
                          gate_noise=tape["gate_noise"][(slice(None),) + sl], seed=tape.seed)
+        nf = float(g.NUC_FRAC.v)
+        r_short = float(g.RADIUS.v) * float(_stretch(g.ELONG.v).min())
         off = 0
-        for name, marker in Panel.Markers.items():
+        for c_idx, (name, marker) in enumerate(Panel.Markers.items()):
             lvl = ctype.level(name)
             if lvl > 0.0:
+                # cell-to-cell spread of one type's expression: lognormal, mean-preserving, on a
+                # frozen (candidate, channel) draw -- so a type's LEVEL stays its mean brightness
+                cv = float(marker.cell_cv.v) if getattr(marker, "cell_cv", None) is not None else 0.0
+                if cv > 0.0 and z_expr is not None:
+                    lvl = lvl * float(np.exp(cv * z_expr[i_c, c_idx % z_expr.shape[1]] - 0.5 * cv * cv))
                 img = render_marker(tape=ptape, marker=marker, cell=f, spacing=spacing, geom=g,
                                     um_per_vox=um_per_vox, edge_softness=0.0, pool_offset=off,
-                                    pool_bank=pool_bank)
+                                    pool_bank=pool_bank, nuc_frac=nf, radius_vox=r_short)
                 # the level multiplies the rendered volume, which is exactly scaling amp
                 if lvl != 1.0:
                     img = img * np.float32(lvl)
                 out[name][sl] = np.where(win, img, out[name][sl])
             off += len(marker.noise_components)
+        for j, marker in enumerate(bg_markers):
+            lvl = float(background["type_level"][types[n]][j])
+            if lvl > 0.0:
+                cv = float(background["cell_cv"][j])
+                if cv > 0.0 and z_expr is not None:
+                    lvl = lvl * float(np.exp(cv * z_expr[i_c, (len(names) + j) % z_expr.shape[1]]
+                                             - 0.5 * cv * cv))
+                img = render_marker(tape=ptape, marker=marker, cell=f, spacing=spacing, geom=g,
+                                    um_per_vox=um_per_vox, edge_softness=0.0, pool_offset=off,
+                                    pool_bank=pool_bank, nuc_frac=nf, radius_vox=r_short)
+                bg_vols[j][sl] = np.where(win, img * np.float32(lvl), bg_vols[j][sl])
+            off += len(marker.noise_components)
 
+    info["bg_vols"] = bg_vols
+    info["edge_dist"] = edge_dist
     return out, labels, nuc_labels, tau_img, types, info
 
 

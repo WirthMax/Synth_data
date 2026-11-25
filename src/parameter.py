@@ -207,7 +207,11 @@ class CellGeometry(ParamHolder):
         1.6,
         "elong",
         note="elong",
-        comment="volume-preserving aspect ratio. >1 prolate (rod), 1 = sphere, <1 oblate.",
+        comment="volume-preserving aspect ratio, LONG : SHORT. >1 prolate (rod), 1 = sphere, "
+        "<1 oblate. The semi-axes are R x elong^(2/3) along and R x elong^(-1/3) across, so 5 is a "
+        "cell 2.9 R long and 0.58 R wide (a cardiomyocyte), 10 is 4.6 R x 0.46 R. RENAMED MEANING "
+        "2026-11-16: the stretch used to be (elong, elong^-1/2), i.e. a true ratio of elong^1.5 -- "
+        "an old ELONG of 7 is 18.5 in these units. See scene._stretch.",
     )
 
     # 2) NUCLEUS
@@ -245,7 +249,10 @@ class CellGeometry(ParamHolder):
         1.6,
         "nuc_elong",
         note="nuc elong",
-        comment="volume-preserving aspect ratio of the Nuclei's OWN body frame.",
+        comment="volume-preserving aspect ratio (long : short) of the nucleus, along the "
+        "CELL's long axis. The value actually used is clamped per cell to what fits inside the "
+        "stretched cell (scene.nuc_elong_fit): free at small NUC_FRAC, forced toward the cell's "
+        "own ELONG as the nucleus fills it.",
     )
     NUC_CORR: P = P(
         0.0,
@@ -435,9 +442,23 @@ class PanelMarker(ParamHolder):
         note="art aff",
         comment="how strongly this marker's antibody binds artifacts",
     )
+    cell_cv: P = P(
+        0.0,
+        1.2,
+        0.05,
+        0.0,
+        "cell cv",
+        note="cell cv",
+        comment="cell-to-cell spread of this marker WITHIN one type: each expressing cell's level "
+        "is multiplied by exp(cv x z - cv^2 / 2) on a frozen per-(cell, channel) normal draw, so "
+        "the type's LEVEL stays its mean brightness and only the scatter around it grows. 0.3 is "
+        "+-30% between neighbours of one type; 0.8 spans about 10x (5-95%), which is what real "
+        "nuclei show in one DAPI tile. 0 = every cell of a type exactly as bright as the next "
+        "(the generator before 2026-11-16), exp(0) = 1 exactly. Not fitted: nuisance.",
+    )
     tissue_bg: P = P(
         0.0,
-        60.0,
+        1000.0,
         0.05,
         0.0,
         "tissue bg",
@@ -452,7 +473,9 @@ class PanelMarker(ParamHolder):
         "~70% zeros inside tissue, against 0-9% zeros on the real staged slide). 3 ~ 180 ADU in "
         "solid tissue, the median real backsub channel. On DAPI this is the blue tissue "
         "autofluorescence that makes real myocardium DAPI read 0.6-0.7 off/on-nucleus. Not "
-        "fitted: orthogonal to expression, which adds on top only in expressing cells.",
+        "fitted: orthogonal to expression, which adds on top only in expressing cells. The bound "
+        "was 60 until 2026-11-16; it is 1000 because the counterstain's background is drawn as a "
+        "fraction of the stain (config.DAPI_CONTRAST), and the stain now reaches 800.",
     )
 
     def __post_init__(self):
@@ -1303,6 +1326,56 @@ class TissueGeometry(ParamHolder):
         comment="spread of the nucleus:cell ratio. Keep > 0, or nuclear size "
         "predicts cell size exactly and the segmentation is invertible.",
     )
+    SLAB: P = P(
+        8.0,
+        600.0,
+        1.0,
+        24.0,
+        "slab",
+        tf="log",
+        note="slab",
+        comment="thickness, in LATERAL voxels, of the tissue the section is cut out of: cell "
+        "centres are seeded through a slab this thick centred on the block (scene.seed_positions). "
+        "The block itself is only 24 voxels (7.8 um) deep, and 24 -- every centre inside it, every "
+        "cell bigger than that showing its nucleus -- is the old generator. A slab of the section "
+        "plus twice the cell's reach is a true cut through bulk: caps, off-centre cuts and "
+        "nucleus-free profiles at their geometric frequency. Beyond that it only wastes "
+        "candidates: the cell count in the section falls as 1 / SLAB at fixed N_CAND.",
+    )
+    SIZE_COUPLE: P = P(
+        0.0,
+        1.0,
+        0.05,
+        0.0,
+        "size couple",
+        note="size cpl",
+        comment="how far the hard-core spacing follows each cell's OWN type radius: the exclusion "
+        "radius is MIN_DIST x (R_type / geometric-mean R)^SIZE_COUPLE. 0 = one spacing for every "
+        "cell, so every realised cell is about MIN_DIST across whatever its RADIUS (the old "
+        "generator, exactly). 1 = spacing proportional to radius: big cells with small ones "
+        "packed between them. The thinning then removes big types more often than small ones, so "
+        "the realised type counts are no longer the composition pi -- which is why the bundle "
+        "stores the realised composition as the target.",
+    )
+    AXIS_ALIGN: P = P(
+        0.0,
+        1.0,
+        0.05,
+        0.0,
+        "axis align",
+        note="axis align",
+        comment="how strongly every cell's long axis turns toward ONE tile-wide direction "
+        "(AXIS_AZIM_DEG, AXIS_POLAR_DEG), times the type's own CellGeometry.ALIGN. 0 = isotropic "
+        "(the null: no grain at all). 1 with a type ALIGN of 1 = perfectly parallel cells: a "
+        "muscle or nerve bundle, seen lengthwise at polar 90 and as a field of cross-sections at "
+        "polar 0. This is the grain of a tile with NO structure in it; inside a structure the "
+        "local director is applied on top.",
+    )
+    AXIS_AZIM_DEG: P = P(0.0, 180.0, 5.0, 0.0, "axis azim", note="axis azim",
+                         comment="in-plane direction of the tile grain, +x toward +y.")
+    AXIS_POLAR_DEG: P = P(0.0, 90.0, 5.0, 90.0, "axis polar", note="axis polar",
+                          comment="polar angle of the tile grain: 90 lies in the section plane, "
+                          "0 runs straight through it.")
     NEIGH_RADIUS: P = P(
         2.0,
         100.0,

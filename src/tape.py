@@ -97,6 +97,20 @@ class Tape(object):
         self.w_tbg = np.random.default_rng([int(self.seed), 7001]).standard_normal(
             (ny, nx), dtype=np.float32)
 
+    def drawExpr(self, n_cand=1500, n_ch=64):
+        """One frozen normal per (candidate cell, channel): the cell-to-cell spread of a marker
+        within one type (PanelMarker.cell_cv scales it). From its OWN stream keyed on the tape
+        seed, like drawTissueBg, so the main stream -- and every geometry draw -- is untouched."""
+        self.z_expr = np.random.default_rng([int(self.seed), 7002]).standard_normal(
+            (n_cand, n_ch)).astype(np.float32)
+
+    def drawMatrix(self, shape=(6, 160, 160), n_field=3):
+        """White fields for the extracellular matrix textures (flexible_types.sample_background),
+        each paired with a gate field for cluster-type textures. Own stream, see drawExpr."""
+        rng = np.random.default_rng([int(self.seed), 7003])
+        self.matrix_noise = rng.standard_normal((n_field, *shape), dtype=np.float32)
+        self.matrix_gate = rng.standard_normal((n_field, *shape), dtype=np.float32)
+
     def drawArtifacts(self, shape=(40, 160, 160), n_cand=256, n_mark=64, n_mode=16,
                       n_t=512, n_lm=21):
         """RNG for Fussel and Aggregate"""

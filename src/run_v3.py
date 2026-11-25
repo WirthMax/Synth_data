@@ -30,28 +30,68 @@ K_SLOTS = 30           # type slots (plan default)
 
 
 # ---------------- generate ----------------
+def _gen_worker_init():
+    """One generation worker = one core. scipy.fft takes its thread count from render.FFT_WORKERS
+    (-1 = all cores by default) and numba from its own setting, so 12 workers each started 16
+    FFT threads and fought over the same cores."""
+    import render
+    render.FFT_WORKERS = 1
+    try:
+        import numba
+        numba.set_num_threads(1)
+    except Exception:
+        pass
+
+
 def _gen_one(args):
-    i, seed, progress, outdir, with_artifacts, p_artifacts = args
+    i, seed, progress, outdir, with_artifacts, p_artifacts, strata, field = args
     import config as cfg
+    # the rendered field (160 = a tile; 512 = a 166 um region): set in the worker, before the render
+    cfg.set_field(field)
     import flexible_bundle as fb
     cur = cfg.curriculum_at(progress)
     # artifacts per SAMPLE (fibres, aggregates, detachment, cycle shift): a real slide has them in
     # some fields and not others, so the model must see both -- keyed on the sample seed, reproducible
     art = with_artifacts or bool(np.random.default_rng([seed + i, 4242]).random() < p_artifacts)
-    b = fb.build_bundle(i, seed=seed + i, curriculum=cur, with_artifacts=art)
-    np.savez(os.path.join(outdir, f"bundle_{i:06d}.npz"), **b)
+    # an infeasible architecture draw is retried inside draw_flexible (ValueError). Anything ELSE
+    # is a rare geometry corner nobody has met yet: one bad tile in 100,000 must not take an
+    # unattended open-ended run down with it, so it is reported with its seed (to reproduce and
+    # fix) and the tile is redrawn from a shifted seed; after three such failures the tile is
+    # skipped -- the trainer reads whatever bundles exist.
+    b = None
+    for k in range(3):
+        try:
+            b = fb.build_bundle(i, seed=seed + i + k * 7_777_777, curriculum=cur,
+                                with_artifacts=art, strata=strata)
+            break
+        except Exception as e:
+            import traceback
+            print(f"  [gen] tile {i} seed {seed + i + k * 7_777_777} failed: "
+                  f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=4)}", flush=True)
+    if b is None:
+        return i, 0, 0, -1
+    # compressed: the label maps and flows are almost all zeros or constants, and the open-ended
+    # run keeps three rounds on a nearly full disk (2.2 MB -> ~1 MB per tile)
+    np.savez_compressed(os.path.join(outdir, f"bundle_{i:06d}.npz"), **b)
     return i, int(b["th_M"]), int(b["th_K"]), int(b["present"].sum())
 
 
 def cmd_gen(a):
     os.makedirs(a.out, exist_ok=True)
-    jobs = [(i, a.seed, a.progress, a.out, a.with_artifacts, a.p_artifacts) for i in range(a.n)]
+    strata = [float(x) for x in a.strata.split(",")] if a.strata else None
+    if strata is not None and len(strata) != 5:
+        raise ValueError(f"--strata needs five shares (empty, 1-10, 11-50, 51-100, >100 visible "
+                         f"cells), got {len(strata)}: {a.strata!r}. Example: 0.08,0.17,0.35,0.2,0.2")
+    jobs = [(i, a.seed, a.progress, a.out, a.with_artifacts, a.p_artifacts, strata, a.field)
+            for i in range(a.n)]
     t0 = time.time()
     done = 0
     if a.workers > 1:
         from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=a.workers) as ex:
-            for i, M, K, J in ex.map(_gen_one, jobs, chunksize=4):
+        with ProcessPoolExecutor(max_workers=a.workers, initializer=_gen_worker_init) as ex:
+            # a 512 px region renders in minutes, not seconds: hand out one job at a time there,
+            # or the last chunk of four keeps one worker busy while the rest idle
+            for i, M, K, J in ex.map(_gen_one, jobs, chunksize=4 if a.field <= 160 else 1):
                 done += 1
                 if done % 50 == 0 or done == a.n:
                     print(f"  {done}/{a.n}  ({(time.time()-t0)/done:.2f}s/sample)", flush=True)
@@ -61,7 +101,9 @@ def cmd_gen(a):
             done += 1
             if done % 50 == 0 or done == a.n:
                 print(f"  {done}/{a.n}", flush=True)
-    print(f"wrote {a.n} bundles to {a.out} in {time.time()-t0:.0f}s")
+    n_ok = _bundle_count(a.out)
+    print(f"wrote {n_ok} bundles to {a.out} in {time.time()-t0:.0f}s"
+          + (f"  ({a.n - n_ok} tiles SKIPPED after repeated failures -- see above)" if n_ok < a.n else ""))
 
 
 # ---------------- train ----------------
@@ -84,7 +126,9 @@ def cmd_train(a):
 
     os.makedirs(a.out, exist_ok=True)
     device = a.device
-    ds = BundleShardDataset(a.data, k_slots=a.k_slots, n_global=a.n_global)
+    ds = BundleShardDataset(a.data, k_slots=a.k_slots, n_global=a.n_global,
+                            augment=bool(a.val_data) and a.augment,
+                            chan_drop=a.chan_drop if a.val_data else 0.0)
     n = len(ds)
     coll = lambda s: T.collate_v3(s, m_max=a.m_max)
     if a.val_data:
@@ -104,7 +148,8 @@ def cmd_train(a):
     print(f"dataset: {n} samples ({len(train_idx)} train / {len(val_idx)} val)", flush=True)
 
     model = ModelV3(n_global=a.n_global, n_marker_noise=4, K=a.k_slots, T=3,
-                    n_queries=a.n_queries, use_flow=not a.no_flow).to(device)
+                    n_queries=a.n_queries, use_flow=not a.no_flow,
+                    use_ref=a.use_ref).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
     fw = json.loads(a.family_weights) if a.family_weights else None
 
@@ -140,7 +185,7 @@ def cmd_train(a):
     print(f"ModelV3: {n_params/1e6:.1f}M params | device={device} | "
           f"fw={fw} | cum step {start_step}->{start_step+a.steps}/{total_steps}", flush=True)
 
-    local, t0 = 0, time.time()
+    local, t0, n_micro = 0, time.time(), 0
     while local < a.steps:
         for tile, present, tgt in train_loader:
             cum = start_step + local
@@ -161,7 +206,11 @@ def cmd_train(a):
             for g in opt.param_groups:
                 g["lr"] = lr
             log = TR.train_step(model, opt, tile, present, tgt, s_step, s_total, gen,
-                                device=device, family_weights=fw)
+                                device=device, family_weights=fw,
+                                accum=(n_micro % a.accum, a.accum))
+            n_micro += 1
+            if n_micro % a.accum:
+                continue                     # an accumulated step is one step: count it once
             if local % a.log_every == 0:
                 log["step"], log["lr"] = cum, lr
                 print(f"step {cum:6d}  loss {log['loss/total']:9.2f}  lr {lr:.2e}  "
@@ -179,6 +228,8 @@ def cmd_train(a):
     end_step = start_step + a.steps
     _save(model, opt, a, end_step)
     agg = _run_eval(model, val_loader, device, end_step, logf)
+    if a.real_eval:
+        agg.update(_run_real_eval(model, a.real_eval, device, end_step, logf))
     json.dump(agg, open(os.path.join(a.out, "metrics.json"), "w"))     # for the orchestrator
     print(f"done in {(time.time()-t0)/60:.1f} min", flush=True)
 
@@ -186,10 +237,14 @@ def cmd_train(a):
 def _run_eval(model, val_loader, device, step, logf):
     import numpy as np
     import train_v3 as TR
-    mets = []
-    for tile, present, tgt in val_loader:
-        mets.append(TR.evaluate_v3(model, tile, present, tgt, device=device))
-    agg = {k: float(np.mean([m[k] for m in mets])) for k in mets[0]} if mets else {}
+    mets, per_tile = [], []
+    for i, (tile, present, tgt) in enumerate(val_loader):
+        m = TR.evaluate_v3(model, tile, present, tgt, device=device, tag_seed=1000 + i)
+        per_tile += m.pop("_per_tile", [])
+        mets.append(m)
+    keys = sorted(set().union(*mets)) if mets else []
+    agg = {k: float(np.mean([m[k] for m in mets if k in m])) for k in keys}
+    agg.update(TR.pool_instance_metrics(per_tile))
     print(f"  [eval @ {step}] " + "  ".join(f"{k}={v:.3f}" for k, v in agg.items()), flush=True)
     logf.write(json.dumps({"eval_step": step, **{f"eval/{k}": round(v, 5)
                                                  for k, v in agg.items()}}) + "\n")
@@ -197,11 +252,76 @@ def _run_eval(model, val_loader, device, step, logf):
     return agg
 
 
+def _run_real_eval(model, data_dir, device, step, logf):
+    """The annotation-free real-tile proxy (real_eval.py) after a training call, as `real/...`
+    metrics. DISPLAY ONLY: these keys are in no score, no family weight and no LR decision -- real
+    tiles never steer training (they are the one yardstick that survives a generator change, which
+    is exactly why they must not be optimised against). A missing or unreadable set is reported and
+    skipped; it never stops a run."""
+    try:
+        import real_eval as RE
+        model.eval()
+        agg, _ = RE.evaluate(model, RE.load_set(data_dir), device)
+    except Exception as e:                                           # never let a diagnostic kill a run
+        print(f"  [real @ {step}] skipped: {type(e).__name__}: {e}", flush=True)
+        return {}
+    keys = ("nuc_f1_c", "nuc_rec_c", "nuc_prec_c", "nuc_count_lr", "cells_per_nuc", "n_pred_cell",
+            "n_pseudo", "flip_f1", "p_exist_mid", "at_cap")
+    out = {f"real/{k}": float(agg[k]) for k in keys if k in agg and np.isfinite(agg[k])}
+    print(f"  [real @ {step}] " + "  ".join(f"{k[5:]}={v:.3f}" for k, v in out.items()), flush=True)
+    logf.write(json.dumps({"eval_step": step, **{k: round(v, 5) for k, v in out.items()}}) + "\n")
+    logf.flush()
+    return out
+
+
+def cmd_evalsyn(a):
+    """Score a checkpoint on a bundle dir with the pooled instance metrics (density bins, signed
+    count error) and fixed marker tags -- the before/after yardstick for decode or loss changes."""
+    import torch
+    from torch.utils.data import DataLoader
+    from data_v3 import BundleShardDataset
+    import targets_v3 as T
+    from model_v3 import ModelV3
+    ck = torch.load(a.ckpt, map_location=a.device, weights_only=False)
+    c = ck["cfg"]
+    model = ModelV3(n_global=c["n_global"], n_marker_noise=4, K=c["k_slots"], T=3,
+                    n_queries=c.get("n_queries", 0), use_flow=c.get("use_flow", True),
+                    **({"use_ref": c["use_ref"]} if "use_ref" in c else {})).to(a.device).eval()
+    model.load_state_dict(ck["model"])
+    ds = BundleShardDataset(a.data, k_slots=c["k_slots"], n_global=c["n_global"])
+    if a.n:
+        ds.paths = ds.paths[:a.n]
+    loader = DataLoader(ds, batch_size=a.batch_size, shuffle=False, num_workers=a.num_workers,
+                        collate_fn=lambda s: T.collate_v3(s))
+    import train_v3 as TR
+    dec = dict(exist_thr=a.exist_thr)
+    if a.no_filter:
+        dec.update(min_area=0, overlap_thr=0.0)
+    mets, per_tile = [], []
+    for i, (tile, present, tgt) in enumerate(loader):
+        m = TR.evaluate_v3(model, tile, present, tgt, device=a.device, tag_seed=1000 + i, decode=dec)
+        per_tile += m.pop("_per_tile", [])
+        mets.append(m)
+    keys = sorted(set().union(*mets))
+    agg = {k: float(np.mean([m[k] for m in mets if k in m])) for k in keys}
+    agg.update(TR.pool_instance_metrics(per_tile))
+    print(f"{a.ckpt} (step {ck.get('step')}) on {a.data} [{len(ds)} tiles], decode {dec}")
+    print("  " + "  ".join(f"{k}={agg[k]:.3f}" for k in sorted(agg) if not k.startswith(("n_b", "q_")) ))
+    print("  " + "  ".join(f"{k}={agg[k]:.3f}" for k in sorted(agg) if k.startswith("q_") and "_b" not in k))
+    for i, (lo, hi) in enumerate(TR.DENSITY_BINS):
+        if agg.get(f"n_b{i}"):
+            print(f"  cells {lo:>3}-{min(hi, 9999):<4} n={agg[f'n_b{i}']:<4} cell F1 {agg[f'q_cell_f1_b{i}']:.3f}"
+                  f"  nuc F1 {agg[f'q_nuc_f1_b{i}']:.3f}  count lr {agg[f'q_count_lr_b{i}']:+.3f}")
+    if a.json:
+        json.dump(dict(ckpt=a.ckpt, step=ck.get("step"), decode=dec, agg=agg, per_tile=per_tile),
+                  open(a.json, "w"), indent=1)
+
+
 def _save(model, opt, a, step):
     import torch
     torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), step=step,
                     cfg=dict(n_global=a.n_global, k_slots=a.k_slots, n_queries=a.n_queries,
-                             use_flow=not a.no_flow)),
+                             use_flow=not a.no_flow, use_ref=a.use_ref)),
                os.path.join(a.out, "model_last.pt"))
 
 
@@ -231,19 +351,44 @@ def update_family_weights(metrics, hard_focus):
 # open-ended rounds: every tracked eval metric as an ERROR (lower = better) -- 1 - x for the scores.
 # The composite is the mean log error-reduction against round 0, so an F1 going 0.30 -> 0.65 and an
 # nmse going 0.06 -> 0.03 count on the same scale. eps keeps a perfect metric from dominating.
+# The segmentation enters as the MACRO average over the visible-cell bins and a scale-free signed-
+# magnitude count error (|log pred/true|), not as per-tile means: half the eval tiles hold < 20
+# cells, so the per-tile mean F1 and the absolute count error both moved with sparse tiles alone and
+# hid that tiles above 100 cells sat below F1 0.2. `real/...` keys are deliberately NOT here.
 _OPEN_METRICS = {  # name: (higher_is_better, eps)
-    "q_cell_f1": (True, 1e-2), "q_nuc_f1": (True, 1e-2), "cell_f1": (True, 1e-2),
+    "q_cell_f1_macro": (True, 1e-2), "q_nuc_f1_macro": (True, 1e-2), "cell_f1": (True, 1e-2),
     "nuc_f1": (True, 1e-2), "cell_iou": (True, 1e-2), "recovered_rate": (True, 1e-2),
     "positivity_acc": (True, 1e-2), "compartment_acc": (True, 1e-2),
     "mu_nmse": (False, 1e-3), "noise_nmse": (False, 1e-3), "global_nmse": (False, 1e-3),
     "expr_nmse": (False, 1e-3), "geom_nmse": (False, 1e-3),
-    "type_count_err": (False, 0.5), "q_count_err": (False, 0.5),
+    "type_count_err": (False, 0.5), "q_count_alr": (False, 5e-2),
 }
 # family -> the metrics whose error it is responsible for; the weight of a family that improves
 # LEAST relative to its own round-0 error goes up (inst / dense are the segmentation losses)
 _OPEN_FAMILIES = {"mu": ("mu_nmse",), "noise": ("noise_nmse",), "global": ("global_nmse",),
                   "level": ("expr_nmse",), "geom": ("geom_nmse",),
-                  "inst": ("q_cell_f1", "q_nuc_f1"), "dense": ("cell_f1", "nuc_f1")}
+                  "inst": ("q_cell_f1_macro", "q_nuc_f1_macro"), "dense": ("cell_f1", "nuc_f1")}
+
+# density mix of a generated round: shares of tiles EXPECTED to show 0 / 1-10 / 11-50 / 51-100 /
+# > 100 visible cells (flexible_types.density_stratum). The plain prior gives about
+# 0.15 / 0.21 / 0.38 / 0.15 / 0.12; this base moves a tenth of the tiles from the empty and sparse
+# bins to the dense ones, where a 52 um frame of real tissue usually is.
+STRATA_BASE = (0.08, 0.17, 0.35, 0.20, 0.20)
+
+
+def strata_from_metrics(metrics, base=STRATA_BASE, adapt=0.5):
+    """Next round's density mix: half the base mix, half in proportion to the query head's cell-F1
+    ERROR in each non-empty bin on the fixed eval set -- so tiles are spent where the model is
+    worst, while `adapt` < 1 keeps every bin supplied whatever the errors say. The empty bin keeps
+    its base share (there is nothing to learn in more of it). Falls back to the base when a bin has
+    no eval tile. Pure function of the eval metrics; it never sees a real tile."""
+    err = [1.0 - float(metrics[f"q_cell_f1_b{i}"]) if f"q_cell_f1_b{i}" in metrics else None
+           for i in range(1, 5)]
+    if any(e is None for e in err) or sum(err) <= 0:
+        return list(base)
+    b = np.asarray(base[1:], float)
+    mix = (1.0 - adapt) * b / b.sum() + adapt * np.asarray(err) / sum(err)
+    return [float(base[0])] + [float(x) for x in (1.0 - base[0]) * mix]
 
 
 def _err(metrics, k):
@@ -293,28 +438,50 @@ def cmd_rounds_open(a):
     data_of = lambda r: os.path.join(a.data_root, f"round_{r}")
     eval_dir = os.path.join(a.data_root, "eval")
 
-    def gen_cmd(out, n, seed):
-        return [a.synmac_python, os.path.abspath(__file__), "gen", "--n", str(n), "--out", out,
-                "--progress", "1.0", "--workers", str(a.gen_workers), "--seed", str(seed),
-                "--p-artifacts", str(a.p_artifacts)]
+    def gen_cmd(out, n, seed, strata=None):
+        cmd = [a.synmac_python, os.path.abspath(__file__), "gen", "--n", str(n), "--out", out,
+               "--progress", "1.0", "--workers", str(a.gen_workers), "--seed", str(seed),
+               "--p-artifacts", str(a.p_artifacts), "--field", str(a.field)]
+        if strata:
+            cmd += ["--strata", ",".join(f"{x:.4f}" for x in strata)]
+        return cmd
+
+    # one BLAS / OpenMP thread per generation worker: the workers ARE the parallelism (see
+    # _gen_worker_init for the FFT and numba side of the same thing)
+    gen_env = {**os.environ, "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+               "MKL_NUM_THREADS": "1"}
 
     def gen_async(r):
         if _bundle_count(data_of(r)) >= a.spr:
             return None
+        # the density mix follows the last finished round's per-bin errors (a round is generated
+        # while the one before it trains, so the feedback lags by one round); the FIXED eval set
+        # below is always the plain prior
+        strata = (st.get("strata") or list(STRATA_BASE)) if a.strata_adapt >= 0 else None
         log = open(os.path.join(a.out, f"gen_round_{r}.log"), "w")
-        return subprocess.Popen(gen_cmd(data_of(r), a.spr, seed_of(r)), stdout=log,
-                                stderr=subprocess.STDOUT)
+        log.write(f"strata {strata}\n")
+        log.flush()
+        return subprocess.Popen(gen_cmd(data_of(r), a.spr, seed_of(r), strata), stdout=log,
+                                stderr=subprocess.STDOUT, env=gen_env)
 
     def train(data_dir, steps, fw, lr, warmup, seed):
         resume = ckpt if os.path.exists(ckpt) else a.init
         cmd = [a.synmodel_python, os.path.abspath(__file__), "train", "--data", data_dir,
                "--val-data", eval_dir, "--out", a.out, "--steps", str(steps),
                "--lr-mode", "const", "--lr", f"{lr}", "--warmup", str(warmup),
-               "--batch-size", str(a.batch_size), "--device", a.device,
+               "--batch-size", str(a.batch_size), "--accum", str(a.accum), "--device", a.device,
                "--num-workers", str(a.num_workers), "--seed", str(seed),
                "--eval-every", str(10 ** 9), "--ckpt-every", "2000", "--n-queries", str(a.n_queries)]
         if a.no_flow:
             cmd += ["--no-flow"]
+        if a.use_ref:
+            cmd += ["--use-ref"]
+        if a.augment:
+            cmd += ["--augment"]
+        if a.chan_drop > 0:
+            cmd += ["--chan-drop", str(a.chan_drop)]
+        if a.real_eval:
+            cmd += ["--real-eval", a.real_eval]
         if resume:
             cmd += ["--resume", resume]
         if fw:
@@ -332,7 +499,7 @@ def cmd_rounds_open(a):
 
     if _bundle_count(eval_dir) < a.eval_n:
         print(f"[open] generating the fixed eval set ({a.eval_n} tiles)", flush=True)
-        subprocess.run(gen_cmd(eval_dir, a.eval_n, a.seed + 7), check=True)
+        subprocess.run(gen_cmd(eval_dir, a.eval_n, a.seed + 7), check=True, env=gen_env)
 
     nxt = gen_async(st["round"])
     while True:
@@ -378,12 +545,15 @@ def cmd_rounds_open(a):
         elif improved:
             st["decays"] = 0 if a.reset_decays_on_best else st["decays"]
         st["fw"] = open_family_weights(m, st["base"], a.hard_focus)
+        if a.strata_adapt >= 0:
+            st["strata"] = strata_from_metrics(m, adapt=a.strata_adapt)
         with open(rounds_log, "a") as f:
             f.write(json.dumps({"round": r, "score": round(score, 5), "best": round(st["best"], 5),
                                 "lr": st["lr"], "extra_steps": extra, "event": event,
                                 "elapsed_h": round((time.time() - t0) / 3600, 2),
                                 "metrics": {k: round(v, 5) for k, v in m.items()},
-                                "next_family_weights": st["fw"]}) + "\n")
+                                "next_family_weights": st["fw"],
+                                "next_strata": st.get("strata")}) + "\n")
         print(f"[open] round {r}: score {score:+.4f} (best {st['best']:+.4f})  {event}", flush=True)
         if not a.keep_data and r - a.pool_rounds + 1 >= 0:
             shutil.rmtree(data_of(r - a.pool_rounds + 1), ignore_errors=True)   # leaves the pool
@@ -423,7 +593,7 @@ def cmd_rounds(a):
     def train(data_dir, steps, fw, seed):
         cmd = [a.synmodel_python, os.path.abspath(__file__), "train", "--data", data_dir,
                "--out", a.out, "--steps", str(steps), "--total-steps", str(grand_total),
-               "--batch-size", str(a.batch_size), "--device", a.device,
+               "--batch-size", str(a.batch_size), "--accum", str(a.accum), "--device", a.device,
                "--num-workers", str(a.num_workers), "--seed", str(seed),
                "--eval-every", "1000", "--ckpt-every", "2000"]
         if os.path.exists(ckpt):
@@ -499,9 +669,16 @@ def main():
     g.add_argument("--seed", type=int, default=1234)
     g.add_argument("--progress", type=float, default=0.0, help="curriculum progress in [0,1]")
     g.add_argument("--workers", type=int, default=1)
+    g.add_argument("--strata", default="",
+                   help="density mix: five comma-separated shares of tiles expected to show 0 / "
+                        "1-10 / 11-50 / 51-100 / >100 visible cells (gen_dataset._world_for_stratum); "
+                        "empty = the plain prior")
     g.add_argument("--with-artifacts", action="store_true", help="artifacts in EVERY sample")
     g.add_argument("--p-artifacts", dest="p_artifacts", type=float, default=0.0,
                    help="probability that a sample carries artifacts (per sample)")
+    g.add_argument("--field", type=int, default=160,
+                   help="rendered field edge in px (config.set_field): 160 = the training tile, "
+                        "512 = a 166 um region; the strata stay per 160 px of field")
     g.set_defaults(func=cmd_gen)
 
     t = sub.add_parser("train", help="train ModelV3 (synmodel)")
@@ -509,6 +686,9 @@ def main():
     t.add_argument("--out", required=True)
     t.add_argument("--steps", type=int, default=20000)
     t.add_argument("--batch-size", type=int, default=4)
+    t.add_argument("--accum", type=int, default=1,
+                   help="micro-batches accumulated per optimiser step (regions: --batch-size 1 "
+                        "--accum 2 is a batch of two 512 px regions)")
     t.add_argument("--lr", type=float, default=3e-4)
     t.add_argument("--wd", type=float, default=0.05)
     t.add_argument("--warmup", type=int, default=2000)
@@ -533,6 +713,18 @@ def main():
                         "at its end state (for adding a head to a finished run)")
     t.add_argument("--n-queries", dest="n_queries", type=int, default=0,
                    help="cell queries of the instance head; 0 = no instance head (flows only)")
+    t.add_argument("--augment", action="store_true",
+                   help="random flip + quarter turn per training sample (needs --val-data, so the "
+                        "held-out set stays un-augmented)")
+    t.add_argument("--chan-drop", dest="chan_drop", type=float, default=0.0,
+                   help="probability a training sample is shown with a random sub-panel "
+                        "(targets_v3.drop_channels; needs --val-data)")
+    t.add_argument("--real-eval", dest="real_eval", default="",
+                   help="dir of cached real tiles (real_eval.py build): score them after the final "
+                        "eval and log real/... metrics. Display only -- never part of a score")
+    t.add_argument("--use-ref", dest="use_ref", action="store_true",
+                   help="flag the nuclear counterstain to the model (ModelV3.use_ref); warm-starts "
+                        "from a checkpoint without it with identical outputs")
     t.add_argument("--no-flow", dest="no_flow", action="store_true",
                    help="query-only segmentation: no flow / nuc_flow loss or eval; the marker head's "
                         "membrane cue comes from the query masks (needs --n-queries)")
@@ -542,6 +734,19 @@ def main():
                    help="JSON dict upweighting hard families, e.g. '{\"mu\":2,\"geom\":1.5}'")
     t.set_defaults(func=cmd_train)
 
+    v = sub.add_parser("evalsyn", help="score a checkpoint on a synthetic bundle dir (pooled metrics)")
+    v.add_argument("--ckpt", required=True)
+    v.add_argument("--data", required=True)
+    v.add_argument("--n", type=int, default=0, help="first n bundles only (0 = all)")
+    v.add_argument("--batch-size", dest="batch_size", type=int, default=4)
+    v.add_argument("--num-workers", dest="num_workers", type=int, default=4)
+    v.add_argument("--device", default="cuda")
+    v.add_argument("--exist-thr", dest="exist_thr", type=float, default=0.5)
+    v.add_argument("--no-filter", dest="no_filter", action="store_true",
+                   help="the old, unfiltered query decode (no min area / overlap rule)")
+    v.add_argument("--json", default=None)
+    v.set_defaults(func=cmd_evalsyn)
+
     r = sub.add_parser("rounds", help="round-based curriculum training orchestrator (plan Phase 6)")
     r.add_argument("--out", required=True, help="run dir (model + logs persist here across rounds)")
     r.add_argument("--data-root", dest="data_root", required=True, help="where per-round data goes")
@@ -550,6 +755,8 @@ def main():
     r.add_argument("--steps-per-round", dest="spr_steps", type=int, default=6000)
     r.add_argument("--final-steps", dest="final_steps", type=int, default=6000)
     r.add_argument("--batch-size", dest="batch_size", type=int, default=4)
+    r.add_argument("--accum", type=int, default=1,
+                   help="forwarded to every train call: micro-batches per optimiser step")
     r.add_argument("--gen-workers", dest="gen_workers", type=int, default=14)
     r.add_argument("--num-workers", dest="num_workers", type=int, default=4)
     r.add_argument("--device", default="cuda")
@@ -575,8 +782,23 @@ def main():
                    help="open-ended: train on this many most recent rounds' data at once")
     r.add_argument("--p-artifacts", dest="p_artifacts", type=float, default=0.3,
                    help="probability a generated sample carries artifacts")
+    r.add_argument("--field", type=int, default=160,
+                   help="forwarded to every gen call: rendered field edge in px (512 = region run)")
     r.add_argument("--n-queries", dest="n_queries", type=int, default=0,
                    help="cell queries of the instance head, forwarded to every train call (0 = none)")
+    r.add_argument("--augment", action="store_true",
+                   help="forwarded to every train call: random flip + quarter turn per sample")
+    r.add_argument("--chan-drop", dest="chan_drop", type=float, default=0.0,
+                   help="forwarded to every train call: sub-panel augmentation probability")
+    r.add_argument("--real-eval", dest="real_eval", default="",
+                   help="forwarded to every train call: cached real tiles, logged as real/... "
+                        "next to the synthetic score (display only)")
+    r.add_argument("--strata-adapt", dest="strata_adapt", type=float, default=-1.0,
+                   help="open-ended: >= 0 generates each round with a density mix that is this "
+                        "share error-driven (strata_from_metrics) and the rest STRATA_BASE; "
+                        "0 = the fixed base mix; < 0 (default) = the plain prior")
+    r.add_argument("--use-ref", dest="use_ref", action="store_true",
+                   help="forwarded to every train call: flag the nuclear counterstain to the model")
     r.add_argument("--no-flow", dest="no_flow", action="store_true",
                    help="forwarded to every train call: query-only segmentation, flow heads untrained")
     r.add_argument("--hard-focus", dest="hard_focus", type=float, default=1.0,

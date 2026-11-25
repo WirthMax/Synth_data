@@ -78,13 +78,18 @@ def build_frame_labels(cell2d, nuc_labels3d, field, types, info, type_names, opt
 
     rows, visible_of, typeidx_of = [], {}, {}
     visible_count = {}
+    min_frac = float(cfg.VIS.get("min_frac", 0.0))
     for n in ids:
         m = inst == n
         area = int(m.sum())
-        vis = area >= min_area_px
         tname = types.get(n)
         tidx = type_index.get(tname, 0)
         g = geoms.get(n)
+        # a sliver of a big cell is not a visible cell: see config.VIS["min_frac"]
+        r_short = (float(g.RADIUS.v) * float(g.ELONG.v) ** (-1.0 / 3.0) if g is not None
+                   and float(g.ELONG.v) >= 1.0 else
+                   float(g.RADIUS.v) * float(g.ELONG.v) ** (2.0 / 3.0) if g is not None else 0.0)
+        vis = area >= max(min_area_px, min_frac * np.pi * r_short ** 2)
         # context from the cell's own centre voxel in the structure-label volume
         ctx = 0
         if labels3d is not None and n in centres_vox:

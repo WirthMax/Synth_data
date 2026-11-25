@@ -123,12 +123,22 @@ _ELONG_OVERRIDE = None
 # config.WIDE_PRIOR["CELL_RADIUS"]. Set and cleared by build_flexible_world.
 _RADIUS_CENTRE = None
 
+# geometry scalars that are SCALES: sampled, mutated and normalised in log. ELONG joined RADIUS on
+# 2026-11-16, when it became the true aspect ratio and its prior log-uniform -- normalised linearly
+# over [0.5, 10], three quarters of all types would sit in the bottom third of the target range.
+_GEOM_LOG = ("RADIUS", "ELONG")
+
+
+def _logu(rng, lo, hi):
+    """Log-uniform draw: equal odds per octave, the prior for anything that is a scale."""
+    return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+
 
 def _geometry_bounds():
-    """Sampling bounds for the five geometry scalars. RADIUS is log-uniform over its full voxel
-    range; ELONG is cfg.WIDE_PRIOR["ELONG"] = [0.6, 12] (was [1, 7], "confirmed with the user"; then
-    widened on the user's request so cardiomyocyte-long cells, ~10 at this FOV, and mildly oblate
-    ones are inside the prior); the rest keep their class bounds."""
+    """Sampling AND normalisation bounds of the five geometry scalars. RADIUS keeps its class
+    bounds (voxels); ELONG is cfg.WIDE_PRIOR["ELONG"] = [0.5, 10], the true long:short ratio (it
+    was [0.6, 12] of the old elong^1.5 stretch, i.e. needles up to 41:1); the rest keep their class
+    bounds."""
     g = CellGeometry()
     lo = {k: _bounds(g, k)[0] for k in GEOM_KEYS}
     hi = {k: _bounds(g, k)[1] for k in GEOM_KEYS}
@@ -136,21 +146,63 @@ def _geometry_bounds():
     return lo, hi
 
 
-def _sample_geometry(rng):
-    """One type's geometry drawn from the prior. RADIUS is log-uniform (a radius is a scale, so
-    equal odds per decade, not per voxel); the others are uniform over their bounds."""
+def _geom_u(k, v, lo, hi):
+    """One geometry scalar -> [0, 1] over its bounds, in log for the scale-like ones."""
+    if k in _GEOM_LOG:
+        return (np.log(np.maximum(v, 1e-12)) - np.log(lo)) / (np.log(hi) - np.log(lo) + 1e-12)
+    return (v - lo) / (hi - lo + 1e-12)
+
+
+def _geom_from_u(k, u, lo, hi):
+    if k in _GEOM_LOG:
+        return np.exp(np.log(lo) + u * (np.log(hi) - np.log(lo)))
+    return lo + u * (hi - lo)
+
+
+def geometry_from_u(u):
+    """Normalised geometry [..., 5] -> physical values, the inverse of `_geometry_u`: RADIUS in
+    voxels, ELONG as the true long:short ratio. The one place a prediction is denormalised."""
+    lo, hi = _geometry_bounds()
+    u = np.asarray(u, np.float64)
+    return np.stack([_geom_from_u(k, u[..., i], lo[k], hi[k]) for i, k in enumerate(GEOM_KEYS)], -1)
+
+
+def _sample_geometry(rng, free_radius=False):
+    """One type's geometry drawn from the prior.
+
+    run12 prior: RADIUS log-uniform, the other four uniform over their bounds.
+    Wide prior (a tile scale is set): RADIUS around the tile scale -- or, for a root flagged
+    `free_radius`, anywhere in the prior with probability p_free_radius, which is what puts a
+    small interstitial type beside a giant one; ELONG a mixture (5% oblate, p_round near-round,
+    the rest log-uniform up to the bound); and the NUCLEUS sized in microns, NUC_FRAC following
+    from it, so a big cell has a small nucleus fraction and a small cell is nearly all nucleus."""
     lo, hi = _geometry_bounds()
     g = {}
     if _RADIUS_CENTRE is None:
         g["RADIUS"] = float(np.exp(rng.uniform(np.log(lo["RADIUS"]), np.log(hi["RADIUS"]))))
+        for k in ("ELONG", "ROUGH", "BETA", "NUC_FRAC"):
+            g[k] = float(rng.uniform(lo[k], hi[k]))
+        return g
+    wp = cfg.WIDE_PRIOR
+    if free_radius and rng.random() < wp["p_free_radius"]:
+        g["RADIUS"] = _logu(rng, *wp["CELL_RADIUS"])
     else:
-        # wide prior: around the tile's size scale, so the spacing (drawn from the same scale) can
-        # actually hold the cells -- a big cell between close seeds is squeezed to the seed spacing
-        g["RADIUS"] = float(np.clip(_RADIUS_CENTRE * np.exp(cfg.WIDE_PRIOR["TYPE_RADIUS_SD"]
+        # around the tile's size scale, so the spacing (drawn from the same scale) can actually
+        # hold the cells -- a big cell between close seeds is squeezed to the seed spacing
+        g["RADIUS"] = float(np.clip(_RADIUS_CENTRE * np.exp(wp["TYPE_RADIUS_SD"]
                                                             * rng.standard_normal()),
-                                    lo["RADIUS"], hi["RADIUS"]))
-    for k in ("ELONG", "ROUGH", "BETA", "NUC_FRAC"):
-        g[k] = float(rng.uniform(lo[k], hi[k]))
+                                    wp["CELL_RADIUS"][0], hi["RADIUS"]))
+    u = rng.random()
+    if u < 0.05:
+        g["ELONG"] = float(rng.uniform(lo["ELONG"], wp["ROUND_ELONG"][0]))
+    elif u < 0.05 + wp["p_round"]:
+        g["ELONG"] = float(rng.uniform(*wp["ROUND_ELONG"]))
+    else:
+        g["ELONG"] = _logu(rng, wp["ROUND_ELONG"][1], hi["ELONG"])
+    g["ROUGH"] = float(rng.uniform(lo["ROUGH"], hi["ROUGH"]))
+    g["BETA"] = float(rng.uniform(lo["BETA"], hi["BETA"]))
+    r_nuc = _logu(rng, *wp["NUC_RADIUS_UM"]) / cfg.UM_PER_VOX
+    g["NUC_FRAC"] = float(np.clip(r_nuc / g["RADIUS"], lo["NUC_FRAC"] + 0.02, hi["NUC_FRAC"] - 0.02))
     return g
 
 
@@ -165,17 +217,16 @@ def _sigmoid(x):
 
 def _mutate_geometry(rng, g):
     """A child's geometry: the parent's, nudged. log RADIUS gets its own Gaussian; the other four
-    are perturbed in logit space (so a scalar near a bound moves less and never leaves it) and
-    clamped back to their bounds."""
+    are perturbed in logit space of their normalised value (so a scalar near a bound moves less and
+    never leaves it) and clamped back to their bounds."""
     lo, hi = _geometry_bounds()
     out = dict(g)
     out["RADIUS"] = float(np.clip(g["RADIUS"] * np.exp(RADIUS_LOG_SD * rng.standard_normal()),
                                   lo["RADIUS"], hi["RADIUS"]))
     for k in ("ELONG", "ROUGH", "BETA", "NUC_FRAC"):
-        span = hi[k] - lo[k]
-        u = (g[k] - lo[k]) / (span + 1e-12)
+        u = float(np.clip(_geom_u(k, g[k], lo[k], hi[k]), 0.0, 1.0))
         u = _sigmoid(_logit(u) + GEOM_LOGIT_SD * rng.standard_normal())
-        out[k] = float(lo[k] + u * span)
+        out[k] = float(_geom_from_u(k, u, lo[k], hi[k]))
     return out
 
 
@@ -252,6 +303,8 @@ def sample_typeset(rng, M, *, k_true_range=(1, 30), max_depth=4, min_level_diff=
 
     k_true = int(rng.integers(k_true_range[0], k_true_range[1] + 1))
     n_roots = int(rng.integers(1, min(5, k_true) + 1))
+    # p_pos may be one number (every marker alike, the run12 prior) or one per marker
+    p_pos = np.broadcast_to(np.asarray(p_pos, float), (M,))
 
     positive = np.zeros((0, M), bool)
     level = np.zeros((0, M), float)
@@ -278,14 +331,14 @@ def sample_typeset(rng, M, *, k_true_range=(1, 30), max_depth=4, min_level_diff=
         return all(are_distinct(i, j, pos, lvl, geo, min_level_diff) for i in range(j))
 
     # roots
-    for _ in range(n_roots):
+    for i_root in range(n_roots):
         for _try in range(max_retries):
             pos_row = rng.random(M) < p_pos
             pos_row[counterstain] = True
             pos_row[bg] = False                              # background-only markers: never expressed
             lvl_row = np.full(M, np.nan)
             lvl_row[pos_row] = [draw_level() for _ in range(int(pos_row.sum()))]
-            geom = _sample_geometry(rng)
+            geom = _sample_geometry(rng, free_radius=i_root > 0)
             if distinct_from_all(pos_row, lvl_row, geom):
                 add(pos_row, lvl_row, geom, -1, 1)
                 break
@@ -332,7 +385,7 @@ def sample_typeset(rng, M, *, k_true_range=(1, 30), max_depth=4, min_level_diff=
 
 
 def sample_panel(rng, *, m_range=(8, 40), dyes, n_noise_kinds, noise_comps=(1, 4),
-                 p_background=0.0):
+                 p_background=0.0, wide=None):
     """Draw a panel of M markers (plan 3.1).
 
     M ~ U{m_range}. Channel 0 is the nuclear counterstain -- always present, nuclear, the
@@ -345,6 +398,12 @@ def sample_panel(rng, *, m_range=(8, 40), dyes, n_noise_kinds, noise_comps=(1, 4
     autofluorescence + noise (+ aggregates when artifacts are on). Real panels are full of these
     (non-binding antibodies, failed stains); the model must learn to ignore them rather than read
     cells from them.
+
+    `wide` (cfg.WIDE_PRIOR, or None for the run12 prior) adds: `ecm[m]`, an EXTRACELLULAR marker --
+    collagen, a basement membrane, the capillary bed between muscle cells -- which no cell type
+    expresses and which lights the matrix instead (flagged background too, for exactly that
+    reason); and `p_pos[m]`, the odds that a root type is positive for marker m, so a panel holds
+    ubiquitous markers next to rare ones instead of every marker at 0.25.
     """
     M = int(rng.integers(m_range[0], m_range[1] + 1))
     mu = [DAPI_MU]                                          # the counterstain
@@ -359,8 +418,25 @@ def sample_panel(rng, *, m_range=(8, 40), dyes, n_noise_kinds, noise_comps=(1, 4
         background.append(bool(rng.random() < p_background))
 
     order = rng.permutation(M)
-    return dict(M=M, mu=mu, dye=dye, noise=noise, order=order, counterstain=0,
-                background=np.array(background, bool))
+    out = dict(M=M, mu=mu, dye=dye, noise=noise, order=order, counterstain=0,
+               background=np.array(background, bool), ecm=np.zeros(M, bool),
+               p_pos=np.full(M, 0.25))
+    if wide is None:
+        return out
+    # wide prior, drawn after everything above so the run12 stream is untouched: WHERE the markers
+    # sit (a per-tile nuclear share instead of 42% of every panel), which are extracellular, and
+    # how many types each is positive in
+    q_nuc = float(rng.uniform(*wide["p_nuclear"]))
+    q_ecm = float(rng.uniform(*wide["p_ecm"]))
+    split = -0.1                                            # tau just inside the envelope
+    for m in range(1, M):
+        out["mu"][m] = (float(rng.uniform(MU_LO, split)) if rng.random() < q_nuc
+                        else float(rng.uniform(split, MU_HI)))
+        out["ecm"][m] = bool(rng.random() < q_ecm)
+        out["p_pos"][m] = (float(rng.uniform(*wide["UBIQ_POS"])) if rng.random() < wide["p_ubiquitous"]
+                           else float(rng.uniform(*wide["P_POS"])))
+    out["background"] = out["background"] | out["ecm"]      # no cell type expresses a matrix marker
+    return out
 
 
 def sample_compositions(rng, kinds, K, *, p_allow_bg=0.8, p_allow_struct=0.4):
@@ -421,7 +497,7 @@ def _marker_name(m, dapi_name):
     return dapi_name if m == 0 else f"M{m:02d}"
 
 
-def build_marker(rng, *, name, dye, mu, noise_kind_idx):
+def build_marker(rng, *, name, dye, mu, noise_kind_idx, band_jitter=None):
     """One antibody channel. Its texture components are drawn from the existing noise priors (they
     are theta), but its tau localisation is set by the continuous `mu` (plus width/sharp tied to it
     via `band_from_mu`) on every component, so the marker shows the same way in every type that
@@ -431,6 +507,12 @@ def build_marker(rng, *, name, dye, mu, noise_kind_idx):
     """
     comps = [NOISE_KINDS[k]() for k in noise_kind_idx]
     mu_v, width_v, sharp_v = band_from_mu(mu)
+    if band_jitter is not None:
+        # one draw per MARKER (every component shares the band): a membrane stain can be a hairline
+        # or a fat cortical shell, a nuclear one flat-topped or centre-weighted. Not predicted --
+        # mu stays the one localisation target.
+        width_v = width_v * float(np.exp(band_jitter[0] * rng.standard_normal()))
+        sharp_v = sharp_v * float(np.exp(band_jitter[1] * rng.standard_normal()))
     for c in comps:
         c.mu = narrow(c.mu, c.mu.lo, c.mu.hi, mu_v)
         c.width = narrow(c.width, c.width.lo, c.width.hi, width_v)
@@ -440,14 +522,19 @@ def build_marker(rng, *, name, dye, mu, noise_kind_idx):
     return m
 
 
-def _flexible_architecture(rng, *, max_structures=3):
+def _flexible_architecture(rng, *, max_structures=3, wide=False):
     """A small tissue architecture for flexible mode: 0..max_structures bundles/vessels of random
     kind. ZERO is now reachable -- a structure-free, cell-only (or, with COVER=0, empty) tile, which
     build_architecture handles by uniform thinning with no director. Profiles are left empty --
     compositions (per kind) replace the per-instance log-weights, so no structure needs a Profile any
     more. FRAC/WALL_IN are narrowed and CONTACT pinned exactly as the fixed-mode builder does, for the
     same feasibility reasons (a lumen must not outgrow the tissue budget; the compliance solve must
-    not engage)."""
+    not engage).
+
+    `wide`: each structure's share, size, aspect and DIRECTION are drawn too. They used to sit at
+    the class defaults -- every structure 10% of the tissue, one size, running along +x -- so the
+    ARCH.* targets were constants and the model had never seen a diagonal bundle. The direction is
+    part of theta, and `targets_v3.augment_bundle` turns it with the image."""
     n = int(rng.integers(0, max_structures + 1))
     structures, kinds = [], []
     if n > 0:
@@ -456,9 +543,25 @@ def _flexible_architecture(rng, *, max_structures=3):
             kind = "vessel" if rng.random() < 0.5 else "ordered"
             cls = Vasculature if kind == "vessel" else Ordered
             st = cls(name=f"s{i}", Profile={})
-            st.FRAC = narrow(st.FRAC, st.FRAC.lo, frac_hi * (0.5 if kind == "vessel" else 1.0))
+            hi = frac_hi * (0.5 if kind == "vessel" else 1.0)
+            st.FRAC = narrow(st.FRAC, st.FRAC.lo, hi,
+                             float(rng.uniform(min(0.04, hi), hi)) if wide else None)
             if kind == "vessel":
                 st.WALL_IN = narrow(st.WALL_IN, st.WALL_IN.lo, min(st.WALL_IN.hi, 0.5))
+            if wide:
+                # the upper size grows with the field edge: on a 160 px tile (52 um) a bundle stops
+                # at 40 um, on a 512 px region (166 um) at 128 um -- bundles and vessels at the scale
+                # real tissue has them, which a 52 um frame could not hold. Capped by the class
+                # bounds (vessel radius 35 um, bundle 600 um), so the theta normalisation is the
+                # same; at the 160 px field the draw is the old one.
+                grow = float(cfg.TISSUE_VOL[1]) / cfg.FIELD_REF
+                lo_um, hi_um = (3.0, 20.0) if kind == "vessel" else (5.0, 40.0)
+                hi_um = min(hi_um * max(grow, 1.0), st.SIZE_UM.hi)
+                st.SIZE_UM = narrow(st.SIZE_UM, st.SIZE_UM.lo, st.SIZE_UM.hi, _logu(rng, lo_um, hi_um))
+                st.ASPECT = narrow(st.ASPECT, st.ASPECT.lo, st.ASPECT.hi,
+                                   float(rng.uniform(1.0, 5.0)))
+                st.DIR_DEG = narrow(st.DIR_DEG, st.DIR_DEG.lo, st.DIR_DEG.hi,
+                                    float(rng.uniform(-90.0, 90.0)))
             structures.append(st)
             kinds.append(kind)
     arch = TissueArchitecture(Structures=structures)
@@ -467,41 +570,183 @@ def _flexible_architecture(rng, *, max_structures=3):
 
 
 def _expected_visible_cells(tg):
-    """Rough estimate of how many cells a tile of this density will actually SHOW. Used only to cap
-    the requested type count so a sparse tile does not ask for more distinct types than it can
-    realise (each present type needs several visible cells). Anchored at the historical prior
-    (MIN_DIST=11, COVER=0.75 -> ~40 visible cells) and scaled inverse-square in spacing and linearly
-    in coverage. Deliberately approximate -- it bounds a count, it is not a target."""
+    """Rough estimate of how many cell profiles a tile of this density SHOWS. A section of
+    thickness t through tissue packed in 3D at hard-core spacing d cuts every cell whose body
+    reaches it: seed density x frame area x (t + the cells' own height). At Matern saturation the
+    seed density is ~0.9 / (4/3 pi d^3) and a packed cell is ~1.3 d tall, so
+
+        N ~ COVER x 0.9 x A x (t + 1.3 d) / (4.19 d^3)      (A = 160^2 px, t = 12 vox = 4 um)
+
+    -- 26 at d = 20 vox, ~180 at the 9 vox floor. That raw count is then bent by a power law fitted
+    to 340 non-empty wide-prior renders (2026-11-16): realised visible cells = 2.4 x raw^0.82
+    (log-correlation 0.96; sparse tiles show about twice the raw count because elongated and grown
+    cells reach the section from further away, dense ones slightly fewer because slivers are not
+    counted as visible). Used to cap the requested type count (a present type needs several
+    visible cells) and as the density stratum the rounds orchestrator steers (`density_stratum`).
+    Deliberately approximate: it bounds a count, it is not a target."""
     md = max(float(tg.MIN_DIST.v), 1e-3)
-    return 40.0 * (float(tg.COVER.v) / 0.75) * (11.0 / md) ** 2
+    area = float(cfg.TISSUE_VOL[1] * cfg.TISSUE_VOL[2])
+    t = float(cfg.OPTICS["section_um"]) / cfg.UM_PER_VOX
+    raw = float(tg.COVER.v) * 0.9 * area * (t + 1.3 * md) / (4.19 * md ** 3)
+    return _VISIBLE_CAL[0] * raw ** _VISIBLE_CAL[1]
 
 
-def _dapi_brightness(bright, b_min, b_max):
-    """Counterstain brightness: the theta level (drawn on the antibody range [b_min, b_max]) mapped
-    log-affinely onto cfg.DAPI_BRIGHT. Same ordering across types, but nuclei span ~0.1-60k ADU
-    instead of saturating the frame -- see config.DAPI_BRIGHT."""
+# (a, b) of realised = a x raw^b, see _expected_visible_cells
+_VISIBLE_CAL = (2.4, 0.82)
+# visible-cell strata, the same edges as train_v3.DENSITY_BINS: empty, 1-10, 11-50, 51-100, > 100
+DENSITY_EDGES = (0.5, 10.5, 50.5, 100.5)
+
+
+def density_stratum(world):
+    """Which density bin a drawn world is EXPECTED to land in (0 = empty .. 4 = > 100 cells),
+    decided from theta alone, before anything is rendered -- so a generator can be asked for a
+    given mix of densities by redrawing worlds, at no rendering cost."""
+    if world["META"].get("empty"):
+        return 0
+    # per 160 px of FIELD: on a larger region the bins keep their meaning -- cells per 52 um x 52 um,
+    # the window the instance head and its per-window metrics work in (train_v3.DENSITY_BINS)
+    n = _expected_visible_cells(world["TG"]) * cfg.FIELD_REF ** 2 / float(
+        cfg.TISSUE_VOL[1] * cfg.TISSUE_VOL[2])
+    return 1 + int(np.searchsorted(DENSITY_EDGES[1:], n))
+
+
+def _dapi_brightness(bright, b_min, b_max, centre=None):
+    """Counterstain brightness from the theta level (drawn on the antibody range [b_min, b_max]).
+    With a tile `centre` (wide prior) the level's position u in that range places the type within
+    cfg.DAPI_TYPE_DECADES around the centre: same ordering across types, but the nuclei of one tile
+    stay within about a decade of each other, as real ones do. Without one (centre None) u is
+    mapped log-affinely onto the whole of cfg.DAPI_BRIGHT, the older rule."""
     lo, hi = cfg.DAPI_BRIGHT
-    u = (np.log(max(bright, 1e-12)) - np.log(b_min)) / (np.log(b_max) - np.log(b_min) + 1e-12)
-    return float(lo * (hi / lo) ** float(np.clip(u, 0.0, 1.0)))
+    u = float(np.clip((np.log(max(bright, 1e-12)) - np.log(b_min))
+                      / (np.log(b_max) - np.log(b_min) + 1e-12), 0.0, 1.0))
+    if centre is None:
+        return float(lo * (hi / lo) ** u)
+    return float(np.clip(centre * 10.0 ** ((u - 0.5) * cfg.DAPI_TYPE_DECADES), lo, hi))
+
+
+def _widen_component(rng, c, i=0):
+    """One texture component drawn over its class bounds: every scalar in texture_keys it carries
+    (uniform; they were never sampled, so all markers of one noise kind had ONE look), its strength
+    `s` floored so a texture never vanishes outright, and `w` for the extra components (the first
+    one's w stays pinned, PIN_DEGENERATE)."""
+    wp = cfg.WIDE_PRIOR
+    for key in wp["texture_keys"]:
+        p = getattr(c, key, None)
+        if isinstance(p, P):
+            # a LENGTH (grain, period, fibre length, in um) is a scale: log-uniform, equal odds per
+            # octave. Drawn uniformly over e.g. 0.1-3 um half of all textures were coarser than
+            # 1.5 um and the optics left a smooth blur, where real stains are crisp at 1-2 px.
+            v = (_logu(rng, p.lo, p.hi) if key in wp["texture_log_keys"] and p.lo > 0
+                 else float(rng.uniform(p.lo, p.hi)))
+            setattr(c, key, narrow(p, p.lo, p.hi, v))
+    c.s = narrow(c.s, c.s.lo, c.s.hi, float(rng.uniform(max(wp["texture_s"][0], c.s.lo),
+                                                         min(wp["texture_s"][1], c.s.hi))))
+    if i > 0:
+        c.w = narrow(c.w, c.w.lo, c.w.hi, float(rng.uniform(*wp["texture_w"])))
 
 
 def _widen_textures(rng, panel):
-    """Wide prior: every antibody component's texture scalars uniform over their class bounds (they
-    used to stay at the class defaults, so all markers of one noise kind had ONE look and the
-    per-marker noise head had almost nothing to regress). w of the extra components varies too; the
-    first component's w stays pinned (PIN_DEGENERATE)."""
+    """Wide prior, per marker: sampled textures, cell-to-cell spread and (for a quarter of the
+    antibody markers) polarity. The counterstain gets its own treatment -- its band and texture
+    were fixed, one soft-edged nucleus for every tile (off/on contrast 0.22 against 0.03-0.35 on
+    real stains): here the band runs from a flat-topped, crisp-edged fill to a peripheral ring and
+    the chromatin from smooth to clumped, inside the bounds make_nuclear put on it, so whatever is
+    drawn stays inside the nucleus."""
     wp = cfg.WIDE_PRIOR
     for mk in panel.Markers.values():
-        if mk.fluorophore == cfg.DAPI_DYE:
-            continue
+        dapi = mk.fluorophore == cfg.DAPI_DYE
         for i, c in enumerate(mk.noise_components):
-            for key in wp["texture_keys"]:
-                p = getattr(c, key, None)
-                if isinstance(p, P):
-                    setattr(c, key, narrow(p, p.lo, p.hi, float(rng.uniform(p.lo, p.hi))))
-            c.s = narrow(c.s, c.s.lo, c.s.hi, float(rng.uniform(*wp["texture_s"])))
-            if i > 0:
-                c.w = narrow(c.w, c.w.lo, c.w.hi, float(rng.uniform(*wp["texture_w"])))
+            _widen_component(rng, c, i)
+        if dapi:
+            mu_v = float(rng.uniform(-0.75, -0.20))
+            width_v = float(rng.uniform(0.35, 0.85))
+            sharp_v = float(rng.uniform(2.5, 10.0))
+            for c in mk.noise_components:
+                c.mu = narrow(c.mu, c.mu.lo, c.mu.hi, mu_v)
+                c.width = narrow(c.width, c.width.lo, c.width.hi, width_v)
+                c.sharp = narrow(c.sharp, c.sharp.lo, c.sharp.hi, sharp_v)
+            cv = float(rng.uniform(*wp["DAPI_CELL_CV"]))
+        else:
+            cv = float(rng.uniform(*wp["CELL_CV"]))
+            if rng.random() < wp["p_polar"]:
+                mk.polarity = narrow(mk.polarity, mk.polarity.lo, mk.polarity.hi,
+                                     float(rng.uniform(*wp["POLARITY"])))
+                v = rng.standard_normal(3)
+                v = v / (np.linalg.norm(v) + 1e-12)
+                mk.pol_dir = tuple(narrow(pd, pd.lo, pd.hi, float(x))
+                                   for pd, x in zip(mk.pol_dir, v))
+        mk.cell_cv = narrow(mk.cell_cv, mk.cell_cv.lo, mk.cell_cv.hi, cv)
+
+
+def sample_background(rng, panel, panel_spec, names_canon, type_names, n_noise_kinds):
+    """The tile's SHARED signal: what every channel shows whether or not its antibody binds.
+
+    On a real staged slide about half the channels are the same picture at different brightness --
+    residual autofluorescence and nonspecific binding -- and that picture is the tissue's own fine
+    structure (fibrils, organelles, gaps), not a blurred outline of the cells. The old generator
+    used the cell occupancy times one smooth texture, so EVERY synthetic channel traced the cells
+    as blobs on black, and "a blob in most channels = a cell" was a perfect shortcut that real
+    tissue never honours. Here the shared signal has two parts:
+
+    - `markers`: 1-3 hidden patterns rendered PER CELL exactly like an antibody marker (their own
+      localisation band, broad; their own textures, oriented with the cell), at a level that
+      differs per TYPE (`type_level`, lognormal: some cell types are simply more autofluorescent)
+      and per cell (`cell_cv`). Channel m shows them mixed by `mix[m]` at its own
+      PanelMarker.tissue_bg level -- so unstained channels look alike but not identical.
+    - `matrix`: 1-3 extracellular textures filling the tissue the cells do NOT claim, optionally
+      with a pericellular band `peri` hugging every cell boundary (a basement membrane, the
+      capillary bed between muscle cells). Channel m shows them at `matrix_level[m]`: faint for an
+      ordinary channel (MATRIX_REL x its cell background), bright for an EXTRACELLULAR marker
+      (`panel_spec["ecm"]`), which no cell type expresses.
+
+    None of it is theta: nuisance the model has to see through. Keyed by marker NAME so the
+    channel permutation cannot misalign it."""
+    from parameter import ClusterNoise, FibreNoise, BlobNoise, NetworkNoise
+    wp = cfg.WIDE_PRIOR
+    M = panel_spec["M"]
+    n_bg = int(rng.integers(wp["n_bg"][0], wp["n_bg"][1] + 1))
+    markers, cell_cv = [], []
+    for j in range(n_bg):
+        k = int(rng.integers(1, 3))
+        mk = build_marker(rng, name=f"__bg{j}", dye=cfg.DYES[0], mu=float(rng.uniform(MU_LO, MU_HI)),
+                          noise_kind_idx=tuple(int(x) for x in rng.integers(0, n_noise_kinds, size=k)))
+        width_v, sharp_v = float(rng.uniform(0.6, 1.5)), float(rng.uniform(1.0, 4.0))
+        for i, c in enumerate(mk.noise_components):
+            _widen_component(rng, c, i)
+            # broad and soft: the shared signal fills the cell, it does not pick a compartment;
+            # and a mild relief, not the hot blobs a strong antibody texture makes -- a cluster
+            # gate at fill 0.02 is a few specks at 50x the mean, so the gate stays mostly open
+            c.width = narrow(c.width, c.width.lo, c.width.hi, width_v)
+            c.sharp = narrow(c.sharp, c.sharp.lo, c.sharp.hi, sharp_v)
+            c.s = narrow(c.s, c.s.lo, c.s.hi, float(rng.uniform(*wp["BG_TEXTURE_S"])))
+            if isinstance(getattr(c, "fill", None), P):
+                c.fill = narrow(c.fill, c.fill.lo, c.fill.hi, float(rng.uniform(0.3, c.fill.hi)))
+        markers.append(mk)
+        cell_cv.append(float(rng.uniform(*wp["BG_CELL_CV"])))
+    sd = float(wp["BG_TYPE_SD"])
+    type_level = {t: np.exp(sd * rng.standard_normal(n_bg) - 0.5 * sd * sd) for t in type_names}
+    mix = {nm: rng.dirichlet(np.full(n_bg, 0.7)) for nm in names_canon}
+
+    n_mat = int(rng.integers(wp["n_matrix"][0], wp["n_matrix"][1] + 1))
+    kinds = (ClusterNoise, FibreNoise, BlobNoise, NetworkNoise)
+    matrix = []
+    for j in range(n_mat):
+        comp = kinds[int(rng.integers(len(kinds)))]()
+        _widen_component(rng, comp, 0)
+        matrix.append(dict(comp=comp, azim=float(rng.uniform(0.0, 180.0)),
+                           peri=(float(rng.uniform(*wp["PERI"])) if rng.random() < wp["p_peri"] else 0.0),
+                           peri_um=_logu(rng, *wp["PERI_UM"])))
+    matrix_level = {}
+    for m, nm in enumerate(names_canon):
+        lv = np.zeros(n_mat)
+        if panel_spec["ecm"][m]:
+            lv[int(rng.integers(n_mat))] = _logu(rng, *wp["ECM_LEVEL"])
+        else:
+            lv = float(panel.Markers[nm].tissue_bg.v) * _logu(rng, *wp["MATRIX_REL"]) \
+                * rng.dirichlet(np.full(n_mat, 0.7))
+        matrix_level[nm] = lv
+    return dict(markers=markers, cell_cv=cell_cv, type_level=type_level, mix=mix,
+                matrix=matrix, matrix_level=matrix_level)
 
 
 def _widen_detector(rng, det):
@@ -566,9 +811,10 @@ def _build_flexible_world(rng, *, curriculum, dyes, n_noise_kinds, dapi_name, ma
         dens.update({k: wp[k] for k in ("MIN_DIST", "COVER", "GROW")})
     empty = bool(rng.random() < float(dens.get("p_empty", 0.0)))
     ms = 0 if empty else int(dens["max_structures"])
-    arch, kinds = _flexible_architecture(rng, max_structures=ms)
+    arch, kinds = _flexible_architecture(rng, max_structures=ms, wide=wide)
 
     tg = TissueGeometry()
+    confluent = False
     if empty:
         tg.COVER = _narrow(tg.COVER, tg.COVER.lo, tg.COVER.hi, 0.0)
         tg.MIN_DIST = _narrow(tg.MIN_DIST, tg.MIN_DIST.lo, tg.MIN_DIST.hi, dens["MIN_DIST"][1])
@@ -580,24 +826,32 @@ def _build_flexible_world(rng, *, curriculum, dyes, n_noise_kinds, dapi_name, ma
         if "vessel" in kinds:
             cov_hi = min(cov_hi, 0.8)
         if wide:
-            # same full span, mass moved toward tissue: spacing log-uniform (cell count ~ 1/MIN_DIST^2,
-            # so uniform spacing made half the tiles <= 7 cells against 50-90 on the real slide) and
-            # cover the max of two uniforms (density 2u -- dense frames twice as likely as sparse)
-            # spacing FOLLOWS the tile's cell size (config.WIDE_PRIOR["CELL_RADIUS"]): drawn on its
-            # own it squeezed every cell to ~3 um whatever its RADIUS
+            # one cell-size scale per tile, and spacing FOLLOWS it (drawn on its own the spacing
+            # squeezed every cell to ~3 um whatever its RADIUS). Whether the cells then fill the
+            # tissue is a REGIME, not an accident of two independent draws -- see
+            # config.WIDE_PRIOR["p_confluent"].
             global _RADIUS_CENTRE
-            r_lo, r_hi = wp["CELL_RADIUS"]
-            _RADIUS_CENTRE = float(np.exp(rng.uniform(np.log(r_lo), np.log(r_hi))))
-            s_lo, s_hi = wp["SPACING_RATIO"]
-            md = float(np.clip(_RADIUS_CENTRE * np.exp(rng.uniform(np.log(s_lo), np.log(s_hi))),
-                               tg.MIN_DIST.lo, tg.MIN_DIST.hi))
-            cov = float(max(rng.uniform(cov_lo, cov_hi), rng.uniform(cov_lo, cov_hi)))
+            _RADIUS_CENTRE = _logu(rng, *wp["CELL_RADIUS"])
+            confluent = bool(rng.random() < wp["p_confluent"])
+            if confluent:
+                ratio = _logu(rng, *wp["CONFLUENT_RATIO"])
+                grow = float(rng.uniform(min(wp["GROW_FILL"] * ratio, tg.GROW.hi), tg.GROW.hi))
+                cov = (cov_hi if rng.random() < wp["p_full_cover"]
+                       else float(max(rng.uniform(0.3, cov_hi), rng.uniform(0.3, cov_hi))))
+            else:
+                ratio = _logu(rng, *wp["SPACING_RATIO"])
+                grow = float(rng.uniform(*dens["GROW"]))
+                cov = float(max(rng.uniform(cov_lo, cov_hi), rng.uniform(cov_lo, cov_hi)))
+            md = float(np.clip(_RADIUS_CENTRE * ratio, max(wp["MIN_SPACING"], tg.MIN_DIST.lo),
+                               tg.MIN_DIST.hi))
         else:
             md = float(rng.uniform(*dens["MIN_DIST"]))
             cov = float(rng.uniform(cov_lo, cov_hi))
+            grow = float(rng.uniform(*dens["GROW"]))
+            confluent = False
         tg.MIN_DIST = _narrow(tg.MIN_DIST, tg.MIN_DIST.lo, tg.MIN_DIST.hi, md)
         tg.COVER = _narrow(tg.COVER, tg.COVER.lo, tg.COVER.hi, cov)
-        tg.GROW = _narrow(tg.GROW, tg.GROW.lo, tg.GROW.hi, float(rng.uniform(*dens["GROW"])))
+        tg.GROW = _narrow(tg.GROW, tg.GROW.lo, tg.GROW.hi, grow)
 
     # cap the requested number of distinct types to what this cellularity can realise: a type counts
     # as present only with >= VIS.min_visible_cells visible cells, so a sparse tile that asked for many
@@ -608,12 +862,12 @@ def _build_flexible_world(rng, *, curriculum, dyes, n_noise_kinds, dapi_name, ma
     k_range = (min(klo, k_cap), min(khi, k_cap))
 
     panel_spec = sample_panel(rng, m_range=cur["m_range"], dyes=dyes, n_noise_kinds=n_noise_kinds,
-                              p_background=cur["p_background"])
+                              p_background=cur["p_background"], wide=wp if wide else None)
     M = panel_spec["M"]
     bg = panel_spec["background"]
     ts = sample_typeset(rng, M, k_true_range=k_range, max_depth=cur["max_depth"],
                         min_level_diff=cur["min_level_diff"], counterstain=panel_spec["counterstain"],
-                        background=bg)
+                        background=bg, p_pos=panel_spec["p_pos"] if wide else 0.25)
     K = ts.K
     b_min, b_max = expression_range()
 
@@ -622,10 +876,14 @@ def _build_flexible_world(rng, *, curriculum, dyes, n_noise_kinds, dapi_name, ma
     for m in range(M):
         nm = _marker_name(m, dapi_name)
         if m == panel_spec["counterstain"]:
-            canon[nm] = dapi_marker(name=nm)                 # the counterstain, always nuclear
+            # the counterstain, always nuclear; under the wide prior its chromatin texture may be
+            # nearly smooth (strength down to 0.1), which the 0.6 floor ruled out
+            canon[nm] = dapi_marker(name=nm, strength=(0.1, 1.6)) if wide else dapi_marker(name=nm)
         else:
             mk = build_marker(rng, name=nm, dye=panel_spec["dye"][m], mu=panel_spec["mu"][m],
-                              noise_kind_idx=panel_spec["noise"][m])
+                              noise_kind_idx=panel_spec["noise"][m],
+                              band_jitter=((wp["BAND_WIDTH_SD"], wp["BAND_SHARP_SD"]) if wide
+                                           else None))
             if bg[m]:                                        # background-only -> antibody aggregates
                 mk.artifact_affinity = _narrow(mk.artifact_affinity, 1.0,
                                                mk.artifact_affinity.hi, mk.artifact_affinity.hi)
@@ -637,15 +895,34 @@ def _build_flexible_world(rng, *, curriculum, dyes, n_noise_kinds, dapi_name, ma
     # cell types: geometry from the TypeSet, expression as ABSOLUTE brightness (10^level) on the
     # positive markers. amp is pinned to 1, so render_marker's amp x level is exactly the brightness.
     types = {}
+    g0 = CellGeometry()
+    # the tile's counterstain brightness (one staining run, one exposure): types sit around it
+    d_lo, d_hi = _cfg.DAPI_BRIGHT
+    half = 10.0 ** (0.5 * _cfg.DAPI_TYPE_DECADES)
+    dapi_centre = _logu(rng, d_lo * half, d_hi / half) if wide else None
     for k in range(K):
-        geom = CellGeometry(**{key: float(ts.geometry[k, i]) for i, key in enumerate(GEOM_KEYS)})
+        gk = {key: float(ts.geometry[k, i]) for i, key in enumerate(GEOM_KEYS)}
+        if wide:
+            # shape NUISANCE per type, outside the five predicted scalars: the nucleus's own
+            # aspect / lobing / offset (it was one shape for every type: NUC_ROUGH at its maximum,
+            # NUC_ELONG 1.6) and how far the type follows the tissue grain (ALIGN was never
+            # sampled, so no cell ever did)
+            gk.update(
+                NUC_ELONG=(1.0 if rng.random() < wp["p_nuc_round"] else _logu(rng, *wp["NUC_ELONG"])),
+                NUC_ROUGH=float(rng.uniform(*wp["NUC_ROUGH"])),
+                NUC_BETA=float(rng.uniform(*wp["NUC_BETA"])),
+                NUC_CORR=float(rng.uniform(g0.NUC_CORR.lo, g0.NUC_CORR.hi)),
+                NUC_OFFSET=float(rng.uniform(g0.NUC_OFFSET.lo, g0.NUC_OFFSET.hi)),
+                RIM=float(rng.uniform(*wp["RIM"])),
+                ALIGN=(1.0 if rng.random() < wp["p_type_aligned"] else float(rng.uniform(0.0, 1.0))))
+        geom = CellGeometry(**gk)
         expr = {}
         for m in np.flatnonzero(ts.positive[k]):
             nm = names_canon[m]
             bright = float(10.0 ** ts.level[k, m])
             if wide and m == panel_spec["counterstain"]:
-                bright = _dapi_brightness(bright, b_min, b_max)
-            expr[nm] = P(0.0, b_max, 0.05, bright, f"expr {nm}",
+                bright = _dapi_brightness(bright, b_min, b_max, centre=dapi_centre)
+            expr[nm] = P(0.0, max(b_max, bright), 0.05, bright, f"expr {nm}",
                          comment="absolute brightness of this marker in this type (flexible mode); "
                                  "replaces the panel amp x level product.")
         types[_type_name(k)] = CellType(name=_type_name(k), Color="black",
@@ -659,12 +936,44 @@ def _build_flexible_world(rng, *, curriculum, dyes, n_noise_kinds, dapi_name, ma
     if wide:
         for m in range(M):
             mk = canon[names_canon[m]]
-            lo, hi = _cfg.TISSUE_BG["dapi" if m == panel_spec["counterstain"] else "marker"]
-            level = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            if m == panel_spec["counterstain"]:
+                # a fraction of the stain itself, so the nuclei are never simply buried: from a
+                # clean re-stain to the cycle-1 stain that is mostly blue autofluorescence
+                level = dapi_centre * _logu(rng, *_cfg.DAPI_CONTRAST)
+            else:
+                lo, hi = _cfg.TISSUE_BG["marker"]
+                level = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
             mk.tissue_bg = _narrow(mk.tissue_bg, mk.tissue_bg.lo, mk.tissue_bg.hi, level)
         _widen_textures(rng, panel)
         if detector is not None:
             detector = _widen_detector(rng, detector)
+        if not empty:
+            # the section is cut from bulk: seed the slab as deep as the biggest type can reach
+            reach = max(float(g.Geometry.RADIUS.v) * float(max(g.Geometry.ELONG.v, 1.0)) ** (2.0 / 3.0)
+                        for g in types.values())
+            block = float(_cfg.TISSUE_VOL[0] * _cfg.Z_RATIO)
+            slab = float(np.clip(block + 2.0 * wp["SLAB_REACH"] * reach, tg.SLAB.lo,
+                                 min(wp["SLAB_MAX"], tg.SLAB.hi)))
+            tg.SLAB = _narrow(tg.SLAB, tg.SLAB.lo, tg.SLAB.hi, slab)
+            couple = float(rng.uniform(*wp["SIZE_COUPLE"]))
+            # the smallest type's spacing is MIN_DIST x (R_min / R_mean)^couple: keep it above the
+            # spacing floor, or a small type between big ones packs past the query cap
+            lr = np.log([float(g.Geometry.RADIUS.v) for g in types.values()])
+            d_lr = float(lr.min() - lr.mean())
+            room = np.log(wp["MIN_SPACING"] / float(tg.MIN_DIST.v))
+            if d_lr < -1e-6 and room > d_lr * couple:
+                couple = float(np.clip(0.9 * room / d_lr, 0.0, couple))
+            tg.SIZE_COUPLE = _narrow(tg.SIZE_COUPLE, tg.SIZE_COUPLE.lo, tg.SIZE_COUPLE.hi, couple)
+            if rng.random() < wp["p_axis"]:
+                tg.AXIS_ALIGN = _narrow(tg.AXIS_ALIGN, tg.AXIS_ALIGN.lo, tg.AXIS_ALIGN.hi,
+                                        float(rng.uniform(*wp["AXIS_ALIGN"])))
+                tg.AXIS_AZIM_DEG = _narrow(tg.AXIS_AZIM_DEG, tg.AXIS_AZIM_DEG.lo,
+                                           tg.AXIS_AZIM_DEG.hi, float(rng.uniform(0.0, 180.0)))
+                # isotropic over the half-sphere: cos(polar) uniform, so in-plane grain (a
+                # lengthwise cut) is commoner than a grain running straight through the section
+                tg.AXIS_POLAR_DEG = _narrow(tg.AXIS_POLAR_DEG, tg.AXIS_POLAR_DEG.lo,
+                                            tg.AXIS_POLAR_DEG.hi,
+                                            float(np.rad2deg(np.arccos(rng.uniform(0.0, 1.0)))))
     elif detector is not None:
         # run12 rendered DAPI on the camera pedestal, before the staged offset correction existed
         import copy
@@ -673,6 +982,12 @@ def _build_flexible_world(rng, *, curriculum, dyes, n_noise_kinds, dapi_name, ma
                                            detector.DAPI_OFFSET_ADU.hi, float(detector.OFFSET_ADU.v))
     compositions = dict(contexts=contexts, pi=pi, allowed=allowed,
                         struct_to_ctx=struct_to_ctx, type_order=[_type_name(k) for k in range(K)])
+    background, optics = None, None
+    if wide:
+        background = sample_background(rng, panel, panel_spec, names_canon, list(types),
+                                       n_noise_kinds)
+        optics = dict(na=float(wp["NA"][int(rng.integers(len(wp["NA"])))]),
+                      focal_um=float(wp["FOCUS_UM"][int(rng.integers(len(wp["FOCUS_UM"])))]))
 
     world = {
         "PANEL": panel, "TYPES": types, "TG": tg, "DET": detector,
@@ -681,10 +996,14 @@ def _build_flexible_world(rng, *, curriculum, dyes, n_noise_kinds, dapi_name, ma
         # artifact parameters (fibres, aggregates, detachment, cycle shift): only read when the frame
         # is rendered with_artifacts, which the generator decides per sample
         "AR": Artifacts(),
+        # the shared background (sample_background) and the per-tile optics (NA, focus): both
+        # nuisance, both None under the run12 prior, where render_frame falls back to the old
+        # occupancy background and the default objective
+        "BG": background, "OPT": optics,
         "META": dict(K=K, M=M, counterstain=panel_spec["counterstain"],
                      channel_order=order, b_range=(b_min, b_max),
                      mu=list(panel_spec["mu"]),                 # canonical-order localisation targets
-                     empty=empty, n_struct=len(arch.Structures)),
+                     empty=empty, n_struct=len(arch.Structures), confluent=bool(confluent)),
     }
     return world
 
@@ -742,14 +1061,12 @@ def _scalar_block(root, prefix, pin=(), keep=None):
 
 
 def _geometry_u(geometry):
-    """Normalise the [K, 5] geometry block column-by-column, matching the sampling bounds (RADIUS
-    log, the rest linear; ELONG over [1, 7])."""
+    """Normalise the [K, 5] geometry block column-by-column over the sampling bounds: RADIUS and
+    ELONG in log (they are scales), the rest linear. `geometry_from_u` is the inverse."""
     lo, hi = _geometry_bounds()
     out = np.zeros_like(geometry, np.float64)
-    out[:, 0] = (np.log(geometry[:, 0]) - np.log(lo["RADIUS"])) / (
-        np.log(hi["RADIUS"]) - np.log(lo["RADIUS"]))
-    for i, k in enumerate(("ELONG", "ROUGH", "BETA", "NUC_FRAC"), start=1):
-        out[:, i] = (geometry[:, i] - lo[k]) / (hi[k] - lo[k] + 1e-12)
+    for i, k in enumerate(GEOM_KEYS):
+        out[:, i] = _geom_u(k, geometry[:, i], lo[k], hi[k])
     return _clamp_u(out)
 
 
@@ -800,7 +1117,22 @@ def theta_v3(world, cyc=None):
     if cyc is not None and "channel_offsets" in cyc:
         offsets = np.asarray(cyc["channel_offsets"], np.float32).reshape(M, 2)
 
+    # NUISANCE the model never predicts, stored only so a tile can be put in a stratum afterwards
+    # (which objective, in focus or not, confluent or loose, how deep the slab): the per-stratum
+    # error tables and the real-vs-synthetic coverage checks read these
+    opt = world.get("OPT") or {}
+    nuis = dict(na=float(opt.get("na", cfg.OPTICS["na"])), focal_um=float(opt.get("focal_um", 0.0)),
+                confluent=float(meta.get("confluent", False)), empty=float(meta.get("empty", False)),
+                slab=float(tgw.SLAB.v), size_couple=float(tgw.SIZE_COUPLE.v),
+                axis_align=float(tgw.AXIS_ALIGN.v), min_dist=float(tgw.MIN_DIST.v),
+                grow=float(tgw.GROW.v), cover=float(tgw.COVER.v),
+                n_struct=float(meta.get("n_struct", 0)),
+                expected_cells=float(_expected_visible_cells(tgw)),
+                stratum=float(density_stratum(world)))
+
     return {
+        "nuis_names": np.array(list(nuis)),
+        "nuis": np.array(list(nuis.values()), np.float64),
         "global_names": np.concatenate([dens_names, g_names, tg_names]),
         "global_u": np.concatenate([dens_u, g_u, tg_u]),
         "noise_names": n_names,

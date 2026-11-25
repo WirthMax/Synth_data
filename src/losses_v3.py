@@ -424,7 +424,11 @@ class InstanceWeights:
     nuc: float = 2.0
     type: float = 1.0
     context: float = 0.5
-    no_object: float = 0.1          # weight of the existence BCE on UNMATCHED queries (most of them)
+    # weight of the mean existence BCE over the UNMATCHED queries, next to the mean over the matched
+    # ones (weight 1). Until 2026-11-16 both sat in ONE weighted mean (unmatched at 0.1), so in a
+    # 180-cell tile the 140 unmatched queries carried 7% of the term and a duplicate cost almost
+    # nothing -- exactly the tiles the head over-segmented (cell F1 below 0.2 above 100 cells).
+    no_object: float = 0.5
 
 
 def _mask_cost(x, y):
@@ -457,6 +461,20 @@ def instance_losses_one(inst, b, gt, nuc, ignore, ttgt, slot_match, w: InstanceW
     if n == 0:
         return dict(exist=w.no_object * F.binary_cross_entropy_with_logits(ex, torch.zeros_like(ex)),
                     mask=z, nuc=z, type=z, context=z)
+    if n > Q:
+        # more visible cells than queries (the prior's spacing floor, WIDE_PRIOR["MIN_SPACING"],
+        # keeps this to a freak tile): the Q largest cells keep their labels and the rest become
+        # IGNORE, so nothing is charged for cells no query is left to take. Order is preserved, so
+        # the per-instance type / context rows are simply subset.
+        area = torch.bincount(gt.flatten(), minlength=n + 1)[1:]
+        sel = area.argsort(descending=True)[:Q].sort().values                # old label - 1, ascending
+        remap = torch.zeros(n + 1, dtype=gt.dtype, device=gt.device)
+        remap[sel + 1] = torch.arange(1, Q + 1, device=gt.device, dtype=gt.dtype)
+        new_gt = remap[gt]
+        ignore = ignore | ((gt > 0) & (new_gt == 0))
+        if "inst_j" in ttgt and ttgt["inst_j"].numel() == n:
+            ttgt = dict(ttgt, inst_j=ttgt["inst_j"][sel], inst_ctx=ttgt["inst_ctx"][sel])
+        gt, n = new_gt, Q
     lab = torch.arange(1, n + 1, device=gt.device)
     Mc = (gt[None] == lab[:, None, None]).float()                         # [n, H, W]
     Mn = Mc * nuc[None].float()
@@ -472,9 +490,13 @@ def instance_losses_one(inst, b, gt, nuc, ignore, ttgt, slot_match, w: InstanceW
 
     tgt_ex = torch.zeros_like(ex)
     tgt_ex[qi] = 1.0
-    wt = torch.full_like(ex, w.no_object)
-    wt[qi] = 1.0
-    exist = (F.binary_cross_entropy_with_logits(ex, tgt_ex, reduction="none") * wt).sum() / wt.sum()
+    hit = tgt_ex > 0.5
+    bce_ex = F.binary_cross_entropy_with_logits(ex, tgt_ex, reduction="none")
+    # matched and unmatched queries are averaged SEPARATELY, so the push-down on a spare query is
+    # the same whether the tile holds 5 cells or 180
+    exist = bce_ex[hit].mean()
+    if (~hit).any():
+        exist = exist + w.no_object * bce_ex[~hit].mean()
 
     valid = (~ignore).float()[None]
     xc, xn = inst["cell"][b][qi], inst["nuc"][b][qi]                       # [n, H, W]
@@ -501,19 +523,50 @@ def instance_losses_one(inst, b, gt, nuc, ignore, ttgt, slot_match, w: InstanceW
     return dict(exist=exist, mask=mask, nuc=nucl, type=typ, context=ctxl)
 
 
+def window_targets(gt, nuc, ignore, ttgt, y0, x0, win, min_area=15):
+    """The instance truth of one WINDOW of a sample: labels renumbered 1..n over the cells the
+    window shows, nucleus and ignore cut the same way, and the per-instance type / context rows
+    subset to match. A cell the window edge cuts down to a SLIVER (< min_area px inside, the
+    generator's own visibility floor cfg.VIS["min_area_px"]) gets no label and becomes ignore: no
+    query can be asked to find 5 px of a cell, nor be punished for finding them. A cell wholly
+    inside keeps its label whatever its size, so a window that is the whole tile changes nothing."""
+    g = gt[y0:y0 + win, x0:x0 + win]
+    n_all = int(gt.max())
+    area_w = torch.bincount(g.flatten(), minlength=n_all + 1)
+    area = torch.bincount(gt.flatten(), minlength=n_all + 1)
+    keep = (area_w > 0) & ((area_w >= min_area) | (area_w == area))
+    keep[0] = False
+    ids = torch.nonzero(keep)[:, 0]
+    remap = torch.zeros(n_all + 1, dtype=gt.dtype, device=gt.device)
+    remap[ids] = torch.arange(1, ids.numel() + 1, dtype=gt.dtype, device=gt.device)
+    g2 = remap[g]
+    ign = ignore[y0:y0 + win, x0:x0 + win] | ((g > 0) & (g2 == 0))
+    if "inst_j" in ttgt and ttgt["inst_j"].numel() == n_all:
+        ttgt = dict(ttgt, inst_j=ttgt["inst_j"][ids - 1], inst_ctx=ttgt["inst_ctx"][ids - 1])
+    return g2, nuc[y0:y0 + win, x0:x0 + win], ign, ttgt
+
+
 def instance_losses(inst, tgt, matches, w: InstanceWeights = None):
-    """Batch mean of instance_losses_one, each term weighted. `matches[b]` is the final-iteration
-    slot match of sample b. Returns (weighted scalar, dict of unweighted terms)."""
+    """Mean of instance_losses_one over the instance head's WINDOWS (one per sample on a tile, a
+    covering grid on a larger region -- `inst["win"]`), each term weighted. `matches[b]` is the
+    final-iteration slot match of sample b, shared by all its windows: one type vocabulary per
+    region. Returns (weighted scalar, dict of unweighted terms)."""
     w = w or InstanceWeights()
     d = tgt["dense"]
-    B = inst["exist"].shape[0]
+    Nw = inst["exist"].shape[0]
+    win = inst.get("win")
+    if win is None:                                  # an older caller: one full window per sample
+        win = torch.stack([torch.arange(Nw), torch.zeros(Nw, dtype=torch.long),
+                           torch.zeros(Nw, dtype=torch.long)], 1)
+    S = inst["cell"].shape[-1]
     acc = {k: inst["exist"].new_zeros(()) for k in ("exist", "mask", "nuc", "type", "context")}
     ign = d["ignore"] & (d["inst"] == 0)
-    for b in range(B):
-        t = instance_losses_one(inst, b, d["inst"][b], d["nucleus"][b] > 0.5, ign[b],
-                                tgt["type"][b], matches[b], w)
+    for i, (b, y0, x0) in enumerate(win.tolist()):
+        gt, nuc, ig, tt = window_targets(d["inst"][b], d["nucleus"][b] > 0.5, ign[b],
+                                         tgt["type"][b], y0, x0, S)
+        t = instance_losses_one(inst, i, gt, nuc, ig, tt, matches[b], w)
         for k in acc:
-            acc[k] = acc[k] + t[k] / B
+            acc[k] = acc[k] + t[k] / Nw
     total = (w.exist * acc["exist"] + w.mask * acc["mask"] + w.nuc * acc["nuc"]
              + w.type * acc["type"] + w.context * acc["context"])
     return total, acc

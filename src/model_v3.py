@@ -418,20 +418,137 @@ class InstanceHead(nn.Module):
                     context=self.context(h))
 
 
+# --- windows: the instance head on inputs larger than a tile -----------------------------------
+# The query head works in a fixed WINDOW of 160 px -- the 40 x 40 grid of stride-4 tokens it was
+# trained on, its 320 queries positional anchors over that grid. A larger input (a 512 px = 166 um
+# region) is covered by overlapping windows of this size: everything upstream (stem, trunk, the
+# global tissue attention, the type slots) sees the WHOLE region, so a window's tokens carry the
+# context around it, while a cell is still segmented by the same head at the same scale. The type
+# logits compare a query with the REGION's slots, so a type means the same slot in every window.
+# On a 160 px input the one window is the whole tile: the old model, bit for bit.
+INST_WIN = 160
+
+
+def window_grid(H, W, win=INST_WIN, min_overlap=32):
+    """Window corners (y0, x0) covering an H x W input with overlapping win x win windows, on the
+    stride-4 grid. Overlap >= min_overlap px (10 um), so a cell that straddles a window edge lies
+    whole in a neighbour: 512 px -> 4 x 4 windows at 0, 116, 236, 352."""
+    def axis(S):
+        if S <= win:
+            return [0]
+        n = int(math.ceil((S - win) / float(win - min_overlap))) + 1
+        return sorted({int(round((S - win) * i / (n - 1) / 4.0)) * 4 for i in range(n)})
+    return [(y, x) for y in axis(H) for x in axis(W)]
+
+
+def default_windows(B, H, W, device=None):
+    """[Nw, 3] long (sample, y0, x0): the covering grid of every sample."""
+    return torch.tensor([(b, y, x) for b in range(B) for y, x in window_grid(H, W)],
+                        dtype=torch.long, device=device)
+
+
+def stitch_windows(vals, win, B, H, W):
+    """Window maps [Nw, C, w, w] -> input maps [B, C, H, W]: every pixel takes the value of the
+    window whose centre is NEAREST to it (Chebyshev), i.e. the window in whose core it lies, the
+    way a tiled prediction is stitched; pixels no window covers stay 0. One window that covers the
+    whole input returns it unchanged."""
+    Nw, C, w, _ = vals.shape
+    out = vals.new_zeros(B, C, H, W)
+    best = vals.new_full((B, 1, H, W), float("inf"))
+    r = torch.arange(w, device=vals.device, dtype=vals.dtype) - (w - 1) / 2.0
+    dmap = torch.maximum(r[:, None].abs(), r[None, :].abs())[None]          # [1, w, w]
+    for i, (b, y, x) in enumerate(win.tolist()):
+        sl = (b, slice(None), slice(y, y + w), slice(x, x + w))
+        take = dmap < best[sl]
+        out[sl] = torch.where(take, vals[i], out[sl])
+        best[sl] = torch.where(take, dmap, best[sl])
+    return out
+
+
 @torch.no_grad()
-def decode_queries(inst, b, exist_thr=0.5, mask_thr=0.5):
+def decode_region(inst, b, H, W, **kw):
+    """Inference-side stitch of one sample's windows -> instance labels over the whole input
+    (cells, nuclei, per-instance props in label order). Each window is decoded on its own
+    (`decode_queries`); an instance is kept by the window whose CORE holds its centroid (the
+    neighbour that sees the same cell drops its copy), and kept instances are painted in order of
+    existence score onto pixels still free -- a duplicate that slips through keeps only a leftover
+    and is dropped below min_area. A single window is decode_queries itself."""
+    import numpy as np
+    win = inst["win"]
+    idx = [i for i, row in enumerate(win.tolist()) if row[0] == b]
+    if len(idx) == 1 and inst["cell"].shape[-2:] == (H, W):
+        return decode_queries(inst, idx[0], **kw)
+    w = inst["cell"].shape[-1]
+    cen = np.array([(win[i, 1].item() + (w - 1) / 2.0, win[i, 2].item() + (w - 1) / 2.0) for i in idx])
+    cand = []
+    for k, i in enumerate(idx):
+        qc, qn, props = decode_queries(inst, i, **kw)
+        y0, x0 = win[i, 1].item(), win[i, 2].item()
+        for j in range(1, int(qc.max()) + 1):
+            m = qc == j
+            ys, xs = np.nonzero(m)
+            if not len(ys):
+                continue
+            cy, cx = ys.mean() + y0, xs.mean() + x0
+            d = np.maximum(np.abs(cen[:, 0] - cy), np.abs(cen[:, 1] - cx))
+            if int(d.argmin()) != k:
+                continue                                     # another window's core holds it
+            cand.append((float(props["score"][j - 1]), i, y0, x0, m, qn == j,
+                         {key: v[j - 1] for key, v in props.items()}))
+    lab = np.zeros((H, W), np.int32)
+    nlab = np.zeros((H, W), np.int32)
+    min_area = kw.get("min_area", 15)
+    rows = []
+    for s, i, y0, x0, m, mn, pr in sorted(cand, key=lambda t: -t[0]):
+        free = lab[y0:y0 + w, x0:x0 + w] == 0
+        mm = m & free
+        if mm.sum() < max(min_area, 1):
+            continue
+        rows.append(pr)
+        lab[y0:y0 + w, x0:x0 + w][mm] = len(rows)
+        nlab[y0:y0 + w, x0:x0 + w][mm & mn] = len(rows)
+    props = {key: np.array([r[key] for r in rows]) for key in (rows[0] if rows else {})}
+    return lab, nlab, props
+
+
+@torch.no_grad()
+def decode_queries(inst, b, exist_thr=0.5, mask_thr=0.5, min_area=15, overlap_thr=0.5, passes=3):
     """One sample's query outputs -> instance labels, the inference-side inverse of InstanceHead.
     A pixel goes to the kept query (existence > exist_thr) with the highest existence x mask
     probability, if that query's own mask probability there exceeds mask_thr; the nucleus labels
     reuse the SAME query ids, so nucleus i is the nucleus of cell i. Per-instance properties come
-    back in the order of the labels (row i-1 <-> label i). Returns numpy arrays."""
+    back in the order of the labels (row i-1 <-> label i). Returns numpy arrays.
+
+    A query that wins only a SLIVER of its own mask is a duplicate or a fragment, not a cell: it is
+    dropped if after the argmax it keeps less than `overlap_thr` of the pixels it claims on its own
+    (Mask2Former's panoptic rule), or fewer than `min_area` px -- the generator's own visibility
+    threshold (cfg.VIS["min_area_px"] = 15), so nothing is reported that the truth would call
+    invisible. Dropped queries leave the competition and the argmax is redone, so their pixels go to
+    the next-best query or to background. min_area=0, overlap_thr=0 is the old, unfiltered decode.
+    Measured on run13's 256-tile eval set (fixed tags): unfiltered cell F1 0.63, density-bin macro
+    0.41, count +0.36 log (over-calls); overlap_thr 0.5 -> 0.79 / 0.58 / -0.11. 0.8 (Mask2Former's
+    value) over-prunes dense tiles (-1.9 log at > 100 cells: neighbouring query masks overlap a
+    lot), and raising exist_thr above 0.5 only lowers F1."""
     pe = torch.sigmoid(inst["exist"][b])
     keep = torch.nonzero(pe > exist_thr)[:, 0]
     H, W = inst["cell"].shape[-2:]
     lab = torch.zeros(H, W, dtype=torch.long, device=pe.device)
     nlab = torch.zeros_like(lab)
-    if keep.numel():
+    for _ in range(max(int(passes), 1)):
+        if not keep.numel():
+            break
         pc = torch.sigmoid(inst["cell"][b, keep])                              # [k, H, W]
+        score = pc * pe[keep, None, None]
+        best = score.argmax(0)
+        own = pc.gather(0, best[None])[0] > mask_thr
+        won = torch.bincount(best[own], minlength=keep.numel())
+        claim = (pc > mask_thr).flatten(1).sum(1)
+        ok = (won >= min_area) & (won.float() >= overlap_thr * claim.float())
+        if bool(ok.all()) or not (min_area > 0 or overlap_thr > 0):
+            break
+        keep = keep[ok]
+    if keep.numel():
+        pc = torch.sigmoid(inst["cell"][b, keep])
         pn = torch.sigmoid(inst["nuc"][b, keep])
         score = pc * pe[keep, None, None]
         best = score.argmax(0)
@@ -670,7 +787,8 @@ class ModelV3(nn.Module):
     U_C = 48             # stem stride-4 per-marker feature channels (h4)
 
     def __init__(self, n_global=16, n_marker_noise=4, n_context=None,
-                 K=30, T=3, d=128, d_tag=32, predict_offset=True, n_queries=0, use_flow=True):
+                 K=30, T=3, d=128, d_tag=32, predict_offset=True, n_queries=0, use_flow=True,
+                 use_ref=False):
         super().__init__()
         n_context = (1 + len(cfg.CONTEXT_KINDS)) if n_context is None else n_context
         self.K, self.T, self.d, self.d_tag = K, T, d, d_tag
@@ -698,6 +816,16 @@ class ModelV3(nn.Module):
         if not use_flow and not n_queries:
             raise ValueError("use_flow=False needs the query head for its membranes -- pass n_queries > 0.")
         self.use_flow = use_flow
+        # use_ref: the nuclear counterstain is FLAGGED. Which channel is DAPI is known at acquisition
+        # on every real panel, but the random tags hid it, so the model had to guess the nucleus
+        # from appearance alone -- and on real tissue it read nucleus-like blobs in other channels
+        # (troponin, mitochondrial markers) as nuclei. The flag is one learned vector added to the
+        # flagged marker's tag, so it reaches every place a tag does (PixelMix biases, trunk tokens)
+        # without a fixed channel slot: the model stays permutation-equivariant over the others.
+        # Zero-initialised, so a checkpoint without it warm-starts with identical outputs.
+        self.use_ref = use_ref
+        if use_ref:
+            self.ref_emb = nn.Parameter(torch.zeros(d_tag))
 
     def _seeds(self, emb, cell_prob4, Hf, Wf, seeds, n_seeds, device):
         """Seeds for the type slots. `seeds=None` runs farthest-point sampling for every sample
@@ -720,7 +848,11 @@ class ModelV3(nn.Module):
             n_seeds[b] = len(chosen)
         return seeds, n_seeds
 
-    def forward(self, tile, present=None, strength=None, tags=None, seeds=None, n_seeds=None):
+    def forward(self, tile, present=None, strength=None, tags=None, seeds=None, n_seeds=None,
+                ref=None, inst_windows=None):
+        """`inst_windows` [Nw, 3] (sample, y0, x0) picks where the instance head runs on an input
+        larger than INST_WIN; None = the covering grid (`window_grid`). The instance outputs then
+        carry one row per WINDOW, and out["inst"]["win"] says which."""
         B, M, H, W = tile.shape
         device = tile.device
         if present is None:
@@ -730,6 +862,8 @@ class ModelV3(nn.Module):
         strength = strength.to(device)
         if tags is None:
             tags = torch.randn(B, M, self.d_tag, device=device) / math.sqrt(self.d_tag)
+        if self.use_ref and ref is not None:                     # ref: [B, M], 1 = counterstain
+            tags = tags + ref.to(device=device, dtype=tags.dtype)[..., None] * self.ref_emb
 
         feats = self.stem(tile, tags, present, strength)
         t = self.trunk(feats["h4"], tags, present, strength)     # [B, M, Hg, Wg, d]
@@ -764,7 +898,9 @@ class ModelV3(nn.Module):
 
         extra = {}
         if self.inst_head is not None:
-            extra["inst"] = self.inst_head(F4, dense["d1"], states[-1][:, :self.K], Hf, Wf)
+            win = inst_windows if inst_windows is not None else default_windows(B, H, W, device)
+            extra["inst"] = self._inst_windows(F4, dense["d1"], states[-1][:, :self.K], Hf, Wf,
+                                               win.to(device))
         loc_feat = self._loc_features(dense, logI, u, Hf, Wf, inst=extra.get("inst"))  # [B, M, N4, loc_in]
         dense_keys = (("nucleus", "cell", "flow", "nuc_flow", "structure") if self.use_flow
                       else ("nucleus", "cell", "structure"))
@@ -773,6 +909,22 @@ class ModelV3(nn.Module):
             marker=self.marker_head(t, loc_feat),
             dense={k: dense[k] for k in dense_keys},
             slots=slot_out, seeds=seeds, n_seeds=n_seeds, emb=emb)
+
+    def _inst_windows(self, F4, d1, slot_state, Hf, Wf, win):
+        """The instance head on each window: its 40 x 40 stride-4 tokens (cut from the context-
+        aware F4 of the whole input), its d1 pixels and its sample's slots."""
+        B, _, d = F4.shape
+        w, w4 = INST_WIN, INST_WIN // 4
+        if Hf * 4 < w or Wf * 4 < w:
+            raise ValueError(f"input {Hf * 4} x {Wf * 4} px is smaller than the instance window "
+                             f"{w} px -- pad or crop the tile to at least {w} px")
+        rows = win.tolist()
+        g = F4.view(B, Hf, Wf, d)
+        F4w = torch.stack([g[b, y // 4:y // 4 + w4, x // 4:x // 4 + w4] for b, y, x in rows])
+        d1w = torch.stack([d1[b, :, y:y + w, x:x + w] for b, y, x in rows])
+        out = self.inst_head(F4w.reshape(len(rows), w4 * w4, d), d1w, slot_state[win[:, 0]], w4, w4)
+        out["win"] = win
+        return out
 
     def _region_probs(self, dense, N4, inst=None):
         """Per-location sub-cellular region membership at stride 4: (nucleus, cytoplasm, membrane),
@@ -792,8 +944,15 @@ class ModelV3(nn.Module):
             edge = F.relu(div)
         else:
             with torch.no_grad():
-                own = torch.sigmoid(inst["exist"])[..., None, None] * torch.sigmoid(inst["cell"])
-                edge = (own.sum(1, keepdim=True) - own.amax(1, keepdim=True)).clamp(0.0, 1.0)
+                # per window (in chunks: 16 windows x 320 masks of a region is a GB), then stitched
+                # back to the input by window cores; on a tile the one window is the whole map
+                ew = []
+                for c in range(0, inst["exist"].shape[0], 4):
+                    own = (torch.sigmoid(inst["exist"][c:c + 4])[..., None, None]
+                           * torch.sigmoid(inst["cell"][c:c + 4]))
+                    ew.append((own.sum(1, keepdim=True) - own.amax(1, keepdim=True)).clamp(0.0, 1.0))
+                H, W = dense["cell"].shape[-2:]
+                edge = stitch_windows(torch.cat(ew), inst["win"], dense["cell"].shape[0], H, W)
         mem4 = (F.avg_pool2d(edge, 4) * cell2d).reshape(cell2d.shape[0], 1, N4)
         cell4 = cell2d.reshape(cell2d.shape[0], 1, N4)
         cyto4 = (cell4 - nuc4 - mem4).clamp(min=0)

@@ -53,7 +53,22 @@ def _context_cells(cells, n_context):
     return out
 
 
-def build_bundle(i, seed, curriculum=None, with_artifacts=False, pool_bank=None):
+def _realised_composition(cells, n_context, K):
+    """Per context (fixed order: 0 = background, 1.. = CONTEXT_KINDS), the share of its VISIBLE
+    cells that belong to each type: [n_context, K], a row of zeros where a context shows no cell.
+    This is the composition target. theta's pi is the odds a CANDIDATE takes a type; with the
+    spacing following each type's size (TissueGeometry.SIZE_COUPLE) big types are thinned harder
+    than small ones, and a section shows a big cell more often than a small one, so the cells
+    actually in the frame are not distributed as pi -- and the frame is all the model can read."""
+    out = np.zeros((n_context, max(K, 1)), np.float32)
+    for r in cells:
+        k, c = int(r["type_idx"]) - 1, int(r["context"])
+        if bool(r["visible"]) and 0 <= k < K and 0 <= c < n_context:
+            out[c, k] += 1.0
+    return out / np.maximum(out.sum(1, keepdims=True), 1.0)
+
+
+def build_bundle(i, seed, curriculum=None, with_artifacts=False, pool_bank=None, strata=None):
     """Render one flexible sample and compute every array the v3 target-builder needs.
 
     Returns a flat dict: the image, the theta v3 arrays (prefixed `th_`), the raw 2D labels, the
@@ -62,7 +77,8 @@ def build_bundle(i, seed, curriculum=None, with_artifacts=False, pool_bank=None)
     """
     pool_bank = cfg.POOL_BANK if pool_bank is None else pool_bank
     _, img, theta, mask, geojson, cyc, labels = gd.draw_flexible(
-        i, seed=seed, curriculum=curriculum, with_artifacts=with_artifacts, pool_bank=pool_bank)
+        i, seed=seed, curriculum=curriculum, with_artifacts=with_artifacts, pool_bank=pool_bank,
+        strata=strata)
 
     K = int(theta["K"])
     n_context = 1 + len(cfg.CONTEXT_KINDS)
@@ -100,6 +116,7 @@ def build_bundle(i, seed, curriculum=None, with_artifacts=False, pool_bank=None)
         pure4=pure4.astype(np.int32),
         present=np.asarray(labels["present"], np.bool_),           # frame-present theta-types [K]
         context_cells=_context_cells(labels["cells"], n_context),
+        comp_real=_realised_composition(labels["cells"], n_context, K),
     )
     bundle.update({f"th_{k}": np.asarray(v) for k, v in theta.items()})
     return bundle
